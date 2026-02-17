@@ -1,6 +1,6 @@
 # LiteParse
 
-Open-source PDF parsing with spatial text extraction - no LLMs, no cloud dependencies.
+Open-source PDF parsing with spatial text extraction, no LLMs and cloud dependencies.
 
 ## Overview
 
