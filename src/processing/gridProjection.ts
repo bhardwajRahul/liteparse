@@ -982,13 +982,6 @@ function updateForwardAnchors(
   );
 }
 
-function resetBlockForwardAnchors(forwardAnchors: PageForwardAnchors): void {
-  forwardAnchors.left = {};
-  forwardAnchors.right = {};
-  forwardAnchors.center = {};
-  forwardAnchors.floating = {};
-}
-
 function getMedianTextBoxSize(lines: ProjectionTextBox[]): TextBoxSize {
   // calculate median textBox width
   const widthList = [];
@@ -1170,10 +1163,9 @@ export function projectToGrid(
     const centerSnap: Snap[] = [];
 
     if (!config.preserveLayoutAlignmentAcrossPages) {
-      resetBlockForwardAnchors(forwardAnchors);
-
       const sizes = getMedianTextBoxSize(lines.slice(block.start, block.end).flat());
       medianWidth = sizes.width;
+      
       // medianHeight updated but not currently used per-block - reserved for future use
       void sizes.height;
     }
