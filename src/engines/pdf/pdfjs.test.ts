@@ -219,30 +219,11 @@ describe("test PdfJS methods", () => {
   it("test extractAllPages (with targetPages and maxPages)", async () => {
     const doc = getTestData();
     const expectedTextItems = getExpectedResults();
-    const expectedPages = [1, 2, 3];
+    const expectedPages = [1, 2, 3, 5];
 
     const engine = new PdfJsEngine();
     const results = await engine.extractAllPages(doc, 4, "1,2,3,5,8");
-    expect(results.length).toBe(3);
-    for (let i = 0; i < results.length; i++) {
-      expect(results[i].pageNum).toBe(expectedPages[i]);
-      expect(results[i].width).toBe(612);
-      expect(results[i].height).toBe(792);
-      expect(results[i].images.length).toBe(0);
-      expect(results[i].annotations?.length).toBe(0);
-      expect(results[i].textItems).toStrictEqual(expectedTextItems);
-      expect(results[i].garbledTextRegions).toBeUndefined();
-    }
-  });
-
-  it("test extractAllPages (with targetPages and maxPages)", async () => {
-    const doc = getTestData();
-    const expectedTextItems = getExpectedResults();
-    const expectedPages = [1, 2, 3];
-
-    const engine = new PdfJsEngine();
-    const results = await engine.extractAllPages(doc, 4, "1,2,3,5,8");
-    expect(results.length).toBe(3);
+    expect(results.length).toBe(4);
     for (let i = 0; i < results.length; i++) {
       expect(results[i].pageNum).toBe(expectedPages[i]);
       expect(results[i].width).toBe(612);

@@ -367,7 +367,7 @@ export class PdfJsEngine implements PdfEngine {
     // Parse target pages if specified
     let pageNumbers: number[];
     if (targetPages) {
-      pageNumbers = this.parseTargetPages(targetPages, numPages);
+      pageNumbers = this.parseTargetPages(targetPages, doc.numPages);
     } else {
       pageNumbers = Array.from({ length: numPages }, (_, i) => i + 1);
     }
