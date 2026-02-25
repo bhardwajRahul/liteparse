@@ -1,24 +1,26 @@
-FROM python:3.9-slim
+FROM ghcr.io/astral-sh/uv:python3.12-trixie
 
-# Install dependencies
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
+    libgomp1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
     libxrender-dev \
-    libgomp1 \
+    libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python packages
-RUN pip install --no-cache-dir easyocr flask pillow numpy
-
-# Copy server code
-COPY server.py /app/server.py
-
+# Set working directory
 WORKDIR /app
+
+# Copy pyproject.toml and server code
+COPY ./*py* .
+
+# install necessary dependencies
+RUN uv sync
 
 # Expose port
 EXPOSE 8828
 
 # Run server
-CMD ["python", "server.py"]
+CMD ["uv", "run", "python3", "server.py"]

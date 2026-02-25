@@ -4,6 +4,15 @@ This is a simple Flask server that wraps EasyOCR to conform to the LiteParse OCR
 
 ## Build and Run
 
+**With uv**
+
+```bash
+# install and run (in one command)
+uv run python3 server.py
+```
+
+**With Docker**
+
 ```bash
 # Build Docker image
 docker build -t liteparse-easyocr .
@@ -83,4 +92,12 @@ const parser = new LiteParse({
 });
 
 const result = await parser.parse('document.pdf');
+```
+
+## Testing
+
+If you make changes to the server, make sure to adapt and run tests:
+
+```bash
+uv run pytest test_server.py
 ```

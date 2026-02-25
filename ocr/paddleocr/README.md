@@ -6,6 +6,17 @@ PaddleOCR is especially fast and accurate for Chinese, Japanese, and Korean lang
 
 ## Build and Run
 
+**With uv**
+
+```bash
+# install and run (in one command)
+uv run python3 server.py
+```
+
+**With Docker**
+
+> _The Docker build might be unstable or not working depending on the target platform for building the image and running the container (there are known issues with `linux/amd64`)_
+
 ```bash
 # Build Docker image
 docker build -t liteparse-paddleocr .
@@ -97,6 +108,14 @@ const parser = new LiteParse({
 });
 
 const result = await parser.parse('document.pdf');
+```
+
+## Testing
+
+If you make changes to the server, make sure to adapt and run tests:
+
+```bash
+uv run pytest test_server.py
 ```
 
 ## GPU Support

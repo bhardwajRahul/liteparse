@@ -1,68 +1,92 @@
-from flask import Flask, request, jsonify
+import io
+import logging
+from typing import Any
+
 import easyocr
 import numpy as np
+import uvicorn
+from fastapi import FastAPI
+from fastapi.datastructures import UploadFile
+from fastapi.param_functions import File, Form
 from PIL import Image
-import io
+from pydantic import BaseModel
 
-app = Flask(__name__)
-reader = None
-current_language = None
 
-@app.route('/ocr', methods=['POST'])
-def ocr():
-    global reader, current_language
+class OcrResponse(BaseModel):
+    results: list[Any]
 
-    # Get language from request
-    language = request.form.get('language', 'en')
 
-    # Initialize reader if needed or language changed
-    if reader is None or current_language != language:
-        print(f"Initializing EasyOCR reader for language: {language}")
-        reader = easyocr.Reader([language], gpu=False)
-        current_language = language
+class StatusResponse(BaseModel):
+    status: str
 
-    # Read image
-    file = request.files.get('file')
-    if not file:
-        return jsonify({'error': 'No file provided'}), 400
 
-    # Load image
-    image_data = file.read()
-    image = Image.open(io.BytesIO(image_data))
+class EasyOCRServer:
+    def __init__(self) -> None:
+        self.reader: easyocr.Reader | None = None
+        self.current_language: str | None = None
 
-    # Convert to numpy array
-    image_array = np.array(image)
+    def _create_ocr_server(self) -> FastAPI:
+        app = FastAPI()
 
-    # Run OCR
-    results = reader.readtext(image_array)
+        @app.post("/ocr")
+        async def ocr_endpoint(
+            file: UploadFile = File(...), language: str = Form(default="en")
+        ) -> OcrResponse:
+            print(
+                f"Language: {language}. Received file {file.filename or 'no name'} with size {file.size or 'unknown size'} and type {file.content_type or 'unknown type'}",
+                flush=True,
+            )
+            # Get language from request
+            language = language.lower()
+            if self.reader is None or self.current_language != language:
+                print(f"Initializing EasyOCR reader for language: {language}")
+                self.reader = easyocr.Reader([language], gpu=False)
+                self.current_language = language
 
-    # Format results according to LiteParse OCR API spec
-    # Convert from EasyOCR format: [[[x1,y1], [x2,y2], [x3,y3], [x4,y4]], text, confidence]
-    # To standard format: { text, bbox: [x1, y1, x2, y2], confidence }
-    formatted = []
-    for coords, text, confidence in results:
-        # Convert polygon to axis-aligned bounding box
-        # coords is [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-        if isinstance(coords, np.ndarray):
-            coords = coords.tolist()
+            image_data = await file.read()
+            image = Image.open(io.BytesIO(image_data))
 
-        xs = [point[0] for point in coords]
-        ys = [point[1] for point in coords]
-        bbox = [min(xs), min(ys), max(xs), max(ys)]
+            # Convert to numpy array
+            image_array = np.array(image)
 
-        formatted.append({
-            'text': text,
-            'bbox': bbox,
-            'confidence': float(confidence)
-        })
+            # Run OCR
+            results = self.reader.readtext(image_array)  # type: ignore
 
-    return jsonify({
-        'results': formatted
-    })
+            # Format results according to LiteParse OCR API spec
+            # Convert from EasyOCR format: [[[x1,y1], [x2,y2], [x3,y3], [x4,y4]], text, confidence]
+            # To standard format: { text, bbox: [x1, y1, x2, y2], confidence }
+            formatted = []
+            for coords, text, confidence in results:
+                # Convert polygon to axis-aligned bounding box
+                # coords is [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+                if isinstance(coords, np.ndarray):
+                    coords = coords.tolist()
 
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({'status': 'healthy'})
+                # int casting is necessary for pydantic serialization (np.Int32 are not serializable)
+                xs = [int(point[0]) for point in coords]
+                ys = [int(point[1]) for point in coords]
+                bbox = [min(xs), min(ys), max(xs), max(ys)]
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8828)
+                formatted.append(
+                    {"text": text, "bbox": bbox, "confidence": float(confidence)}
+                )
+            return OcrResponse(results=formatted)
+
+        @app.get("/health")
+        def health() -> StatusResponse:
+            return StatusResponse(status="healthy")
+
+        return app
+
+    def serve(self) -> None:
+        app = self._create_ocr_server()
+        uvicorn.run(app, host="0.0.0.0", port=8828)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.DEBUG,
+    )
+    logging.info("Starting server on port 8828")
+    server = EasyOCRServer()
+    server.serve()

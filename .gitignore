@@ -46,4 +46,4 @@ deno.json
 *venv*
 __pycache__
 *.pyc
-
+*cache*

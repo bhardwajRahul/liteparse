@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM ghcr.io/astral-sh/uv:python3.12-trixie
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -13,19 +13,14 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Install Python dependencies
-RUN pip install --no-cache-dir \
-    flask==3.0.0 \
-    paddlepaddle==3.2.2 \
-    paddleocr==3.4.0 \
-    pillow \
-    numpy
+# Copy pyproject.toml and server code
+COPY ./*py* .
 
-# Copy server code
-COPY server.py .
+# install necessary dependencies
+RUN uv sync
 
 # Expose port
 EXPOSE 8829
 
 # Run server
-CMD ["python", "server.py"]
+CMD ["uv", "run", "python3", "server.py"]
