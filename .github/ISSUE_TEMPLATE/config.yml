@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/run-llama/liteparse#readme
+    about: Check the README for usage documentation
+  - name: Discussions
+    url: https://github.com/run-llama/liteparse/discussions
+    about: Ask questions and share ideas

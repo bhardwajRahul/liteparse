@@ -1,0 +1,92 @@
+name: Parsing Issue
+description: Report an issue with document parsing (incorrect output, missing text, etc.)
+title: "[Parsing] "
+labels: ["parsing", "bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Important: Document Required
+
+        **Parsing issues without a reproducible example will be closed.**
+
+        To investigate parsing problems, we need to see the actual document. Please either:
+        - Attach the document to this issue (drag and drop below)
+        - Provide a public link to the document
+        - If the document is confidential, provide a minimal reproduction with a similar document
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Describe the parsing issue you're experiencing
+      placeholder: "The text on page 3 is missing / The table formatting is incorrect / etc."
+    validations:
+      required: true
+
+  - type: textarea
+    id: document
+    attributes:
+      label: Document
+      description: |
+        **Required:** Attach the document or provide a link.
+        Drag and drop your file here, or paste a public URL.
+      placeholder: "Drag and drop your document here, or paste a URL"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Output
+      description: What did you expect the output to look like?
+      placeholder: "I expected the table to have 3 columns with aligned text..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Output
+      description: What did you actually get? (paste relevant portions)
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command Used
+      description: The exact command or code you ran
+      render: bash
+      placeholder: "lit parse document.pdf --format json"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: LiteParse Version
+      description: Run `lit --version` to get this
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux
+        - Windows
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Any other relevant information (OCR server used, config file, etc.)

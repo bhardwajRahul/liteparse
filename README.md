@@ -1,5 +1,9 @@
 # LiteParse
 
+[![CI](https://github.com/run-llama/liteparse/actions/workflows/ci.yml/badge.svg)](https://github.com/run-llama/liteparse/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/@llamaindex/liteparse.svg)](https://www.npmjs.com/package/@llamaindex/liteparse)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 Open-source PDF parsing with spatial text extraction, no LLMs and cloud dependencies.
 
 ## Overview
@@ -38,16 +42,7 @@ lit parse document.pdf
 lit screenshot document.pdf
 ```
 
-#### Option 2: Homebrew (macOS/Linux)
-
-Coming soon! Once published, you'll be able to install via Homebrew:
-
-```bash
-brew tap yourusername/liteparse
-brew install liteparse
-```
-
-#### Option 3: Instal from Source
+#### Option 2: Install from Source
 
 You can clone the repo and install the CLI globally from source:
 
@@ -62,8 +57,6 @@ npm install -g ./liteparse-*.tgz
 ## Usage
 
 ### Parse Files
-
-You can run tests without building the binary using the CLI:
 
 ```bash
 # Basic parsing
@@ -98,8 +91,8 @@ lit screenshot document.pdf -o ./screenshots
 # Screenshot specific pages
 lit screenshot document.pdf --pages "1,3,5" -o ./screenshots
 
-# Custom output directory and DPI
-lit screenshot document.pdf -o ./images --dpi 300 -o ./screenshots
+# Custom DPI
+lit screenshot document.pdf --dpi 300 -o ./screenshots
 
 # Screenshot page range
 lit screenshot document.pdf --pages "1-10" -o ./screenshots
@@ -110,13 +103,13 @@ lit screenshot document.pdf --pages "1-10" -o ./screenshots
 Install as a dependency in your project:
 
 ```bash
-npm install liteparse
+npm install @llamaindex/liteparse
 # or
-pnpm add liteparse
+pnpm add @llamaindex/liteparse
 ```
 
 ```typescript
-import { LiteParse } from 'liteparse';
+import { LiteParse } from '@llamaindex/liteparse';
 
 const parser = new LiteParse({ ocrEnabled: true });
 const result = await parser.parse('document.pdf');
@@ -139,6 +132,7 @@ Options:
   --ocr-server-url <url>  HTTP OCR server URL (uses Tesseract if not provided)
   --no-ocr                Disable OCR
   --ocr-language <lang>   OCR language(s) (default: "en")
+  --num-workers <n>       Number of pages to OCR in parallel (default: CPU cores - 1)
   --max-pages <n>         Max pages to parse (default: "10000")
   --target-pages <pages>  Target pages (e.g., "1-5,10,15-20")
   --dpi <dpi>             DPI for rendering (default: "150")
@@ -163,7 +157,8 @@ Options:
   --ocr-server-url <url>  HTTP OCR server URL (uses Tesseract if not provided)
   --no-ocr                Disable OCR
   --ocr-language <lang>   OCR language(s) (default: "en")
-  --max-pages <n>         Max pages to parse per file (default: "1000")
+  --num-workers <n>       Number of pages to OCR in parallel (default: CPU cores - 1)
+  --max-pages <n>         Max pages to parse per file (default: "10000")
   --dpi <dpi>             DPI for rendering (default: "150")
   --no-precise-bbox       Disable precise bounding boxes
   --recursive             Recursively search input directory

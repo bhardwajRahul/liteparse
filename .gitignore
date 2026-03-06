@@ -42,8 +42,24 @@ temp/
 *.png
 deno.json
 
-# python files
+# Python files
 *venv*
 __pycache__
 *.pyc
 *cache*
+
+# Test/dev directories (local testing)
+e2e-output/
+parsed_dataset/
+hard_docs/
+hard_docs_parsed/
+test-docs/
+test-docs-output/
+arxiv_screenshots/
+more_hard_docs/
+nytimes_imgs/
+ac/
+ltt/
+
+# OCR data files
+*.traineddata

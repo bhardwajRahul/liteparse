@@ -145,7 +145,6 @@ See the `/ocr` directory for reference implementations:
 
 - `ocr/easyocr/` - Wrapper for EasyOCR
 - `ocr/paddleocr/` - Wrapper for PaddleOCR
-- `ocr/tesseract/` - Wrapper for Tesseract (if you want to run it as a server)
 
 ## Testing Your Server
 

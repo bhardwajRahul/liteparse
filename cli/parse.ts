@@ -60,7 +60,7 @@ const program = new Command();
 program
   .name("lit")
   .description("OSS document parsing tool (supports PDF, DOCX, XLSX, images, and more)")
-  .version("1.0.0");
+  .version("0.1.0");
 
 program
   .command("parse <file>")
