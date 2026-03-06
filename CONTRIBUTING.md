@@ -19,6 +19,22 @@ Thank you for your interest in contributing to LiteParse! This document provides
    npm run build
    ```
 
+## What to Contribute?
+
+In this project, we welcome a wide range of contributions, but we do want to maintain the spirit of the project. We are primarily focused on:
+
+- Core algorithms for PDF parsing and text extraction
+- OCR integrations and improvements
+- Different types or modifications to output formats
+
+We are less interested in:
+
+- Markdown output
+- Any LLM integration or agent code
+- Anything that doesn't directly relate to improving the core parsing and extraction capabilities
+
+While the project is in Typescript today, I'm pretty open to porting to Rust if someone wanted to take that on as a contribution. The core algorithms and logic would be the same, just implemented in Rust instead of Typescript.
+
 ## Development Workflow
 
 ### Building
@@ -45,7 +61,7 @@ npm run format     # Format code with Prettier
 
 ### Testing Local Changes
 
-You can test your changes locally without installing globally:
+You can test your changes locally:
 
 ```bash
 # Parse a document
@@ -57,47 +73,25 @@ You can test your changes locally without installing globally:
 
 ## Making Changes
 
-### Changesets
+### Versioning & Changelogs
 
-We use [Changesets](https://github.com/changesets/changesets) to manage versioning and changelogs. When you make a change that should be released:
+We use [Changesets](https://github.com/changesets/changesets) to manage versioning and changelogs. When you make a change to source code that should be released:
 
 1. Run `npm run changeset`
 2. Select the type of change (patch, minor, major)
 3. Write a description of your changes
 4. Commit the generated changeset file with your PR
 
-**When to add a changeset:**
-- Bug fixes (patch)
-- New features (minor)
-- Breaking changes (major)
-- Performance improvements (patch or minor)
-
-**When NOT to add a changeset:**
-- Documentation-only changes
-- CI/tooling changes
-- Test-only changes
-
-### Code Style
-
-- We use TypeScript with strict mode
-- Code is formatted with Prettier
-- Follow existing patterns in the codebase
-
-### Commit Messages
-
-Use clear, descriptive commit messages. We don't enforce a specific format, but prefer:
-- Start with a verb (Add, Fix, Update, Remove, etc.)
-- Keep the first line under 72 characters
-- Reference issues when applicable
-
 ## Pull Requests
 
-1. Create a feature branch from `main`
+1. Fork and create a feature branch from `main`
 2. Make your changes
 3. Add a changeset if needed (`npm run changeset`)
 4. Ensure all tests pass (`npm test`)
-5. Ensure linting passes (`npm run lint`)
+5. Ensure linting passes (`npm run lint:fix` and `npm run format`)
 6. Submit a pull request
+
+When you submit a PR, a number of CICD checks will run. Among these, your code will be tested against a regression suite of documents to ensure that your changes don't break existing parsing capabilities. It will be up to the maintainers discretion to determine if any changes to the regression set are expected/positive or unexpected/negative.
 
 ### PR Guidelines
 
