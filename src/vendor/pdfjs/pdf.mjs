@@ -2743,12 +2743,12 @@ function getVerbosityLevel() {
 }
 function info(msg) {
   if (verbosity >= VerbosityLevel.INFOS) {
-    console.log(`Info: ${msg}`);
+    console.error(`Info: ${msg}`);
   }
 }
 function warn(msg) {
-  if (verbosity >= VerbosityLevel.ERRORS) {
-    console.log(`Warning: ${msg}`);
+  if (verbosity >= VerbosityLevel.WARNINGS) {
+    console.error(`Warning: ${msg}`);
   }
 }
 function unreachable(msg) {
@@ -5171,7 +5171,7 @@ function noContextMenu(e) {
   e.preventDefault();
 }
 function deprecated(details) {
-  console.log("Deprecated API usage: " + details);
+  console.error("Deprecated API usage: " + details);
 }
 let pdfDateStringRegex;
 class PDFDateString {
