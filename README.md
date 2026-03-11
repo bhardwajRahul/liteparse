@@ -29,7 +29,7 @@ LiteParse is a standalone OSS PDF parsing tool focused exclusively on **fast and
 
 #### Option 1: Global Install (Recommended)
 
-Install globally via npm to use the `liteparse` command anywhere:
+Install globally via npm to use the `lit` command anywhere:
 
 ```bash
 npm i -g @llamaindex/liteparse
@@ -40,6 +40,13 @@ Then use it:
 ```bash
 lit parse document.pdf
 lit screenshot document.pdf
+```
+
+For macOS and Linux users, `liteparse` can be also installed via `brew`:
+
+```bash
+brew tap run-llama/liteparse
+brew install llamaindex-liteparse
 ```
 
 #### Option 2: Install from Source
