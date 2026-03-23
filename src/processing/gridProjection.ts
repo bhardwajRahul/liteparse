@@ -1450,10 +1450,7 @@ export function projectToGrid(
           rawLinesDelta[lineIndex] = 0;
         }
 
-        const indent = Math.min(
-          Math.max(Math.round((line[0].x - blockMinX) / medianWidth), 0),
-          8
-        );
+        const indent = Math.min(Math.max(Math.round((line[0].x - blockMinX) / medianWidth), 0), 8);
         let result = " ".repeat(indent);
 
         for (let i = 0; i < line.length; i++) {
@@ -1498,8 +1495,7 @@ export function projectToGrid(
           const line = lines[lineIndex];
           if (line.length === 0) continue;
 
-          const adjFlowing =
-            flowingLines.has(lineIndex - 1) || flowingLines.has(lineIndex + 1);
+          const adjFlowing = flowingLines.has(lineIndex - 1) || flowingLines.has(lineIndex + 1);
           if (adjFlowing && lineMaxGap(line) < columnGapThreshold) {
             renderLineAsFlowing(lineIndex);
             changed = true;
