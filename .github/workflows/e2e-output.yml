@@ -43,7 +43,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           pip install huggingface_hub
-          hf download 'llamaindex/liteparse_cicd_data' --local-dir expected-dataset --repo-type dataset --token ${{ secrets.HF_TOKEN }}
+          hf download 'llamaindex/liteparse_cicd_data' --local-dir expected-dataset --repo-type dataset
 
       - name: Compare outputs
         id: compare
@@ -132,7 +132,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          hf download 'llamaindex/liteparse_cicd_data' --local-dir expected-dataset --repo-type dataset --token ${{ secrets.HF_TOKEN }}
+          hf download 'llamaindex/liteparse_cicd_data' --local-dir expected-dataset --repo-type dataset
 
       - name: Generate and upload dataset
         env:
