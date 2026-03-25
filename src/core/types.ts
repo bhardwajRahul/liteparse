@@ -108,6 +108,9 @@ export interface LiteParseConfig {
    * Calculate precise bounding boxes for each text line. Disable for faster
    * parsing when bounding boxes aren't needed.
    *
+   * @deprecated Controls the deprecated `boundingBoxes` output. Will be removed in v2.0.
+   * Text item coordinates (`x`, `y`, `width`, `height`) are always present regardless.
+   *
    * @defaultValue `true`
    */
   preciseBoundingBox: boolean;
@@ -248,6 +251,8 @@ export interface OcrData {
  * An axis-aligned bounding box defined by its top-left and bottom-right corners.
  *
  * All coordinates are in PDF points.
+ *
+ * @deprecated Use {@link TextItem} coordinates (`x`, `y`, `width`, `height`) instead. Will be removed in v2.0.
  */
 export interface BoundingBox {
   /** X coordinate of the top-left corner. */
@@ -274,7 +279,10 @@ export interface ParsedPage {
   text: string;
   /** Individual text elements extracted from the page. */
   textItems: TextItem[];
-  /** Bounding boxes for text lines. Present when {@link LiteParseConfig.preciseBoundingBox} is enabled. */
+  /**
+   * @deprecated Use {@link TextItem} coordinates instead. Will be removed in v2.0.
+   * Present when {@link LiteParseConfig.preciseBoundingBox} is enabled.
+   */
   boundingBoxes?: BoundingBox[];
 }
 
@@ -303,7 +311,9 @@ export interface ParseResultJson {
       fontName?: string;
       fontSize?: number;
     }>;
-    /** Bounding boxes for text lines. */
+    /**
+     * @deprecated Use `textItems` coordinates instead. Will be removed in v2.0.
+     */
     boundingBoxes: BoundingBox[];
   }>;
 }

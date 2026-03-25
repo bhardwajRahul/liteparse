@@ -40,9 +40,9 @@ for (const page of result.pages) {
 const parser = new LiteParse({ outputFormat: "json" });
 const result = await parser.parse("document.pdf");
 
-for (const page of result.json.pages) {
-  for (const bbox of page.boundingBoxes) {
-    console.log(`[${bbox.x1}, ${bbox.y1}] → [${bbox.x2}, ${bbox.y2}]`);
+for (const page of result.json?.pages || []) {
+  for (const item of page.textItems) {
+    console.log(`[${item.x}, ${item.y}] → [${item.x + item.width}, ${item.y + item.height}] ${item.text}`);
   }
 }
 ```
