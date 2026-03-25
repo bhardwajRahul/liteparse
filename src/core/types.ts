@@ -172,6 +172,10 @@ export interface TextItem {
   vgap?: boolean;
   /** @internal Whether this is a placeholder item used during layout. */
   isPlaceholder?: boolean;
+  /** Whether this text was extracted via OCR rather than native PDF text. */
+  fromOCR?: boolean;
+  /** OCR confidence score from 0.0 to 1.0. Only present for OCR-detected text. */
+  confidence?: number;
 }
 
 /**
@@ -302,6 +306,8 @@ export interface ParseResultJson {
       height: number;
       fontName?: string;
       fontSize?: number;
+      fromOCR?: boolean;
+      confidence?: number;
     }>;
     /** Bounding boxes for text lines. */
     boundingBoxes: BoundingBox[];
