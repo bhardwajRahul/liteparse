@@ -29,18 +29,33 @@ export function searchItems(items: JsonTextItem[], options: SearchItemsOptions):
   const normalize = caseSensitive ? (s: string) => s : (s: string) => s.toLowerCase();
   const q = normalize(options.phrase);
 
+  // Pre-compute separator between each pair of adjacent items.
+  // If two items are on the same line and the next item starts where the
+  // previous one ends (spatially adjacent), they are joined without a space.
+  // Otherwise a space is inserted.
+  const seps: string[] = new Array(items.length).fill("");
+  for (let i = 1; i < items.length; i++) {
+    const prev = items[i - 1];
+    const cur = items[i];
+    const fontSize = prev.fontSize ?? cur.fontSize ?? 12;
+    const sameLine = Math.abs(cur.y - prev.y) < fontSize * 0.5;
+    const gap = cur.x - (prev.x + prev.width);
+    seps[i] = sameLine && gap <= fontSize * 0.3 ? "" : " ";
+  }
+
   let start = 0;
   while (start < items.length) {
     let combined = "";
     let found = false;
     for (let end = start; end < items.length; end++) {
-      combined += (end > start ? " " : "") + items[end].text;
+      if (end > start) combined += seps[end];
+      combined += items[end].text;
       if (normalize(combined).includes(q)) {
         // Narrow from the left: drop leading items that aren't part of the match
         let narrowed = combined;
         let s = start;
         while (s < end) {
-          const without = narrowed.slice(items[s].text.length + 1);
+          const without = narrowed.slice(items[s].text.length + seps[s + 1].length);
           if (normalize(without).includes(q)) {
             narrowed = without;
             s++;

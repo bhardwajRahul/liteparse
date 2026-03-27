@@ -2,8 +2,15 @@ import { describe, expect, it } from "vitest";
 import { searchItems } from "./searchItems";
 import { JsonTextItem } from "../core/types";
 
-function item(text: string, x: number, y: number, width: number, height = 12): JsonTextItem {
-  return { text, x, y, width, height };
+function item(
+  text: string,
+  x: number,
+  y: number,
+  width: number,
+  height = 12,
+  fontSize = 12
+): JsonTextItem {
+  return { text, x, y, width, height, fontSize };
 }
 
 describe("searchItems", () => {
@@ -51,6 +58,38 @@ describe("searchItems", () => {
     const items = [item("hello", 10, 20, 50)];
     const results = searchItems(items, { phrase: "goodbye" });
     expect(results).toHaveLength(0);
+  });
+
+  it("matches spatially adjacent items without inserting a space", () => {
+    // "29-CA-" and "261755" are adjacent (gap=0), so joined as "29-CA-261755"
+    // "Case No." and "29-CA-" have a word gap (gap=5 > tolerance), so space inserted
+    const items = [
+      item("Case No.", 10, 50, 60),
+      item("29-CA-", 75, 50, 50),
+      item("261755", 125, 50, 50),
+    ];
+    const results = searchItems(items, { phrase: "Case No. 29-CA-261755" });
+    expect(results).toHaveLength(1);
+    expect(results[0].text).toBe("Case No. 29-CA-261755");
+  });
+
+  it("matches adjacent items with en-dash", () => {
+    // "pages 10–" and "20" are adjacent (gap=0)
+    const items = [item("pages 10\u2013", 10, 50, 60), item("20", 70, 50, 20)];
+    const results = searchItems(items, { phrase: "pages 10\u201320" });
+    expect(results).toHaveLength(1);
+  });
+
+  it("narrows correctly past adjacent items", () => {
+    // "prefix" has word gap to "29-CA-", "29-CA-" is adjacent to "261755"
+    const items = [
+      item("prefix", 10, 50, 40),
+      item("29-CA-", 55, 50, 50),
+      item("261755", 105, 50, 50),
+    ];
+    const results = searchItems(items, { phrase: "29-CA-261755" });
+    expect(results).toHaveLength(1);
+    expect(results[0].x).toBe(55);
   });
 
   it("merges bounding boxes vertically for wrapped phrases", () => {
