@@ -11,6 +11,28 @@ const FLOATING_SPACES = 2;
 // Minimum spaces between snapped columns
 const COLUMN_SPACES = 4;
 
+// --- Flowing text detection thresholds ---
+// Max total anchors (left+right+center) before block is considered structured
+const FLOWING_MAX_TOTAL_ANCHORS = 4;
+// Max left anchors before block is considered structured
+const FLOWING_MAX_LEFT_ANCHORS = 3;
+// Minimum non-empty lines required to classify a block
+const FLOWING_MIN_LINES = 3;
+// Fraction of page width a line must span to count as "wide"
+const FLOWING_WIDE_LINE_RATIO = 0.5;
+// Fraction of lines that must be wide for a block to be flowing
+const FLOWING_WIDE_LINE_THRESHOLD = 0.6;
+// Multiplier on median char width for column gap detection
+const FLOWING_COLUMN_GAP_MULTIPLIER = 4;
+// Minimum items on a line to be classified as flowing in per-line detection
+const FLOWING_MIN_LINE_ITEMS = 3;
+// Height multiplier for word-break space threshold in flowing text
+const FLOWING_SPACE_HEIGHT_RATIO = 0.15;
+// Minimum absolute space threshold in flowing text
+const FLOWING_SPACE_MIN_THRESHOLD = 0.3;
+// Maximum indent (in character widths) for flowing text
+const FLOWING_MAX_INDENT = 8;
+
 type Snap = {
   bbox: ProjectionTextBox;
   lineIndex: number;
@@ -895,7 +917,14 @@ export function bboxToLine(
         const bothAreNumbers =
           looksLikeTableNumber(previousLine.str) && looksLikeTableNumber(currentLine.str);
 
-        if (!bothAreNumbers && currentLine.x - previousLine.x - previousLine.w <= mergeThreshold) {
+        // Check gap with BOTH rounded width (used elsewhere) and raw width from pageBbox.
+        // Only merge without space if both agree the gap is small enough. This prevents
+        // rounding artifacts from causing word fusions (e.g., "of" + "our" → "ofour"
+        // when Math.round(w) reduces the gap from 1.34 to 1.0)
+        const roundedGap = currentLine.x - previousLine.x - previousLine.w;
+        const rawGap =
+          currentLine.x - previousLine.x - (previousLine.pageBbox?.w ?? previousLine.w);
+        if (!bothAreNumbers && roundedGap <= mergeThreshold && rawGap <= mergeThreshold) {
           // if same word but less than .7 of prev line
           if (currentLine.h != 0 && currentLine.h < previousLine.h * 0.7) {
             // and not starting with space
@@ -1062,6 +1091,122 @@ function updateForwardAnchors(
   );
 }
 
+/**
+ * Compute the maximum gap between adjacent items on a line.
+ */
+function lineMaxGap(line: ProjectionTextBox[]): number {
+  let maxGap = 0;
+  for (let gi = 1; gi < line.length; gi++) {
+    const gap = line[gi].x - (line[gi - 1].x + line[gi - 1].w);
+    if (gap > maxGap) maxGap = gap;
+  }
+  return maxGap;
+}
+
+/**
+ * Render a single line as flowing text: join items with single spaces based on gap size.
+ * Sets bbox.rendered = true for each item.
+ */
+function renderLineAsFlowingText(
+  line: ProjectionTextBox[],
+  minX: number,
+  medianWidth: number
+): string {
+  const indent = Math.min(
+    Math.max(Math.round((line[0].x - minX) / medianWidth), 0),
+    FLOWING_MAX_INDENT
+  );
+  let result = " ".repeat(indent);
+
+  for (let i = 0; i < line.length; i++) {
+    const bbox = line[i];
+    if (i > 0) {
+      const prevBbox = line[i - 1];
+      const gap = bbox.x - (prevBbox.x + prevBbox.w);
+      const spaceThreshold = Math.max(
+        bbox.h * FLOWING_SPACE_HEIGHT_RATIO,
+        FLOWING_SPACE_MIN_THRESHOLD
+      );
+      if (gap > spaceThreshold && !result.endsWith(" ")) {
+        result += " ";
+      }
+    }
+    result += bbox.str;
+    bbox.rendered = true;
+  }
+
+  return result;
+}
+
+/**
+ * Classify whether a block of lines is flowing paragraph text or structured/tabular content.
+ * Flowing text gets a simpler rendering path that avoids grid projection artifacts.
+ */
+function isFlowingTextBlock(
+  blockLines: ProjectionTextBox[][],
+  anchorLeft: Anchor,
+  anchorRight: Anchor,
+  anchorCenter: Anchor,
+  pageWidth: number
+): boolean {
+  const leftAnchorCount = Object.keys(anchorLeft).length;
+  const rightAnchorCount = Object.keys(anchorRight).length;
+  const centerAnchorCount = Object.keys(anchorCenter).length;
+
+  // Multiple column anchors indicate structured/tabular content
+  if (leftAnchorCount + rightAnchorCount + centerAnchorCount > FLOWING_MAX_TOTAL_ANCHORS)
+    return false;
+  if (leftAnchorCount > FLOWING_MAX_LEFT_ANCHORS) return false;
+
+  // Count non-empty lines and how many span most of the page width
+  let nonEmptyLines = 0;
+  let wideLines = 0;
+  for (const line of blockLines) {
+    if (line.length === 0) continue;
+    nonEmptyLines++;
+    const lineStart = line[0].x;
+    const lineEnd = line[line.length - 1].x + line[line.length - 1].w;
+    if (lineEnd - lineStart > pageWidth * FLOWING_WIDE_LINE_RATIO) wideLines++;
+  }
+
+  // Need enough lines to confidently classify
+  if (nonEmptyLines < FLOWING_MIN_LINES) return false;
+
+  // Majority of lines should span most of page width for flowing text
+  return wideLines / nonEmptyLines > FLOWING_WIDE_LINE_THRESHOLD;
+}
+
+/**
+ * Render a flowing text block by joining items with single spaces.
+ * Avoids grid projection artifacts (excessive whitespace, fused words)
+ * that occur when applying column-alignment logic to paragraph text.
+ */
+function renderFlowingBlock(
+  lines: ProjectionTextBox[][],
+  block: LineRange,
+  rawLines: string[],
+  medianWidth: number
+): void {
+  // Find the block's left margin
+  let minX = Infinity;
+  for (let i = block.start; i < block.end; i++) {
+    if (lines[i].length > 0) {
+      minX = Math.min(minX, lines[i][0].x);
+    }
+  }
+  if (minX === Infinity) minX = 0;
+
+  for (let lineIndex = block.start; lineIndex < block.end; lineIndex++) {
+    const line = lines[lineIndex];
+    if (!rawLines[lineIndex]) {
+      rawLines[lineIndex] = "";
+    }
+    if (line.length === 0) continue;
+
+    rawLines[lineIndex] = renderLineAsFlowingText(line, minX, medianWidth);
+  }
+}
+
 function getMedianTextBoxSize(lines: ProjectionTextBox[]): TextBoxSize {
   // calculate median textBox width
   const widthList = [];
@@ -1198,10 +1343,22 @@ export function projectToGrid(
   }
 
   for (const block of blocks) {
+    const blockLines = lines.slice(block.start, block.end);
     const { anchorLeft, anchorRight, anchorCenter } = extractAnchorsPointsFromLines(
-      lines.slice(block.start, block.end),
+      blockLines,
       page
     );
+
+    // Block-level classification: if entire block is clearly flowing text,
+    // render it simply and skip grid projection
+    if (isFlowingTextBlock(blockLines, anchorLeft, anchorRight, anchorCenter, page.width)) {
+      if (!config.preserveLayoutAlignmentAcrossPages) {
+        const sizes = getMedianTextBoxSize(blockLines.flat());
+        medianWidth = sizes.width;
+      }
+      renderFlowingBlock(lines, block, rawLines, medianWidth);
+      continue;
+    }
 
     const snapMaps: SnapMaps = {
       left: [],
@@ -1314,6 +1471,72 @@ export function projectToGrid(
     snapMaps.right.sort((a, b) => a - b);
     snapMaps.left.sort((a, b) => a - b);
 
+    // Per-line flowing text detection: pre-render lines that are clearly paragraph text
+    // (spans page width, no large column gaps) with simple single-space joining.
+    // This avoids grid projection artifacts on flowing text within mixed blocks.
+    const flowingLines = new Set<number>();
+    {
+      // Find block's left margin for indent calculation
+      let blockMinX = Infinity;
+      for (let li = block.start; li < block.end; li++) {
+        if (lines[li].length > 0) {
+          blockMinX = Math.min(blockMinX, lines[li][0].x);
+        }
+      }
+      if (blockMinX === Infinity) blockMinX = 0;
+
+      const columnGapThreshold = medianWidth * FLOWING_COLUMN_GAP_MULTIPLIER;
+
+      // Helper to mark and render a line as flowing
+      function markFlowing(lineIndex: number): void {
+        const line = lines[lineIndex];
+        if (!rawLines[lineIndex]) {
+          rawLines[lineIndex] = "";
+          rawLinesDelta[lineIndex] = 0;
+        }
+        rawLines[lineIndex] = renderLineAsFlowingText(line, blockMinX, medianWidth);
+        flowingLines.add(lineIndex);
+      }
+
+      // First pass: detect clearly flowing lines (wide, no column gaps, enough items)
+      for (let lineIndex = block.start; lineIndex < block.end; lineIndex++) {
+        const line = lines[lineIndex];
+        if (line.length < FLOWING_MIN_LINE_ITEMS) continue;
+
+        const lineStart = line[0].x;
+        const lineEnd = line[line.length - 1].x + line[line.length - 1].w;
+        const lineSpan = lineEnd - lineStart;
+
+        if (
+          lineSpan > page.width * FLOWING_WIDE_LINE_RATIO &&
+          lineMaxGap(line) < columnGapThreshold
+        ) {
+          markFlowing(lineIndex);
+        }
+      }
+
+      // Second pass: extend flowing to adjacent continuation lines using
+      // forward + backward sweeps (O(n) instead of iterating until convergence)
+      // Forward sweep: propagate flowing status downward
+      for (let lineIndex = block.start; lineIndex < block.end; lineIndex++) {
+        if (flowingLines.has(lineIndex)) continue;
+        const line = lines[lineIndex];
+        if (line.length === 0) continue;
+        if (flowingLines.has(lineIndex - 1) && lineMaxGap(line) < columnGapThreshold) {
+          markFlowing(lineIndex);
+        }
+      }
+      // Backward sweep: propagate flowing status upward
+      for (let lineIndex = block.end - 1; lineIndex >= block.start; lineIndex--) {
+        if (flowingLines.has(lineIndex)) continue;
+        const line = lines[lineIndex];
+        if (line.length === 0) continue;
+        if (flowingLines.has(lineIndex + 1) && lineMaxGap(line) < columnGapThreshold) {
+          markFlowing(lineIndex);
+        }
+      }
+    }
+
     while (hasChanged || snapMaps.right.length || snapMaps.left.length || snapMaps.center.length) {
       hasChanged = false;
 
@@ -1411,7 +1634,11 @@ export function projectToGrid(
       ) {
         const thisTurnSnap: Snap[] = [];
         for (const item of leftSnap) {
-          if (item.bbox.leftAnchor && parseFloat(item.bbox.leftAnchor) == snapMaps.left[0]) {
+          if (
+            item.bbox.leftAnchor &&
+            parseFloat(item.bbox.leftAnchor) == snapMaps.left[0] &&
+            !flowingLines.has(item.lineIndex)
+          ) {
             thisTurnSnap.push(item);
           }
         }
@@ -1461,6 +1688,7 @@ export function projectToGrid(
 
         for (const currentLeftSnapBox of thisTurnSnap) {
           const lineIndex = currentLeftSnapBox.lineIndex;
+          if (flowingLines.has(lineIndex)) continue;
           if (targetX > rawLines[lineIndex].length) {
             rawLines[lineIndex] += " ".repeat(targetX - rawLines[lineIndex].length);
           }
@@ -1481,6 +1709,7 @@ export function projectToGrid(
         }
 
         for (let index = block.start; index < block.end; ++index) {
+          if (flowingLines.has(index)) continue;
           const line = rawLines[index];
           if (line.length < targetX) {
             rawLines[index] += " ".repeat(targetX - line.length);
@@ -1495,7 +1724,11 @@ export function projectToGrid(
         const thisTurnSnap: Snap[] = [];
         hasChanged = true;
         for (const item of rightSnap) {
-          if (item.bbox.rightAnchor && parseFloat(item.bbox.rightAnchor) == snapMaps.right[0]) {
+          if (
+            item.bbox.rightAnchor &&
+            parseFloat(item.bbox.rightAnchor) == snapMaps.right[0] &&
+            !flowingLines.has(item.lineIndex)
+          ) {
             thisTurnSnap.push(item);
           }
         }
@@ -1542,6 +1775,7 @@ export function projectToGrid(
 
         for (const currentRightSnapBox of thisTurnSnap) {
           const lineIndex = currentRightSnapBox.lineIndex;
+          if (flowingLines.has(lineIndex)) continue;
           rawLines[lineIndex] = rawLines[lineIndex].trimEnd();
           if (targetX > rawLines[lineIndex].trimEnd().length + currentRightSnapBox.bbox.strLength) {
             rawLines[lineIndex] += " ".repeat(
@@ -1564,6 +1798,7 @@ export function projectToGrid(
           );
         }
         for (let index = block.start; index < block.end; ++index) {
+          if (flowingLines.has(index)) continue;
           const line = rawLines[index];
           if (line.length < targetX) {
             rawLines[index] += " ".repeat(targetX - line.length);
@@ -1578,7 +1813,11 @@ export function projectToGrid(
         const thisTurnSnap: Snap[] = [];
         hasChanged = true;
         for (const item of centerSnap) {
-          if (item.bbox.centerAnchor && parseFloat(item.bbox.centerAnchor) == snapMaps.center[0]) {
+          if (
+            item.bbox.centerAnchor &&
+            parseFloat(item.bbox.centerAnchor) == snapMaps.center[0] &&
+            !flowingLines.has(item.lineIndex)
+          ) {
             thisTurnSnap.push(item);
           }
         }
@@ -1621,6 +1860,7 @@ export function projectToGrid(
         }
         forwardAnchors.center[snapMaps.center[0]] = targetX;
         for (const currentCenterSnapBox of thisTurnSnap) {
+          if (flowingLines.has(currentCenterSnapBox.lineIndex)) continue;
           if (
             targetX >
             rawLines[currentCenterSnapBox.lineIndex].length +

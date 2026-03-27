@@ -1,5 +1,17 @@
 # @llamaindex/liteparse
 
+## 1.3.2
+
+### Patch Changes
+
+- [#55](https://github.com/run-llama/liteparse/pull/55) [`b57cb61`](https://github.com/run-llama/liteparse/commit/b57cb61de9371cbc1cf91f01aafc7e1fe912e520) Thanks [@hexapode](https://github.com/hexapode)! - Improve text projection on justified text
+
+## 1.3.1
+
+### Patch Changes
+
+- [#70](https://github.com/run-llama/liteparse/pull/70) [`243dc05`](https://github.com/run-llama/liteparse/commit/243dc0556769a59cf59e6565a5657b7d2630fc97) Thanks [@saravananravi08](https://github.com/saravananravi08)! - fix: resolve standard font loading failure in Node.js
+
 ## 1.3.0
 
 ### Minor Changes
