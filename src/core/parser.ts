@@ -157,60 +157,60 @@ export class LiteParse {
 
     log(`Loaded PDF with ${doc.numPages} pages`);
 
-    // Extract pages
-    const pages = await this.pdfEngine.extractAllPages(
-      doc,
-      this.config.maxPages,
-      this.config.targetPages
-    );
+    try {
+      // Extract pages
+      const pages = await this.pdfEngine.extractAllPages(
+        doc,
+        this.config.maxPages,
+        this.config.targetPages
+      );
 
-    // run BEFORE grid projection
-    if (this.ocrEngine) {
-      await this.runOCR(doc, pages, log);
-    }
+      // run BEFORE grid projection
+      if (this.ocrEngine) {
+        await this.runOCR(doc, pages, log);
+      }
 
-    // Process pages with complete grid projection (after OCR)
-    const processedPages = projectPagesToGrid(pages, this.config);
+      // Process pages with complete grid projection (after OCR)
+      const processedPages = projectPagesToGrid(pages, this.config);
 
-    // Build bounding boxes if enabled
-    if (this.config.preciseBoundingBox) {
-      for (const page of processedPages) {
-        page.boundingBoxes = buildBoundingBoxes(page.textItems);
+      // Build bounding boxes if enabled
+      if (this.config.preciseBoundingBox) {
+        for (const page of processedPages) {
+          page.boundingBoxes = buildBoundingBoxes(page.textItems);
+        }
+      }
+
+      // Build final text
+      const fullText = processedPages.map((p) => p.text).join("\n\n");
+
+      const result: ParseResult = {
+        pages: processedPages,
+        text: fullText,
+      };
+
+      // Format based on output format
+      switch (this.config.outputFormat) {
+        case "json":
+          result.json = JSON.parse(formatJSON(result));
+          break;
+        case "text":
+          // Already in text format
+          break;
+      }
+
+      return result;
+    } finally {
+      // Always release resources, even if processing throws
+      await this.pdfEngine.close(doc);
+
+      if (this.ocrEngine && "terminate" in this.ocrEngine) {
+        await (this.ocrEngine as TesseractEngine).terminate();
+      }
+
+      if (needsCleanup && cleanupPath) {
+        await cleanupConversionFiles(cleanupPath);
       }
     }
-
-    // Build final text
-    const fullText = processedPages.map((p) => p.text).join("\n\n");
-
-    // Close PDF document
-    await this.pdfEngine.close(doc);
-
-    // Cleanup OCR engine if it's Tesseract (to free memory)
-    if (this.ocrEngine && "terminate" in this.ocrEngine) {
-      await (this.ocrEngine as TesseractEngine).terminate();
-    }
-
-    // Cleanup temporary conversion files
-    if (needsCleanup && cleanupPath) {
-      await cleanupConversionFiles(cleanupPath);
-    }
-
-    const result: ParseResult = {
-      pages: processedPages,
-      text: fullText,
-    };
-
-    // Format based on output format
-    switch (this.config.outputFormat) {
-      case "json":
-        result.json = JSON.parse(formatJSON(result));
-        break;
-      case "text":
-        // Already in text format
-        break;
-    }
-
-    return result;
   }
 
   /**
