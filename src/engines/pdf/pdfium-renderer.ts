@@ -52,10 +52,7 @@ export class PdfiumRenderer {
    * (`renderPageToBuffer`, `extractImageBounds`) reuse it instead
    * of re-parsing the file on every invocation.
    */
-  async loadDocument(
-    pdfInput: string | Buffer | Uint8Array,
-    password?: string
-  ): Promise<void> {
+  async loadDocument(pdfInput: string | Buffer | Uint8Array, password?: string): Promise<void> {
     await this.init();
     this.closeDocument();
     const pdfBuffer =
