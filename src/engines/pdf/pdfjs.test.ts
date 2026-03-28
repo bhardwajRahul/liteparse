@@ -48,7 +48,10 @@ vi.mock("./pdfium-renderer.js", async () => {
       class {
         constructor() {}
 
+        loadDocument = vi.fn().mockResolvedValue(undefined);
+        closeDocument = vi.fn();
         renderPageToBuffer = vi.fn().mockResolvedValue(Buffer.from("this is a page"));
+        close = vi.fn().mockResolvedValue(undefined);
       }
     ),
   };

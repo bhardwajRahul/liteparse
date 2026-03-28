@@ -601,10 +601,11 @@ export class PdfJsEngine implements PdfEngine {
 
     let images: Image[] = [];
     try {
+      const pdfInput = this.currentPdfPath || this.currentPdfData || doc.data;
       if (!this.pdfiumRenderer) {
         this.pdfiumRenderer = new PdfiumRenderer();
+        await this.pdfiumRenderer.loadDocument(pdfInput);
       }
-      const pdfInput = this.currentPdfPath || this.currentPdfData || doc.data;
       const imageBounds = await this.pdfiumRenderer.extractImageBounds(pdfInput, pageNum);
       images = imageBounds.map((bounds) => ({
         x: bounds.x,
@@ -667,14 +668,14 @@ export class PdfJsEngine implements PdfEngine {
     dpi: number,
     password?: string
   ): Promise<Buffer> {
-    if (!this.pdfiumRenderer) {
-      this.pdfiumRenderer = new PdfiumRenderer();
-    }
-
-    // Use file path when available, otherwise pass buffer directly
     const pdfInput = this.currentPdfPath || this.currentPdfData;
     if (!pdfInput) {
       throw new Error("No PDF path or data available for rendering");
+    }
+
+    if (!this.pdfiumRenderer) {
+      this.pdfiumRenderer = new PdfiumRenderer();
+      await this.pdfiumRenderer.loadDocument(pdfInput, password);
     }
 
     return await this.pdfiumRenderer.renderPageToBuffer(pdfInput, pageNum, dpi, password);

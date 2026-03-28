@@ -1,4 +1,4 @@
-import { PDFiumLibrary, type PDFiumPageRenderOptions } from "@hyzyla/pdfium";
+import { PDFiumLibrary, PDFiumDocument, type PDFiumPageRenderOptions } from "@hyzyla/pdfium";
 import sharp from "sharp";
 import { promises as fs } from "fs";
 
@@ -39,11 +39,49 @@ interface PdfiumPageInternal {
  */
 export class PdfiumRenderer {
   private pdfium: PDFiumLibrary | null = null;
+  private cachedDocument: PDFiumDocument | null = null;
 
   async init(): Promise<void> {
     if (!this.pdfium) {
       this.pdfium = await PDFiumLibrary.init();
     }
+  }
+
+  /**
+   * Pre-load a PDF document so that subsequent per-page calls
+   * (`renderPageToBuffer`, `extractImageBounds`) reuse it instead
+   * of re-parsing the file on every invocation.
+   */
+  async loadDocument(
+    pdfInput: string | Buffer | Uint8Array,
+    password?: string
+  ): Promise<void> {
+    await this.init();
+    this.closeDocument();
+    const pdfBuffer =
+      typeof pdfInput === "string" ? await fs.readFile(pdfInput) : Buffer.from(pdfInput);
+    this.cachedDocument = await this.pdfium!.loadDocument(pdfBuffer, password);
+  }
+
+  closeDocument(): void {
+    if (this.cachedDocument) {
+      this.cachedDocument.destroy();
+      this.cachedDocument = null;
+    }
+  }
+
+  private async getOrLoadDocument(
+    pdfInput: string | Buffer | Uint8Array,
+    password?: string
+  ): Promise<{ document: PDFiumDocument; isTemporary: boolean }> {
+    if (this.cachedDocument) {
+      return { document: this.cachedDocument, isTemporary: false };
+    }
+    await this.init();
+    const pdfBuffer =
+      typeof pdfInput === "string" ? await fs.readFile(pdfInput) : Buffer.from(pdfInput);
+    const document = await this.pdfium!.loadDocument(pdfBuffer, password);
+    return { document, isTemporary: true };
   }
 
   async renderPageToBuffer(
@@ -52,27 +90,12 @@ export class PdfiumRenderer {
     dpi: number = 150,
     password?: string
   ): Promise<Buffer> {
-    await this.init();
-
-    if (!this.pdfium) {
-      throw new Error("PDFium not initialized");
-    }
-
-    // Accept file path or raw bytes
-    const pdfBuffer =
-      typeof pdfInput === "string" ? await fs.readFile(pdfInput) : Buffer.from(pdfInput);
-
-    // Load document
-    const document = await this.pdfium.loadDocument(pdfBuffer, password);
+    const { document, isTemporary } = await this.getOrLoadDocument(pdfInput, password);
 
     try {
-      // Get page (0-indexed in pdfium)
       const page = document.getPage(pageNumber - 1);
-
-      // Calculate scale from DPI (72 DPI is the default)
       const scale = dpi / 72;
 
-      // Render page using Sharp for image processing
       const image = await page.render({
         scale,
         render: async (options: PDFiumPageRenderOptions) => {
@@ -95,8 +118,9 @@ export class PdfiumRenderer {
 
       return Buffer.from(image.data);
     } finally {
-      // Clean up document
-      document.destroy();
+      if (isTemporary) {
+        document.destroy();
+      }
     }
   }
 
@@ -110,20 +134,9 @@ export class PdfiumRenderer {
     pageNumber: number,
     password?: string
   ): Promise<Array<{ x: number; y: number; width: number; height: number }>> {
-    await this.init();
-
-    if (!this.pdfium) {
-      throw new Error("PDFium not initialized");
-    }
-
-    const pdfBuffer =
-      typeof pdfInput === "string" ? await fs.readFile(pdfInput) : Buffer.from(pdfInput);
-
-    const document = await this.pdfium.loadDocument(pdfBuffer, password);
+    const { document, isTemporary } = await this.getOrLoadDocument(pdfInput, password);
 
     try {
-      // Cast to internal interface — module/pageIdx/objectIdx are private in
-      // @hyzyla/pdfium typings but required for low-level WASM bound queries
       const page = document.getPage(pageNumber - 1) as unknown as PdfiumPageInternal;
       const results: Array<{ x: number; y: number; width: number; height: number }> = [];
 
@@ -134,18 +147,15 @@ export class PdfiumRenderer {
         return results;
       }
 
-      // Get page dimensions via WASM (getSize() is private in typings)
       const pageWidth = mod._FPDF_GetPageWidthF(pagePtr);
       const pageHeight = mod._FPDF_GetPageHeightF(pagePtr);
 
-      // Iterate page objects looking for images
       for (const obj of page.objects()) {
         if (obj.type !== "image") continue;
 
         const objHandle = obj.objectIdx;
         if (!objHandle) continue;
 
-        // Allocate memory for 4 floats (left, bottom, right, top)
         const ptr = mod._malloc(16);
         try {
           const ok = mod._FPDFPageObj_GetBounds(objHandle, ptr, ptr + 4, ptr + 8, ptr + 12);
@@ -165,7 +175,6 @@ export class PdfiumRenderer {
           if (w > pageWidth * MAX_IMAGE_PAGE_COVERAGE && h > pageHeight * MAX_IMAGE_PAGE_COVERAGE)
             continue;
 
-          // Convert PDF coords (Y-up) to viewport coords (Y-down)
           results.push({
             x: left,
             y: pageHeight - top,
@@ -179,12 +188,14 @@ export class PdfiumRenderer {
 
       return results;
     } finally {
-      document.destroy();
+      if (isTemporary) {
+        document.destroy();
+      }
     }
   }
 
   async close(): Promise<void> {
-    // PDFium WASM doesn't need explicit cleanup
+    this.closeDocument();
     if (this.pdfium) {
       this.pdfium.destroy();
       this.pdfium = null;
