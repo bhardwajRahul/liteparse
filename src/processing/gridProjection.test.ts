@@ -249,12 +249,7 @@ describe("test bboxToLine", () => {
     const result = bboxToLine(textBbox, 5, 6);
     const renderedLines = result.map((line) => line.map((bbox) => bbox.str).join(" "));
 
-    expect(renderedLines).toStrictEqual([
-      "Heading",
-      "",
-      "First paragraph",
-      "Second line",
-    ]);
+    expect(renderedLines).toStrictEqual(["Heading", "", "First paragraph", "Second line"]);
   });
 });
 
