@@ -1,5 +1,11 @@
 # @llamaindex/liteparse
 
+## 1.4.3
+
+### Patch Changes
+
+- [#108](https://github.com/run-llama/liteparse/pull/108) [`f4ee121`](https://github.com/run-llama/liteparse/commit/f4ee121d800b01f007a1d970d8197eda6673b392) Thanks [@Winds-AI](https://github.com/Winds-AI)! - Fix OCR bullet line spacing inflation
+
 ## 1.4.2
 
 ### Patch Changes
