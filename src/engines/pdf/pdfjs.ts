@@ -54,7 +54,7 @@ interface PdfJsExtendedDocument extends PdfDocument {
 }
 
 // Dynamic import of PDF.js
-const { fn: getDocument, dir: PDFJS_DIR, VerbosityLevel } = await importPdfJs();
+const { fn: getDocument, dir: PDFJS_DIR } = await importPdfJs();
 
 const CMAP_URL = `${PDFJS_DIR}/cmaps/`;
 const STANDARD_FONT_DATA_URL = `${PDFJS_DIR}/standard_fonts/`;
@@ -684,7 +684,7 @@ export class PdfJsEngine implements PdfEngine {
       cMapPacked: CMAP_PACKED,
       standardFontDataUrl: STANDARD_FONT_DATA_URL,
       wasmUrl: WASM_URL,
-      verbosity: VerbosityLevel.ERRORS,
+      verbosity: 0, // VerbosityLevel.ERRORS — suppress Type3 font warnings
     });
 
     let pdfDocument: PdfJsDocument;
