@@ -57,6 +57,16 @@ export interface GridDebugConfig {
    * @defaultValue `"./debug-output"`
    */
   visualizePath?: string;
+
+  /**
+   * Enable trace mode for detailed render decision logging.
+   * When enabled, each render logs the full decision chain: initial targetX,
+   * lineMax computation, forward anchor checks, and which factor was the
+   * binding constraint. Forward anchor mutations are also traced with their
+   * triggering item. Respects textFilter/lineFilter/pageFilter.
+   * @defaultValue `false`
+   */
+  trace?: boolean;
 }
 
 export const DEFAULT_DEBUG_CONFIG: GridDebugConfig = {
@@ -79,6 +89,49 @@ export interface RenderedSegment {
   gridCol: number;
   text: string;
   snap: "left" | "right" | "center" | "floating" | "flowing";
+}
+
+/** Context for a render decision trace — captures every factor that influenced targetX. */
+export interface RenderTraceContext {
+  snapType: "left" | "right" | "center" | "floating";
+
+  // Initial calculation
+  initialTargetX: number;
+  medianWidth: number;
+
+  // lineMax computation
+  lineMax: number;
+  lastSnapLeft?: number;
+  lastSnapLeftKey?: number;
+  rawLineTrimLength: number;
+  shouldSpace: number;
+
+  // For right snap: per-item lineMax candidates
+  lineMaxCandidates?: Array<{
+    text: string;
+    lineIndex: number;
+    lineItemCount: number;
+    filtered: boolean;
+    value: number;
+  }>;
+
+  // Forward anchor check
+  forwardAnchorValue?: number;
+
+  // prevAnchors check
+  prevAnchorValue?: number;
+
+  // Floating-specific
+  pdfFallbackUsed?: boolean;
+  pdfFallbackTargetX?: number;
+  floatingAnchorBump?: number;
+
+  // Sparse anchor (left snap)
+  isSparseAnchor?: boolean;
+
+  // Final
+  finalTargetX: number;
+  bindingConstraint: string;
 }
 
 /** Captured data for a single page, used by the grid visualizer. */
@@ -111,6 +164,10 @@ export class GridDebugLogger {
   private entries: LogEntry[] = [];
   private currentPage: number = 0;
   private writeOutput: (msg: string) => void;
+
+  // Trace mode: snap positions that matched-filter items belong to.
+  // Forward anchor mutations affecting these positions are always logged.
+  private trackedSnapPositions = new Set<number>();
 
   // Visualization data collection
   private vizPages: VisualizerPageData[] = [];
@@ -282,6 +339,15 @@ export class GridDebugLogger {
   /** Log snap assignment for a bbox */
   logSnapAssignment(bbox: ProjectionTextBox, lineIndex: number, boxIndex: number): void {
     if (!this.matchesBbox(bbox, lineIndex)) return;
+
+    // Track snap positions for matched items so we can trace forward anchor
+    // mutations that affect them even when the triggering item doesn't match filters
+    if (this.config.trace) {
+      if (bbox.leftAnchor) this.trackedSnapPositions.add(parseFloat(bbox.leftAnchor));
+      if (bbox.rightAnchor) this.trackedSnapPositions.add(parseFloat(bbox.rightAnchor));
+      if (bbox.centerAnchor) this.trackedSnapPositions.add(parseFloat(bbox.centerAnchor));
+    }
+
     this.emit({
       phase: "snap",
       lineIndex,
@@ -356,6 +422,108 @@ export class GridDebugLogger {
       phase: "dedup",
       text: bbox.str,
       message: `"${bbox.str.substring(0, 40)}" multi-anchor resolved to ${resolvedTo} (left=${bbox.leftAnchor ?? "-"} right=${bbox.rightAnchor ?? "-"} center=${bbox.centerAnchor ?? "-"})`,
+    });
+  }
+
+  /** Log block-level context (medianWidth, sparse anchors, snap maps) */
+  logBlockContext(
+    blockStart: number,
+    blockEnd: number,
+    medianWidth: number,
+    sparseLeftAnchors: Set<number>
+  ): void {
+    if (!this.config.trace || !this.config.enabled || this.isPageFiltered()) return;
+    let msg = `Block ${blockStart}-${blockEnd - 1}: medianWidth=${round2(medianWidth)}`;
+    if (sparseLeftAnchors.size > 0) {
+      msg += `, sparseLeft=[${[...sparseLeftAnchors].map(round2).join(", ")}]`;
+    }
+    this.emit({ phase: "trace-block", message: msg });
+  }
+
+  /** Log full render decision trace for a single item */
+  logRenderTrace(bbox: ProjectionTextBox, lineIndex: number, ctx: RenderTraceContext): void {
+    if (!this.config.trace || !this.matchesBbox(bbox, lineIndex)) return;
+
+    const lines: string[] = [];
+    lines.push(
+      `"${bbox.str.substring(0, 40)}" → col ${ctx.finalTargetX} (${ctx.snapType}) [binding: ${ctx.bindingConstraint}]`
+    );
+    lines.push(
+      `  initial: round(${round2(bbox.x)} / ${round2(ctx.medianWidth)}) = ${ctx.initialTargetX}, COLUMN_SPACES cap → ${Math.min(ctx.initialTargetX, 4)}`
+    );
+
+    // lineMax details
+    if (ctx.lineMaxCandidates) {
+      // Right snap: show per-item candidates
+      lines.push(`  lineMax: ${ctx.lineMax} from ${ctx.lineMaxCandidates.length} candidates:`);
+      for (const c of ctx.lineMaxCandidates) {
+        const mark = c.filtered ? " [FILTERED: single-item line]" : "";
+        lines.push(
+          `    L${c.lineIndex} "${c.text}" → ${c.value} (lineItems=${c.lineItemCount})${mark}`
+        );
+      }
+    } else {
+      const parts: string[] = [];
+      if (ctx.lastSnapLeft !== undefined && ctx.lastSnapLeft > 0) {
+        parts.push(
+          `lastSnapLeft=${ctx.lastSnapLeft}${ctx.lastSnapLeftKey !== undefined ? ` (from left@${round2(ctx.lastSnapLeftKey)})` : ""}`
+        );
+      }
+      parts.push(`rawLine.trimEnd=${ctx.rawLineTrimLength}`);
+      if (ctx.shouldSpace > 0) parts.push(`shouldSpace=${ctx.shouldSpace}`);
+      lines.push(`  lineMax: ${ctx.lineMax} (${parts.join(", ")})`);
+    }
+
+    // Forward anchor
+    if (ctx.forwardAnchorValue !== undefined) {
+      lines.push(`  forwardAnchor: ${ctx.forwardAnchorValue}`);
+    }
+    // prevAnchors
+    if (ctx.prevAnchorValue !== undefined) {
+      lines.push(`  prevAnchor: ${ctx.prevAnchorValue}`);
+    }
+    // Floating-specific
+    if (ctx.pdfFallbackUsed) {
+      lines.push(`  pdfFallback: targetX raised to ${ctx.pdfFallbackTargetX} (empty line)`);
+    }
+    if (ctx.floatingAnchorBump !== undefined) {
+      lines.push(`  floatingAnchor bump: +${ctx.floatingAnchorBump}`);
+    }
+    if (ctx.isSparseAnchor) {
+      lines.push(`  sparse anchor: skipping forward anchor propagation and block padding`);
+    }
+
+    this.emit({
+      phase: "trace-render",
+      lineIndex,
+      text: bbox.str,
+      message: lines.join("\n"),
+    });
+  }
+
+  /** Log a forward anchor mutation with the triggering item */
+  logForwardAnchorMutation(
+    triggerText: string,
+    triggerLineIndex: number,
+    snapType: string,
+    snapPosition: number,
+    oldValue: number | undefined,
+    newValue: number,
+    rightBound: number
+  ): void {
+    if (!this.config.trace || !this.config.enabled || this.isPageFiltered()) return;
+    // Log if: no text filter, or trigger matches filter, or snap position is tracked
+    if (this.config.textFilter?.length) {
+      const text = triggerText.toLowerCase();
+      const matchesTrigger = this.config.textFilter.some((f) => text.includes(f.toLowerCase()));
+      const matchesPosition = this.trackedSnapPositions.has(snapPosition);
+      if (!matchesTrigger && !matchesPosition) return;
+    }
+    const oldStr = oldValue !== undefined ? `was ${oldValue}` : "unset";
+    this.emit({
+      phase: "trace-fwd-mutation",
+      lineIndex: triggerLineIndex,
+      message: `${snapType}@${round2(snapPosition)}: ${oldStr} → ${newValue} (triggered by "${triggerText.substring(0, 40)}" L${triggerLineIndex}, rightBound=${round2(rightBound)})`,
     });
   }
 
@@ -453,6 +621,9 @@ class NoopGridDebugLogger extends GridDebugLogger {
   override logRender(): void {}
   override logForwardAnchor(): void {}
   override logDuplicateResolution(): void {}
+  override logBlockContext(): void {}
+  override logRenderTrace(): void {}
+  override logForwardAnchorMutation(): void {}
   override logLineComposition(): void {}
   override flushSync(): void {}
   override async flush(): Promise<void> {}

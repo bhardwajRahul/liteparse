@@ -1098,7 +1098,11 @@ function updateForwardAnchorRightBound(
   snapMap: number[],
   forwardAnchor: ForwardAnchor,
   rightBound: number,
-  anchorTarget: number
+  anchorTarget: number,
+  logger: GridDebugLogger,
+  triggerText: string,
+  triggerLineIndex: number,
+  snapType: string
 ): void {
   // Anything snapped to the right of rightBound should be aligned to anchorTarget line length at minimum
   // Also update nearby positions (within tolerance) to handle slight position variations between rows
@@ -1108,14 +1112,34 @@ function updateForwardAnchorRightBound(
     const anchor = snapMap[i];
     if (rightBound <= anchor) {
       if (!forwardAnchor[anchor] || anchorTarget > forwardAnchor[anchor]) {
+        const oldValue = forwardAnchor[anchor];
         forwardAnchor[anchor] = anchorTarget;
+        logger.logForwardAnchorMutation(
+          triggerText,
+          triggerLineIndex,
+          snapType,
+          anchor,
+          oldValue,
+          anchorTarget,
+          rightBound
+        );
       }
       // Also update nearby positions within tolerance
       for (let j = i - 1; j >= 0; --j) {
         const nearbyAnchor = snapMap[j];
         if (anchor - nearbyAnchor > POSITION_TOLERANCE) break;
         if (!forwardAnchor[nearbyAnchor] || anchorTarget > forwardAnchor[nearbyAnchor]) {
+          const oldValue = forwardAnchor[nearbyAnchor];
           forwardAnchor[nearbyAnchor] = anchorTarget;
+          logger.logForwardAnchorMutation(
+            triggerText,
+            triggerLineIndex,
+            snapType,
+            nearbyAnchor,
+            oldValue,
+            anchorTarget,
+            rightBound
+          );
         }
       }
     } else {
@@ -1129,21 +1153,47 @@ function updateForwardAnchors(
   nextBbox: ProjectionTextBox | null,
   snapMaps: SnapMaps,
   forwardAnchors: PageForwardAnchors,
-  lineLength: number
+  lineLength: number,
+  logger: GridDebugLogger,
+  lineIndex: number
 ): void {
   const rightBound = bbox.x + bbox.w;
   let targetLength = lineLength;
   if (nextBbox && (nextBbox.shouldSpace ?? 0) > 0) {
     targetLength += nextBbox.shouldSpace ?? 0;
   }
-  updateForwardAnchorRightBound(snapMaps.left, forwardAnchors.left, rightBound, targetLength);
-  updateForwardAnchorRightBound(snapMaps.right, forwardAnchors.right, rightBound, targetLength);
+  const triggerText = bbox.str;
+  updateForwardAnchorRightBound(
+    snapMaps.left,
+    forwardAnchors.left,
+    rightBound,
+    targetLength,
+    logger,
+    triggerText,
+    lineIndex,
+    "left"
+  );
+  updateForwardAnchorRightBound(
+    snapMaps.right,
+    forwardAnchors.right,
+    rightBound,
+    targetLength,
+    logger,
+    triggerText,
+    lineIndex,
+    "right"
+  );
+
   // we do not update center anchors since centered text may span between snapped columns
   updateForwardAnchorRightBound(
     snapMaps.floating,
     forwardAnchors.floating,
     rightBound,
-    targetLength
+    targetLength,
+    logger,
+    triggerText,
+    lineIndex,
+    "floating"
   );
 }
 
@@ -1474,6 +1524,8 @@ export function projectToGrid(
       void sizes.height;
     }
 
+    logger.logBlockContext(block.start, block.end, medianWidth, new Set());
+
     // compute snaps
     for (let lineIndex = block.start; lineIndex < block.end; ++lineIndex) {
       const line = lines[lineIndex];
@@ -1649,23 +1701,32 @@ export function projectToGrid(
             break;
           }
 
-          let targetX = Math.min(Math.round(bbox.x / medianWidth), COLUMN_SPACES);
+          const initialTargetX = Math.round(bbox.x / medianWidth);
+          let targetX = Math.min(initialTargetX, COLUMN_SPACES);
 
           let lastSnapLeft = 0;
+          let lastSnapLeftKey: number | undefined;
           for (const key in forwardAnchors.left) {
             // Use parseFloat to preserve decimal precision from anchor keys
             if (parseFloat(key) <= bbox.x) {
-              lastSnapLeft = Math.max(lastSnapLeft, forwardAnchors.left[key]);
+              if (forwardAnchors.left[key] > lastSnapLeft) {
+                lastSnapLeft = forwardAnchors.left[key];
+                lastSnapLeftKey = parseFloat(key);
+              }
             }
           }
-          const lineMax = Math.max(
-            lastSnapLeft,
-            rawLines[lineIndex].trimEnd().length + (bbox.shouldSpace ?? 0)
-          );
+          const rawLineTrimLength = rawLines[lineIndex].trimEnd().length;
+          const lineMax = Math.max(lastSnapLeft, rawLineTrimLength + (bbox.shouldSpace ?? 0));
+          let bindingConstraint = "COLUMN_SPACES";
           if (targetX < lineMax) {
             targetX = lineMax;
+            bindingConstraint =
+              lastSnapLeft >= rawLineTrimLength + (bbox.shouldSpace ?? 0)
+                ? "lastSnapLeft"
+                : "lineMax";
           }
 
+          let floatingAnchorBump: number | undefined;
           if (!bbox.forceUnsnapped) {
             const floatingAnchor = forwardAnchors.floating[Math.round(bbox.x)];
             if (floatingAnchor && targetX < floatingAnchor) {
@@ -1674,10 +1735,26 @@ export function projectToGrid(
               const maxFloatingGap = 4;
               const adjustedAnchor = Math.min(floatingAnchor, targetX + maxFloatingGap);
               if (adjustedAnchor > targetX) {
+                floatingAnchorBump = adjustedAnchor - targetX;
                 targetX = adjustedAnchor;
+                bindingConstraint = "floatingAnchor";
               }
             }
           }
+
+          logger.logRenderTrace(bbox, lineIndex, {
+            snapType: "floating",
+            initialTargetX,
+            medianWidth,
+            lineMax,
+            lastSnapLeft: lastSnapLeft > 0 ? lastSnapLeft : undefined,
+            lastSnapLeftKey,
+            rawLineTrimLength,
+            shouldSpace: bbox.shouldSpace ?? 0,
+            floatingAnchorBump,
+            finalTargetX: targetX,
+            bindingConstraint,
+          });
 
           rawLines[lineIndex] = rawLines[lineIndex].trimEnd();
           if (targetX > rawLines[lineIndex].length) {
@@ -1701,7 +1778,9 @@ export function projectToGrid(
               nextBbox,
               snapMaps,
               forwardAnchors,
-              rawLines[lineIndex].length
+              rawLines[lineIndex].length,
+              logger,
+              lineIndex
             );
           }
         }
@@ -1728,7 +1807,8 @@ export function projectToGrid(
           continue;
         }
 
-        let targetX = Math.min(Math.round(snapMaps.left[0] / medianWidth), COLUMN_SPACES);
+        const leftInitialTargetX = Math.round(snapMaps.left[0] / medianWidth);
+        let targetX = Math.min(leftInitialTargetX, COLUMN_SPACES);
         const lineMax = Math.max(
           ...thisTurnSnap.map((v) => {
             let spaceEnd = 0;
@@ -1747,21 +1827,21 @@ export function projectToGrid(
           })
         );
 
+        let leftBindingConstraint = "COLUMN_SPACES";
         if (targetX < lineMax) {
           targetX = lineMax;
+          leftBindingConstraint = "lineMax";
         }
 
-        if (
-          forwardAnchors.left[snapMaps.left[0]] &&
-          targetX < forwardAnchors.left[snapMaps.left[0]]
-        ) {
-          targetX = forwardAnchors.left[snapMaps.left[0]];
+        const leftForwardAnchorValue = forwardAnchors.left[snapMaps.left[0]];
+        if (leftForwardAnchorValue && targetX < leftForwardAnchorValue) {
+          targetX = leftForwardAnchorValue;
+          leftBindingConstraint = "forwardAnchor";
         }
-        if (
-          prevAnchors.forwardAnchorLeft[snapMaps.left[0]] &&
-          targetX < prevAnchors.forwardAnchorLeft[snapMaps.left[0]]
-        ) {
-          targetX = prevAnchors.forwardAnchorLeft[snapMaps.left[0]];
+        const leftPrevAnchorValue = prevAnchors.forwardAnchorLeft[snapMaps.left[0]];
+        if (leftPrevAnchorValue && targetX < leftPrevAnchorValue) {
+          targetX = leftPrevAnchorValue;
+          leftBindingConstraint = "prevAnchor";
         }
 
         forwardAnchors.left[snapMaps.left[0]] = targetX;
@@ -1770,6 +1850,20 @@ export function projectToGrid(
         for (const currentLeftSnapBox of thisTurnSnap) {
           const lineIndex = currentLeftSnapBox.lineIndex;
           if (flowingLines.has(lineIndex)) continue;
+
+          logger.logRenderTrace(currentLeftSnapBox.bbox, lineIndex, {
+            snapType: "left",
+            initialTargetX: leftInitialTargetX,
+            medianWidth,
+            lineMax,
+            rawLineTrimLength: rawLines[lineIndex].trimEnd().length,
+            shouldSpace: currentLeftSnapBox.bbox.shouldSpace ?? 0,
+            forwardAnchorValue: leftForwardAnchorValue || undefined,
+            prevAnchorValue: leftPrevAnchorValue || undefined,
+            finalTargetX: targetX,
+            bindingConstraint: leftBindingConstraint,
+          });
+
           if (targetX > rawLines[lineIndex].length) {
             rawLines[lineIndex] += " ".repeat(targetX - rawLines[lineIndex].length);
           }
@@ -1787,7 +1881,9 @@ export function projectToGrid(
             nextBbox,
             snapMaps,
             forwardAnchors,
-            rawLines[lineIndex].length
+            rawLines[lineIndex].length,
+            logger,
+            lineIndex
           );
         }
 
@@ -1821,38 +1917,44 @@ export function projectToGrid(
           continue;
         }
 
-        let targetX = Math.min(Math.round(snapMaps.right[0] / medianWidth), COLUMN_SPACES);
-        const lineMax = Math.max(
-          ...thisTurnSnap.map((v) => {
-            let lastSnapLeft = 0;
-            for (const key in forwardAnchors.left) {
-              if (parseInt(key) <= v.bbox.x) {
-                lastSnapLeft = Math.max(lastSnapLeft, forwardAnchors.left[key]);
-              }
+        const rightInitialTargetX = Math.round(snapMaps.right[0] / medianWidth);
+        let targetX = Math.min(rightInitialTargetX, COLUMN_SPACES);
+        const allRightCandidates = thisTurnSnap.map((v) => {
+          let lastSnapLeft = 0;
+          for (const key in forwardAnchors.left) {
+            if (parseInt(key) <= v.bbox.x) {
+              lastSnapLeft = Math.max(lastSnapLeft, forwardAnchors.left[key]);
             }
-            return (
-              Math.max(
-                lastSnapLeft,
-                rawLines[v.lineIndex].trimEnd().length + (v.bbox.shouldSpace ?? 0)
-              ) + v.bbox.strLength
-            );
-          })
-        );
+          }
+          const value =
+            Math.max(
+              lastSnapLeft,
+              rawLines[v.lineIndex].trimEnd().length + (v.bbox.shouldSpace ?? 0)
+            ) + v.bbox.strLength;
+          return {
+            text: v.bbox.str.substring(0, 30),
+            lineIndex: v.lineIndex,
+            lineItemCount: lines[v.lineIndex].length,
+            filtered: false,
+            value,
+          };
+        });
+        const lineMax = Math.max(...allRightCandidates.map((c) => c.value));
 
+        let rightBindingConstraint = "COLUMN_SPACES";
         if (targetX < lineMax) {
           targetX = lineMax;
+          rightBindingConstraint = "lineMax";
         }
-        if (
-          forwardAnchors.right[snapMaps.right[0]] &&
-          targetX < forwardAnchors.right[snapMaps.right[0]]
-        ) {
-          targetX = forwardAnchors.right[snapMaps.right[0]];
+        const rightForwardAnchorValue = forwardAnchors.right[snapMaps.right[0]];
+        if (rightForwardAnchorValue && targetX < rightForwardAnchorValue) {
+          targetX = rightForwardAnchorValue;
+          rightBindingConstraint = "forwardAnchor";
         }
-        if (
-          prevAnchors.forwardAnchorRight[snapMaps.right[0]] &&
-          targetX < prevAnchors.forwardAnchorRight[snapMaps.right[0]]
-        ) {
-          targetX = prevAnchors.forwardAnchorRight[snapMaps.right[0]];
+        const rightPrevAnchorValue = prevAnchors.forwardAnchorRight[snapMaps.right[0]];
+        if (rightPrevAnchorValue && targetX < rightPrevAnchorValue) {
+          targetX = rightPrevAnchorValue;
+          rightBindingConstraint = "prevAnchor";
         }
         forwardAnchors.right[snapMaps.right[0]] = targetX;
         logger.logForwardAnchor("right", snapMaps.right[0], targetX);
@@ -1860,6 +1962,21 @@ export function projectToGrid(
         for (const currentRightSnapBox of thisTurnSnap) {
           const lineIndex = currentRightSnapBox.lineIndex;
           if (flowingLines.has(lineIndex)) continue;
+
+          logger.logRenderTrace(currentRightSnapBox.bbox, lineIndex, {
+            snapType: "right",
+            initialTargetX: rightInitialTargetX,
+            medianWidth,
+            lineMax,
+            rawLineTrimLength: rawLines[lineIndex].trimEnd().length,
+            shouldSpace: currentRightSnapBox.bbox.shouldSpace ?? 0,
+            lineMaxCandidates: allRightCandidates,
+            forwardAnchorValue: rightForwardAnchorValue || undefined,
+            prevAnchorValue: rightPrevAnchorValue || undefined,
+            finalTargetX: targetX,
+            bindingConstraint: rightBindingConstraint,
+          });
+
           rawLines[lineIndex] = rawLines[lineIndex].trimEnd();
           if (targetX > rawLines[lineIndex].trimEnd().length + currentRightSnapBox.bbox.strLength) {
             rawLines[lineIndex] += " ".repeat(
@@ -1885,7 +2002,9 @@ export function projectToGrid(
             nextBbox,
             snapMaps,
             forwardAnchors,
-            rawLines[lineIndex].length
+            rawLines[lineIndex].length,
+            logger,
+            lineIndex
           );
         }
         for (let index = block.start; index < block.end; ++index) {
@@ -1916,7 +2035,8 @@ export function projectToGrid(
           snapMaps.center.shift();
           continue;
         }
-        let targetX = Math.min(Math.round(snapMaps.center[0] / medianWidth), COLUMN_SPACES);
+        const centerInitialTargetX = Math.round(snapMaps.center[0] / medianWidth);
+        let targetX = Math.min(centerInitialTargetX, COLUMN_SPACES);
         const lineMax = Math.max(
           ...thisTurnSnap.map((v) => {
             let spaceEnd = 0;
@@ -1934,25 +2054,39 @@ export function projectToGrid(
           })
         );
 
+        let centerBindingConstraint = "COLUMN_SPACES";
         if (targetX < lineMax) {
           targetX = lineMax;
+          centerBindingConstraint = "lineMax";
         }
-        if (
-          forwardAnchors.center[snapMaps.center[0]] &&
-          targetX < forwardAnchors.center[snapMaps.center[0]]
-        ) {
-          targetX = forwardAnchors.center[snapMaps.center[0]];
+        const centerForwardAnchorValue = forwardAnchors.center[snapMaps.center[0]];
+        if (centerForwardAnchorValue && targetX < centerForwardAnchorValue) {
+          targetX = centerForwardAnchorValue;
+          centerBindingConstraint = "forwardAnchor";
         }
-        if (
-          prevAnchors.forwardAnchorCenter[snapMaps.center[0]] &&
-          targetX < prevAnchors.forwardAnchorCenter[snapMaps.center[0]]
-        ) {
-          targetX = prevAnchors.forwardAnchorCenter[snapMaps.center[0]];
+        const centerPrevAnchorValue = prevAnchors.forwardAnchorCenter[snapMaps.center[0]];
+        if (centerPrevAnchorValue && targetX < centerPrevAnchorValue) {
+          targetX = centerPrevAnchorValue;
+          centerBindingConstraint = "prevAnchor";
         }
         forwardAnchors.center[snapMaps.center[0]] = targetX;
         logger.logForwardAnchor("center", snapMaps.center[0], targetX);
         for (const currentCenterSnapBox of thisTurnSnap) {
           if (flowingLines.has(currentCenterSnapBox.lineIndex)) continue;
+
+          logger.logRenderTrace(currentCenterSnapBox.bbox, currentCenterSnapBox.lineIndex, {
+            snapType: "center",
+            initialTargetX: centerInitialTargetX,
+            medianWidth,
+            lineMax,
+            rawLineTrimLength: rawLines[currentCenterSnapBox.lineIndex].trimEnd().length,
+            shouldSpace: currentCenterSnapBox.bbox.shouldSpace ?? 0,
+            forwardAnchorValue: centerForwardAnchorValue || undefined,
+            prevAnchorValue: centerPrevAnchorValue || undefined,
+            finalTargetX: targetX,
+            bindingConstraint: centerBindingConstraint,
+          });
+
           if (
             targetX >
             rawLines[currentCenterSnapBox.lineIndex].length +

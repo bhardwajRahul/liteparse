@@ -30,6 +30,7 @@ interface ParseCommandOptions {
   config?: string;
   quiet?: boolean;
   debug?: boolean;
+  debugTrace?: boolean;
   debugVisualize?: boolean;
   debugOutput?: string;
   debugTextFilter?: string[];
@@ -91,6 +92,7 @@ program
   .option("--config <file>", "Config file (JSON)")
   .option("-q, --quiet", "Suppress progress output")
   .addOption(new Option("--debug", "Enable grid projection debug logging").hideHelp())
+  .addOption(new Option("--debug-trace", "Enable detailed render decision tracing").hideHelp())
   .addOption(new Option("--debug-visualize", "Generate grid visualization PNGs").hideHelp())
   .addOption(new Option("--debug-output <path>", "Output directory for debug files").hideHelp())
   .addOption(
@@ -147,7 +149,7 @@ program
       };
 
       // Build debug config if any debug flags are set
-      if (options.debug || options.debugVisualize) {
+      if (options.debug || options.debugTrace || options.debugVisualize) {
         let regionFilter: { x1: number; y1: number; x2: number; y2: number } | undefined;
         if (options.debugRegion) {
           const [x1, y1, x2, y2] = options.debugRegion.split(",").map(Number);
@@ -155,6 +157,7 @@ program
         }
         config.debug = {
           enabled: true,
+          trace: options.debugTrace,
           visualize: options.debugVisualize,
           visualizePath: options.debugOutput ?? "./debug-output",
           outputPath: options.debugOutput ? `${options.debugOutput}/debug.log` : undefined,
