@@ -1,5 +1,11 @@
 # @llamaindex/liteparse
 
+## 1.5.2
+
+### Patch Changes
+
+- [#140](https://github.com/run-llama/liteparse/pull/140) [`dae7e90`](https://github.com/run-llama/liteparse/commit/dae7e907d434efc052b808db0fe73b9e63feca5f) Thanks [@logan-markewich](https://github.com/logan-markewich)! - Better overlap detection and deduplication
+
 ## 1.5.1
 
 ### Patch Changes
