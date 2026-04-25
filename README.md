@@ -246,7 +246,7 @@ See [`scripts/browser-compat/`](scripts/browser-compat/) for a complete working 
 - File path input (pass `Uint8Array` instead)
 - DOCX/XLSX/PPTX/image conversion (requires LibreOffice/ImageMagick)
 - HTTP OCR server backend
-- PDFium-based screenshots (replace with PDF.js canvas rendering — see [this example](https://gist.github.com/example))
+- Screenshots (these use PDFium + sharp, which are native Node addons)
 
 ### CLI Options
 
