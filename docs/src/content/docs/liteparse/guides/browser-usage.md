@@ -5,7 +5,7 @@ sidebar:
   order: 6
 ---
 
-LiteParse's core parsing engine — PDF.js text extraction, spatial grid projection, and OCR via Tesseract.js — can run entirely in the browser. Since the library includes Node-only dependencies (sharp, fs, child_process, etc.), you need a bundler like [Vite](https://vite.dev/) to swap those out with browser-safe stubs at build time.
+LiteParse's core parsing engine (PDF.js text extraction, spatial grid projection, and OCR via Tesseract.js) can run entirely in the browser. Since the library includes Node-only dependencies (sharp, fs, child_process, etc.), you need a bundler like [Vite](https://vite.dev/) to swap those out with browser-safe stubs at build time.
 
 ## What works in the browser
 
