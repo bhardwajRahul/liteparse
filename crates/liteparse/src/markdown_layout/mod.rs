@@ -21,9 +21,7 @@ mod tables;
 pub use blocks::{Block, Cell, render_blocks};
 pub use classify::classify_page_with_filters;
 pub use headings::{build_heading_map, compute_body_size};
-#[cfg(feature = "office-native")]
-pub(crate) use inline::apply_link;
-pub use inline::escape_inline;
+pub use inline::{apply_link, escape_inline};
 pub use repetition::{compute_header_footer_set, detect_single_page_chrome};
 pub use tables::detect_table_rects;
 pub(crate) use tables::{count_text_table_runs, validated_ruled_table_rects};

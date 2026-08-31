@@ -289,8 +289,7 @@ pub(crate) fn calculate_page_complexity(
 ///   `TableLikely` on its own.
 /// - `figure_count`/`figure_coverage` count placed images rather than
 ///   vector-graphic clusters — the closest native analogue.
-#[cfg(all(feature = "office-native", not(target_arch = "wasm32")))]
-pub(crate) fn calculate_native_page_complexity(
+pub fn calculate_native_page_complexity(
     page: &Page,
     image_rects: &[crate::types::Rect],
     table_count: usize,
@@ -1181,7 +1180,6 @@ mod tests {
         assert_eq!(count_columns(&leaf(0), 0), 0);
     }
 
-    #[cfg(all(feature = "office-native", not(target_arch = "wasm32")))]
     mod native {
         use super::super::*;
         use crate::types::Rect;

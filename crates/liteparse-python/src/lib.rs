@@ -1062,8 +1062,6 @@ struct PyLiteParseConfig {
     #[pyo3(get)]
     keep_headers_footers: bool,
     #[pyo3(get)]
-    office_native: bool,
-    #[pyo3(get)]
     extract_annotations: bool,
     #[pyo3(get)]
     extract_form_fields: bool,
@@ -1142,7 +1140,6 @@ impl PyLiteParseConfig {
             },
             extract_links: cfg.extract_links,
             keep_headers_footers: cfg.keep_headers_footers,
-            office_native: cfg.office_native,
             extract_annotations: cfg.extract_annotations,
             extract_form_fields: cfg.extract_form_fields,
             extract_structure_tree: cfg.extract_structure_tree,
@@ -1202,7 +1199,6 @@ impl LiteParse {
         image_output_dir = None,
         extract_links = None,
         keep_headers_footers = None,
-        office_native = None,
         extract_annotations = None,
         extract_form_fields = None,
         extract_structure_tree = None,
@@ -1239,7 +1235,6 @@ impl LiteParse {
         image_output_dir: Option<String>,
         extract_links: Option<bool>,
         keep_headers_footers: Option<bool>,
-        office_native: Option<bool>,
         extract_annotations: Option<bool>,
         extract_form_fields: Option<bool>,
         extract_structure_tree: Option<bool>,
@@ -1319,9 +1314,6 @@ impl LiteParse {
         }
         if let Some(v) = keep_headers_footers {
             cfg.keep_headers_footers = v;
-        }
-        if let Some(v) = office_native {
-            cfg.office_native = v;
         }
         if let Some(v) = extract_annotations {
             cfg.extract_annotations = v;

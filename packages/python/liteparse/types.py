@@ -406,9 +406,6 @@ class LiteParseConfig:
     #: Keep running headers/footers in markdown output instead of stripping
     #: repeated page-band lines and page chrome.
     keep_headers_footers: bool = False
-    #: Parse DOCX/PPTX/XLSX natively instead of converting via LibreOffice
-    #: (other formats always use the conversion path).
-    office_native: bool = True
     extract_images: bool = False
     extract_vector_graphics: bool = False
     extract_xfa_packets: bool = False

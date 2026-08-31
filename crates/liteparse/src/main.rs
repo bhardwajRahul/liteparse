@@ -54,12 +54,6 @@ struct ParseCommand {
     #[arg(long)]
     no_ocr: bool,
 
-    /// Force the LibreOffice conversion path for DOCX/PPTX/XLSX instead of
-    /// the native parsers (builds with the docx-native/pptx-native/
-    /// xlsx-native features parse those formats natively by default)
-    #[arg(long)]
-    no_office_native: bool,
-
     /// OCR language (Tesseract format, e.g. "eng", "fra", "deu")
     #[arg(long, default_value = "eng")]
     ocr_language: String,
@@ -137,9 +131,7 @@ struct ParseCommand {
     #[arg(long)]
     keep_headers_footers: bool,
 
-    /// Include document annotations as page-scoped structured JSON/API data
-    /// (PDF annotations; on the native DOCX path, hyperlinks and internal
-    /// links as `link` annotations).
+    /// Include document annotations as page-scoped structured JSON/API data.
     #[arg(long)]
     extract_annotations: bool,
 
@@ -192,11 +184,6 @@ struct ScreenshotCommand {
     #[arg(long)]
     password: Option<String>,
 
-    /// Disable the native office parser (DOCX renders via LibreOffice
-    /// conversion instead of the native layout raster)
-    #[arg(long)]
-    no_office_native: bool,
-
     /// Suppress progress output
     #[arg(short, long)]
     quiet: bool,
@@ -217,12 +204,6 @@ struct BatchParseCommand {
     /// Disable OCR
     #[arg(long)]
     no_ocr: bool,
-
-    /// Force the LibreOffice conversion path for DOCX/PPTX/XLSX instead of
-    /// the native parsers (builds with the docx-native/pptx-native/
-    /// xlsx-native features parse those formats natively by default)
-    #[arg(long)]
-    no_office_native: bool,
 
     /// OCR language (Tesseract format, e.g. "eng", "fra", "deu")
     #[arg(long, default_value = "eng")]
@@ -283,9 +264,7 @@ struct BatchParseCommand {
     #[arg(long)]
     extract_vector_graphics: bool,
 
-    /// Include document annotations as page-scoped structured JSON/API data
-    /// (PDF annotations; on the native DOCX path, hyperlinks and internal
-    /// links as `link` annotations).
+    /// Include document annotations as page-scoped structured JSON/API data.
     #[arg(long)]
     extract_annotations: bool,
     /// Include AcroForm widget fields and values as page-scoped structured data.
@@ -406,7 +385,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut config = LiteParseConfig {
                 ocr_language: cmd.ocr_language,
                 ocr_enabled: !cmd.no_ocr,
-                office_native: !cmd.no_office_native,
                 tessdata_path: cmd.tessdata_path,
                 max_pages: cmd.max_pages,
                 target_pages: cmd.target_pages,
@@ -477,7 +455,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 target_pages: cmd.target_pages.clone(),
                 dpi: cmd.dpi,
                 password: cmd.password.clone(),
-                office_native: !cmd.no_office_native,
                 quiet: cmd.quiet,
                 ..Default::default()
             };
@@ -511,7 +488,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut config = LiteParseConfig {
                 ocr_language: cmd.ocr_language,
                 ocr_enabled: !cmd.no_ocr,
-                office_native: !cmd.no_office_native,
                 tessdata_path: cmd.tessdata_path,
                 max_pages: cmd.max_pages,
                 target_pages: None,

@@ -48,8 +48,6 @@ pub mod ocr;
 
 #[doc(hidden)]
 pub mod ocr_merge;
-/// Native readers for office formats (DOCX, PPTX, XLSX), bypassing LibreOffice.
-pub mod office;
 #[doc(hidden)]
 pub mod output;
 #[doc(hidden)]

@@ -47,7 +47,7 @@ pub fn escape_inline(s: &str) -> String {
 /// Wrap `inner` in a markdown inline link to `url`. Uses the angle-bracket
 /// destination form when the URL contains characters that would otherwise
 /// terminate or break the `(url)` form (whitespace or parentheses).
-pub(crate) fn apply_link(inner: &str, url: &str) -> String {
+pub fn apply_link(inner: &str, url: &str) -> String {
     if url.contains([' ', '\t', '(', ')']) {
         format!("[{}](<{}>)", inner, url)
     } else {

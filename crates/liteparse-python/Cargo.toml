@@ -11,11 +11,8 @@ name = "_liteparse"
 crate-type = ["cdylib"]
 
 [features]
-default = ["tesseract", "docx-native", "pptx-native", "xlsx-native"]
+default = ["tesseract"]
 tesseract = ["liteparse/tesseract"]
-docx-native = ["liteparse/docx-native"]
-pptx-native = ["liteparse/pptx-native"]
-xlsx-native = ["liteparse/xlsx-native"]
 
 [dependencies]
 liteparse = { package = "liteparse", version = "2.11.0", path = "../liteparse", default-features = false }

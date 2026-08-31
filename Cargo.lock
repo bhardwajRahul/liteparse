@@ -389,20 +389,6 @@ name = "bytemuck"
 version = "1.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
-dependencies = [
- "bytemuck_derive",
-]
-
-[[package]]
-name = "bytemuck_derive"
-version = "1.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc0e56a716f1e132ff6bf4bdac1c944a3fcdc1cae65f70a4a2a1ac3b401d2d1f"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.2",
-]
 
 [[package]]
 name = "byteorder"
@@ -1187,15 +1173,6 @@ name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
-
-[[package]]
-name = "font-types"
-version = "0.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75382bc7392ef10aad10935f92fc3db36d2d4dad0e5d96d8d65e04f89a07ec39"
-dependencies = [
- "bytemuck",
-]
 
 [[package]]
 name = "fontconfig-parser"
@@ -2046,9 +2023,7 @@ dependencies = [
  "crc32fast",
  "file-format",
  "flate2",
- "fontdb",
  "image",
- "liteparse-ooxml",
  "liteparse-pdfium",
  "liteparse-pdfium-sys",
  "lopdf",
@@ -2062,7 +2037,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "skrifa",
  "tempfile",
  "tesseract-rs",
  "thiserror 2.0.19",
@@ -2070,7 +2044,6 @@ dependencies = [
  "url",
  "usvg",
  "web-time",
- "zip",
 ]
 
 [[package]]
@@ -2087,28 +2060,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
-]
-
-[[package]]
-name = "liteparse-ooxml"
-version = "0.1.0"
-dependencies = [
- "bitflags 2.13.1",
- "fontdb",
- "image",
- "log",
- "quick-xml",
- "rustc-hash",
- "rustybuzz",
- "serde",
- "serde_json",
- "skrifa",
- "ssf-rs",
- "thiserror 2.0.19",
- "tiny-skia",
- "unicode-properties",
- "unicode-segmentation",
- "zip",
 ]
 
 [[package]]
@@ -3163,16 +3114,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
 
 [[package]]
-name = "quick-xml"
-version = "0.39.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
-dependencies = [
- "memchr",
- "serde",
-]
-
-[[package]]
 name = "quinn"
 version = "0.11.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3415,17 +3356,6 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
-]
-
-[[package]]
-name = "read-fonts"
-version = "0.42.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c69341f5f744623061a258e9d06a0213783a89ec23b6efb88a1c0c4ed285559"
-dependencies = [
- "bytemuck",
- "font-types",
- "once_cell",
 ]
 
 [[package]]
@@ -4086,16 +4016,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
-name = "skrifa"
-version = "0.45.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd5b090b1690f1c63a8659574ea987c557f1cc571e24dedcba89458f32d0ccb5"
-dependencies = [
- "bytemuck",
- "read-fonts",
-]
-
-[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4147,15 +4067,6 @@ dependencies = [
  "nom 7.1.3",
  "serde",
  "unicode-segmentation",
-]
-
-[[package]]
-name = "ssf-rs"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b553b4f0a04a9d3c330973c51f285f25315f56931522ebf101bd5c5ebc613f9"
-dependencies = [
- "regex",
 ]
 
 [[package]]

@@ -53,17 +53,6 @@ pub struct LiteParseConfig {
     /// downstream than risk losing content. Only affects Markdown output.
     #[serde(default)]
     pub keep_headers_footers: bool,
-    /// Parse DOCX/PPTX/XLSX natively (vendored readers + layout) instead of
-    /// converting via LibreOffice. Default `true`; each format is gated by
-    /// its cargo feature (`docx-native`, `pptx-native`, `xlsx-native`) and
-    /// every other format always takes the conversion path. Set `false` to
-    /// force the LibreOffice path (A/B comparison). The native paths never
-    /// run OCR (text is born digital; a text-sparse document falls back to
-    /// conversion so scanned images still OCR), produce no screenshots, and
-    /// fall back to conversion for config they cannot honor (image/
-    /// annotation/form/structure extraction, crop, complexity).
-    #[serde(default = "default_true")]
-    pub office_native: bool,
     /// Extract all PDF annotations into each parsed page. Default `false`.
     /// This is independent of `extract_links`, which only controls Markdown
     /// link reconstruction.
@@ -235,7 +224,6 @@ impl Default for LiteParseConfig {
             image_output_dir: None,
             extract_links: true,
             keep_headers_footers: false,
-            office_native: true,
             extract_annotations: false,
             extract_form_fields: false,
             extract_structure_tree: false,
@@ -254,10 +242,6 @@ impl Default for LiteParseConfig {
             extract_vector_graphics: false,
         }
     }
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// Returns the default number of OCR workers: CPU cores - 1, minimum 1.

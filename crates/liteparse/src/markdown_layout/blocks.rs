@@ -40,8 +40,8 @@ pub enum Block {
         rows: Vec<Vec<String>>,
     },
     /// Table whose cells carry explicit spans. Emitted by producers that know
-    /// the merge structure outright (the native office path reads `gridSpan` /
-    /// `vMerge` from the DOCX) rather than inferring it from coordinates.
+    /// the merge structure outright (e.g. a structural reader with access to
+    /// `gridSpan` / `vMerge`) rather than inferring it from coordinates.
     ///
     /// `rows` is *not* rectangular: a cell absorbed by a neighbour's
     /// `colspan`/`rowspan` is omitted entirely, exactly as in HTML. `header_rows`

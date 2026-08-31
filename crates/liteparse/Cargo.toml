@@ -15,7 +15,7 @@ name = "lit"
 path = "src/main.rs"
 
 [features]
-default = ["tesseract", "docx-native", "pptx-native", "xlsx-native"]
+default = ["tesseract"]
 oar-ocr = ["dep:oar-ocr"]
 oar-ocr-auto-download = ["oar-ocr", "oar-ocr/auto-download"]
 oar-ocr-cuda = ["oar-ocr", "oar-ocr/cuda"]
@@ -25,20 +25,11 @@ oar-ocr-coreml = ["oar-ocr", "oar-ocr/coreml"]
 oar-ocr-webgpu = ["oar-ocr", "oar-ocr/webgpu"]
 oar-ocr-openvino = ["oar-ocr", "oar-ocr/openvino"]
 tesseract = ["dep:tesseract-rs"]
-# Native office structure reading (no LibreOffice, no projection).
-# `office-native` is an internal marker enabled by every native-office reader,
-# so code shared between them (the `apply_link` re-export, native complexity)
-# has one cfg to name instead of an `any(...)` list that grows per format.
-office-native = []
-docx-native = ["dep:liteparse-ooxml", "liteparse-ooxml/raster", "office-native"]
-pptx-native = ["dep:liteparse-ooxml", "liteparse-ooxml/raster", "office-native"]
-xlsx-native = ["dep:liteparse-ooxml", "liteparse-ooxml/raster", "office-native"]
 
 [dependencies]
 blake3 = "1"
 clap = { version = "4.5.55", features = ["derive"] }
 file-format = { version = "0.29.0", features = ["reader"] }
-liteparse-ooxml = { version = "0.1.0", path = "../liteparse-ooxml", optional = true }
 image = { version = "0.25", default-features = false, features = ["default-formats"] }
 memchr = "2"
 ordered-float = "5.3.0"
@@ -67,10 +58,3 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "fs", "process"] }
 serial_test = "3"
 crc32fast = "1"
 regex = "1"
-# `office::xlsx` tests build minimal workbooks in memory, same pin as
-# liteparse-ooxml's own reader tests.
-zip = { version = "2", default-features = false, features = ["deflate"] }
-# `bold_census` example only. Same pins as liteparse-ooxml's font-measurement
-# stack, so the example inspects faces through the types the render path uses.
-fontdb = "0.22"
-skrifa = "0.45"

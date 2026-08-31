@@ -40,8 +40,6 @@ export interface LiteParseConfig {
   extractLinks: boolean;
   /** Keep running headers/footers in markdown output instead of stripping repeated page-band lines and page chrome (default: false). */
   keepHeadersFooters: boolean;
-  /** Parse DOCX/PPTX/XLSX natively instead of converting via LibreOffice (default: true; other formats always use the conversion path). */
-  officeNative: boolean;
   /** Extract all PDF annotations into each parsed page (default: false). */
   extractAnnotations: boolean;
   /** Extract AcroForm widget fields and values (default: false). */
@@ -540,7 +538,6 @@ export class LiteParse {
       imageOutputDir: userConfig.imageOutputDir,
       extractLinks: userConfig.extractLinks,
       keepHeadersFooters: userConfig.keepHeadersFooters,
-      officeNative: userConfig.officeNative,
       extractAnnotations: userConfig.extractAnnotations,
       extractFormFields: userConfig.extractFormFields,
       extractStructureTree: userConfig.extractStructureTree,
@@ -582,7 +579,6 @@ export class LiteParse {
       imageOutputDir: resolved.imageOutputDir ?? undefined,
       extractLinks: resolved.extractLinks ?? true,
       keepHeadersFooters: resolved.keepHeadersFooters ?? false,
-      officeNative: resolved.officeNative ?? true,
       extractAnnotations: resolved.extractAnnotations ?? false,
       extractFormFields: resolved.extractFormFields ?? false,
       extractStructureTree: resolved.extractStructureTree ?? false,

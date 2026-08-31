@@ -59,10 +59,6 @@ pub struct LiteParseConfig {
     /// Keep running headers/footers in markdown output instead of stripping
     /// repeated page-band lines and page chrome. Default false.
     keep_headers_footers: Option<bool>,
-    /// Parse DOCX/PPTX/XLSX natively instead of converting via LibreOffice. Accepted
-    /// and echoed for config round-trip parity; the native path is not
-    /// compiled into the wasm build yet, so it has no effect here.
-    office_native: Option<bool>,
     extract_annotations: Option<bool>,
     extract_form_fields: Option<bool>,
     extract_structure_tree: Option<bool>,
@@ -171,9 +167,6 @@ impl LiteParseConfig {
         if let Some(v) = self.keep_headers_footers {
             cfg.keep_headers_footers = v;
         }
-        if let Some(v) = self.office_native {
-            cfg.office_native = v;
-        }
         if let Some(v) = self.extract_annotations {
             cfg.extract_annotations = v;
         }
@@ -264,7 +257,6 @@ impl LiteParseConfig {
             extract_images: Some(cfg.extract_images),
             extract_links: Some(cfg.extract_links),
             keep_headers_footers: Some(cfg.keep_headers_footers),
-            office_native: Some(cfg.office_native),
             extract_annotations: Some(cfg.extract_annotations),
             extract_form_fields: Some(cfg.extract_form_fields),
             extract_structure_tree: Some(cfg.extract_structure_tree),
