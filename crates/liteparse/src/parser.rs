@@ -1228,9 +1228,36 @@ impl LiteParse {
             },
         );
         let n_pages = native.pages.len();
-        let page_blocks = split_blocks_by_page(&tagged, &native.block_pages, n_pages);
+        let mut page_blocks = split_blocks_by_page(&tagged, &native.block_pages, n_pages);
         let all_blocks: Vec<crate::markdown_layout::Block> =
             tagged.into_iter().map(|(b, _)| b).collect();
+
+        // Headers/footers: the layout records each page's selected slot
+        // (`LayoutedPage::header_blocks`/`footer_blocks`; the raster and
+        // `text_items` always carry them). Markdown mirrors the PDF path's
+        // default of suppressing running chrome, so the blocks join the
+        // markdown stream only under `keep_headers_footers` — header at the
+        // page top, footer at the page bottom. The doc-level text then has to
+        // be assembled per page (a whole-document block walk has no page
+        // boundaries to repeat them at), which `all_blocks: None` selects.
+        let keep_hf = self.config.keep_headers_footers;
+        if keep_hf {
+            for (i, blocks) in page_blocks.iter_mut().enumerate() {
+                let Some(lp) = layouted.get(i) else { break };
+                let header = docx::emit_header_footer(
+                    &resolved,
+                    &lp.header_blocks,
+                    self.config.extract_links,
+                );
+                let footer = docx::emit_header_footer(
+                    &resolved,
+                    &lp.footer_blocks,
+                    self.config.extract_links,
+                );
+                blocks.splice(0..0, header);
+                blocks.extend(footer);
+            }
+        }
 
         // Per-page complexity from native facts: placed-media rects, the
         // page's table blocks (exact, not detected), and the section-declared
@@ -1278,7 +1305,7 @@ impl LiteParse {
         let mut result = self.parse_from_native_blocks(
             pages,
             page_blocks,
-            (!page_filtered).then_some(all_blocks),
+            (!page_filtered && !keep_hf).then_some(all_blocks),
             native.outline,
             images,
             page_stats,

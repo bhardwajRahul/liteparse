@@ -72,6 +72,30 @@ pub fn emit(doc: &ResolvedDocument, extract_links: bool) -> Vec<Block> {
     .collect()
 }
 
+/// Emit an out-of-body block list — a page's header or footer content, as
+/// selected per page by the layout (`LayoutedPage::header_blocks` /
+/// `footer_blocks`) — as markdown blocks.
+///
+/// A fresh `Emitter` per call: header/footer content must not continue body
+/// list numbering, and vice versa. Structure-only (no figures): a header
+/// image ref would collide with the layout's page-scoped figure ids.
+pub fn emit_header_footer(
+    doc: &ResolvedDocument,
+    blocks: &[liteparse_ooxml::model::Block],
+    extract_links: bool,
+) -> Vec<Block> {
+    let mut em = Emitter::new(
+        doc,
+        EmitOptions {
+            links: extract_links,
+            figures: None,
+        },
+    );
+    let mut out = Vec::new();
+    em.blocks(blocks, &mut out);
+    out
+}
+
 /// Where an emitted [`Block`] came from, for the layout block→page join.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockSource {
@@ -648,6 +672,18 @@ impl<'a> Emitter<'a> {
                 // A figure inside a cell can't live in single-line cell text;
                 // requeue it so the enclosing `table` emits it afterwards.
                 Block::Figure { id, format } => self.pending_figures.push((id, format)),
+                // A nested table can't render as markup inside a single-line
+                // cell; flatten its cells in reading order so the content
+                // survives rather than being dropped.
+                Block::MergedTable { rows, .. } => {
+                    for row in rows {
+                        for cell in row {
+                            if !cell.text.is_empty() {
+                                parts.push(cell.text);
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }

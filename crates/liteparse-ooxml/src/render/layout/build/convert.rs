@@ -257,9 +257,18 @@ pub(super) fn paragraph_style_from_props(
         })
         .unwrap_or(Pt::ZERO);
 
-    // §17.3.1.33: when autoSpacing is true, use 14pt instead of explicit value.
-    let space_before = if props.spacing.and_then(|s| s.before_auto_spacing) == Some(true) {
+    // §17.3.1.33: when autoSpacing is true, the explicit value is ignored and
+    // spacing is consumer-defined. Word uses 14pt for ordinary paragraphs but
+    // 0 for paragraphs carrying list numbering (`w:numPr` with a live numId) —
+    // observable in HTML-paste documents where consecutive `NormalWeb` list
+    // items sit at plain line pitch. LibreOffice emulates the same rule.
+    let auto_space = if props.numbering.as_ref().is_some_and(|n| n.num_id != 0) {
+        Pt::ZERO
+    } else {
         Pt::new(14.0)
+    };
+    let space_before = if props.spacing.and_then(|s| s.before_auto_spacing) == Some(true) {
+        auto_space
     } else {
         props
             .spacing
@@ -268,7 +277,7 @@ pub(super) fn paragraph_style_from_props(
             .unwrap_or(Pt::ZERO)
     };
     let space_after = if props.spacing.and_then(|s| s.after_auto_spacing) == Some(true) {
-        Pt::new(14.0)
+        auto_space
     } else {
         props
             .spacing

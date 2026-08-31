@@ -682,6 +682,8 @@ mod tests {
             commands,
             page_size: PtSize::new(Pt::new(612.0), Pt::new(792.0)),
             block_starts: Vec::new(),
+            header_blocks: Vec::new(),
+            footer_blocks: Vec::new(),
         }
     }
 

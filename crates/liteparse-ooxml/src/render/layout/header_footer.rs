@@ -245,6 +245,9 @@ pub fn render_headers_footers(
         );
 
         if let Some(blocks) = header_blocks {
+            // Side-channel for consumers that emit markdown/text: record the
+            // selected slot's blocks on the page (see `LayoutedPage::header_blocks`).
+            page.header_blocks = blocks.clone();
             // Set per-page field context for PAGE/NUMPAGES evaluation.
             state.field_ctx = crate::render::layout::fragment::FieldContext {
                 page_number: Some(logical_page_number),
@@ -263,6 +266,8 @@ pub fn render_headers_footers(
         }
 
         if let Some(blocks) = footer_blocks {
+            // Side-channel counterpart of `header_blocks` above.
+            page.footer_blocks = blocks.clone();
             state.field_ctx = crate::render::layout::fragment::FieldContext {
                 page_number: Some(logical_page_number),
                 num_pages: Some(page_range.total_pages),

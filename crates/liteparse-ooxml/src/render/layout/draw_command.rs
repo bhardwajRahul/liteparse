@@ -495,6 +495,16 @@ pub struct LayoutedPage {
     /// `Continuous`-section continuation for free. Blocks that emit no content
     /// (empty paragraphs) appear on no page; consumers fill forward.
     pub block_starts: Vec<usize>,
+    /// liteparse instrumentation (no upstream equivalent): the header blocks
+    /// the §17.10.5/§17.10.6 slot selection picked for this page — the same
+    /// choice the paint pass makes in `render_headers_footers`. Populated in
+    /// the deferred header/footer phase, after pagination is final, so it
+    /// needs no checkpoint/replay handling. Empty when the page's section has
+    /// no applicable slot (e.g. a `titlePg` first page without a `first`
+    /// header).
+    pub header_blocks: Vec<crate::model::Block>,
+    /// Footer counterpart of [`LayoutedPage::header_blocks`].
+    pub footer_blocks: Vec<crate::model::Block>,
 }
 
 impl LayoutedPage {
@@ -503,6 +513,8 @@ impl LayoutedPage {
             commands: Vec::new(),
             page_size,
             block_starts: Vec::new(),
+            header_blocks: Vec::new(),
+            footer_blocks: Vec::new(),
         }
     }
 }

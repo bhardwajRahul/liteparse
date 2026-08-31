@@ -970,6 +970,8 @@ mod tests {
             ],
             page_size: PtSize::new(Pt::new(100.0), Pt::new(100.0)),
             block_starts: Vec::new(),
+            header_blocks: Vec::new(),
+            footer_blocks: Vec::new(),
         }
     }
 
@@ -1094,6 +1096,8 @@ mod tests {
             ],
             page_size: PtSize::new(Pt::new(100.0), Pt::new(100.0)),
             block_starts: Vec::new(),
+            header_blocks: Vec::new(),
+            footer_blocks: Vec::new(),
         }
     }
 
@@ -1157,6 +1161,8 @@ mod tests {
             commands: Vec::new(),
             page_size: PtSize::new(Pt::new(w), Pt::new(h)),
             block_starts: Vec::new(),
+            header_blocks: Vec::new(),
+            footer_blocks: Vec::new(),
         };
         let r = rasterize_page(&page, &FontRegistry::new(), 150.0 / 72.0).expect("raster");
         assert!(r.scale < 150.0 / 72.0, "this page must have been clamped");

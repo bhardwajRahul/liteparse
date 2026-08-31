@@ -484,9 +484,12 @@ fn layout_deck(pkg: &PresentationPackage, registry: &FontRegistry) -> SlideGeome
         out.layouts.push(LayoutedPage {
             commands,
             page_size,
-            // A DOCX-only side-channel: it indexes the flattened body blocks a
-            // page starts, and a slide is one page with no such flattening.
+            // DOCX-only side-channels: `block_starts` indexes the flattened
+            // body blocks a page starts (a slide is one page with no such
+            // flattening), and slides have no OOXML headers/footers.
             block_starts: Vec::new(),
+            header_blocks: Vec::new(),
+            footer_blocks: Vec::new(),
         });
         let content_bounds = union_bounds(&items);
         out.pages.push(Page {
@@ -1156,6 +1159,8 @@ fn commands_to_items(
         commands,
         page_size: extent,
         block_starts: Vec::new(),
+        header_blocks: Vec::new(),
+        footer_blocks: Vec::new(),
     };
     let converted = docx_layout::layout_to_pages(&[page], ctx.registry, false, false);
     converted

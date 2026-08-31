@@ -1054,9 +1054,13 @@ fn emit_split_paragraph<'doc>(
         // §17.6.4: a fresh column offers full height, like a fresh page.
         let at_page_top = state.cursor_y <= state.column_top;
         let avail = (state.bottom - state.cursor_y).max(Pt::ZERO);
-        // §17.3.1.24/§17.3.1.33: space_after and the bottom border space are
-        // only spent once, on the segment carrying the paragraph's last line.
-        let trailing_extra = cont_style.space_after + placed.bottom_border_space();
+        // §17.3.1.24/§17.3.1.33: the bottom border space is only spent once,
+        // on the segment carrying the paragraph's last line. `space_after` is
+        // deliberately NOT charged to the fit test: Word discards trailing
+        // blank space at the page bottom instead of pushing the last line to
+        // the next page. The cursor still advances by the full height, so a
+        // following paragraph that no longer fits breaks the page as before.
+        let trailing_extra = placed.bottom_border_space();
 
         // Count how many of this placement's lines fit, charging space_before
         // (first segment only, §17.3.1.33) and the trailing spacing on the last.
@@ -1738,7 +1742,11 @@ pub(crate) fn layout_section_with_clearance(
                         } else {
                             let mut para = placed.emit_full();
                             // Column/page overflow: advance column, then page.
-                            if state.cursor_y + para.size.height > state.bottom
+                            // §17.3.1.33: `size.height` includes trailing
+                            // `space_after`, but Word discards that blank space
+                            // at the page bottom — only the ink has to fit.
+                            let fit_height = para.size.height - effective_style.space_after;
+                            if state.cursor_y + fit_height > state.bottom
                                 && state.cursor_y > state.column_top
                             {
                                 // `placed` (which borrows `effective_style`) is no
