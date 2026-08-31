@@ -150,12 +150,35 @@ pub(crate) enum ParaChildXml {
     /// §17.5.1.6 `<w:customXml>` (CT_CustomXmlRun) — content is flattened.
     #[serde(rename = "customXml")]
     CustomXml(RunTrackChangeXml),
+    /// `<w:sdt>` (CT_SdtRun §17.5.2.31) — run-level structured document tag
+    /// (checkbox / dropdown / date / plain-text content controls). The
+    /// display content lives in `<w:sdtContent>` (EG_PContent) and is
+    /// flattened in place; dropping it loses real text (e.g. the ☐/☒ glyph
+    /// run of a `w14:checkbox`).
+    #[serde(rename = "sdt")]
+    Sdt(Box<SdtRunXml>),
     /// `<w:pPr>` is captured on `ParaXml` directly, but serde's untagged
     /// enum still has to handle it if it appears in `$value` ordering.
     #[serde(rename = "pPr")]
     PPr(Box<PPrXml>),
     #[serde(other)]
     Other,
+}
+
+/// `<w:sdt>` at run level (CT_SdtRun). Mirrors [`SdtBlockXml`]: only
+/// `<w:sdtContent>` matters — `<w:sdtPr>`/`<w:sdtEndPr>` are ignored.
+#[derive(Deserialize, Default)]
+pub(crate) struct SdtRunXml {
+    #[serde(rename = "sdtContent", default)]
+    pub content: Option<SdtRunContentXml>,
+}
+
+/// CT_SdtContentRun — the same `EG_PContent` children as `<w:p>`, so a
+/// nested `<w:sdt>` recurses through the same variant.
+#[derive(Deserialize, Default)]
+pub(crate) struct SdtRunContentXml {
+    #[serde(rename = "$value", default)]
+    pub content: Vec<ParaChildXml>,
 }
 
 /// A run-level revision (`ins`/`del`/`moveFrom`/`moveTo`, CT_RunTrackChange)
@@ -332,6 +355,29 @@ pub(crate) struct FldCharXml {
     pub dirty: Option<AttrBool>,
     #[serde(rename = "@fldLock", default)]
     pub fld_lock: Option<AttrBool>,
+    /// §17.16.17 `<w:ffData>` — legacy form-field data on the *begin* marker.
+    #[serde(rename = "ffData", default)]
+    pub ff_data: Option<FfDataXml>,
+}
+
+/// §17.16.17 CT_FFData — only the checkbox member is modelled; text/dropdown
+/// form fields carry their display value in the result zone and need nothing
+/// from here.
+#[derive(Deserialize, Default)]
+pub(crate) struct FfDataXml {
+    #[serde(rename = "checkBox", default)]
+    pub check_box: Option<FfCheckBoxXml>,
+}
+
+/// §17.16.7 CT_FFCheckBox. A FORMCHECKBOX field has no result-zone text —
+/// its rendered state lives here: `<w:checked>` when the user toggled it,
+/// `<w:default>` otherwise.
+#[derive(Deserialize, Default)]
+pub(crate) struct FfCheckBoxXml {
+    #[serde(rename = "default", default)]
+    pub default: Option<OnOff>,
+    #[serde(rename = "checked", default)]
+    pub checked: Option<OnOff>,
 }
 
 #[derive(Deserialize)]
@@ -686,7 +732,7 @@ pub(crate) struct TableCellXml {
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
-pub(crate) use crate::docx::parse::primitives::AttrBool;
+pub(crate) use crate::docx::parse::primitives::{AttrBool, OnOff};
 
 #[cfg(test)]
 mod tests {

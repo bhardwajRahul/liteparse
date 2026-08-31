@@ -227,10 +227,17 @@ fn extend_from_run(r: RunXml, out: &mut Vec<Inline>, ctx: &mut ConvertCtx) {
                 // delimits begin/separate/end), so drop the marker entirely.
                 let Some(ty) = fc.fld_char_type else { continue };
                 flush(&mut acc, out);
+                // §17.16.7: `<w:checked>` reflects a user toggle; absent, the
+                // authored `<w:default>` is the rendered state.
+                let form_checkbox = fc
+                    .ff_data
+                    .and_then(|ff| ff.check_box)
+                    .map(|cb| cb.checked.or(cb.default).map(|v| v.0).unwrap_or(false));
                 out.push(Inline::FieldChar(FieldChar {
                     field_char_type: FieldCharType::from(ty),
                     dirty: fc.dirty.map(|b| b.0),
                     fld_lock: fc.fld_lock.map(|b| b.0),
+                    form_checkbox,
                 }));
             }
             RunChildXml::FootnoteRef(n) => {
@@ -328,6 +335,13 @@ fn append_para_children(
             | ParaChildXml::MoveTo(w)
             | ParaChildXml::SmartTag(w)
             | ParaChildXml::CustomXml(w) => append_para_children(w.content, content, ctx),
+            // §17.5.2.31: run-level SDT (checkbox/dropdown/date/text content
+            // controls) — render the display content in place.
+            ParaChildXml::Sdt(s) => {
+                if let Some(inner) = s.content {
+                    append_para_children(inner.content, content, ctx);
+                }
+            }
             // Delete-side revision wrappers: content is deleted — drop it.
             ParaChildXml::Del(_) | ParaChildXml::MoveFrom(_) => {}
             ParaChildXml::PPr(_) => {} // already captured on the parent
@@ -598,6 +612,81 @@ mod tests {
         let mut ctx = ConvertCtx::new();
         let (para, _) = convert_paragraph(p, &mut ctx);
         collect_text(&para.content)
+    }
+
+    /// §17.16.7: a FORMCHECKBOX begin marker carries its rendered state in
+    /// `<w:ffData><w:checkBox>` — `<w:checked>` wins over `<w:default>`,
+    /// and an ffData without a checkBox member stays `None`.
+    #[test]
+    fn fld_char_ffdata_checkbox_state() {
+        let checkbox_state = |xml: &str| -> Option<bool> {
+            let p: ParaXml = quick_xml::de::from_str(xml).unwrap();
+            let mut ctx = ConvertCtx::new();
+            let (para, _) = convert_paragraph(p, &mut ctx);
+            para.content.iter().find_map(|i| match i {
+                Inline::FieldChar(fc) => Some(fc.form_checkbox),
+                _ => None,
+            })?
+        };
+        let field = |ff_data: &str| {
+            format!(
+                r#"<w:p xmlns:w="x"><w:r>
+                     <w:fldChar w:fldCharType="begin">{ff_data}</w:fldChar>
+                   </w:r></w:p>"#
+            )
+        };
+        assert_eq!(
+            checkbox_state(&field(
+                r#"<w:ffData><w:name w:val="C1"/><w:checkBox><w:sizeAuto/><w:default w:val="0"/></w:checkBox></w:ffData>"#
+            )),
+            Some(false)
+        );
+        assert_eq!(
+            checkbox_state(&field(
+                r#"<w:ffData><w:checkBox><w:default w:val="0"/><w:checked w:val="1"/></w:checkBox></w:ffData>"#
+            )),
+            Some(true)
+        );
+        // FORMTEXT-style ffData (no checkBox): not a checkbox.
+        assert_eq!(
+            checkbox_state(&field(r#"<w:ffData><w:name w:val="T1"/></w:ffData>"#)),
+            None
+        );
+        assert_eq!(checkbox_state(&field("")), None);
+    }
+
+    /// Run-level `<w:sdt>` (CT_SdtRun) — the display run inside
+    /// `<w:sdtContent>` must render in place, not vanish into the `Other`
+    /// catch-all. This is how `w14:checkbox` content controls carry their
+    /// ☐/☒ glyph, so dropping it silently loses form-checkbox state.
+    #[test]
+    fn run_level_sdt_content_renders_in_place() {
+        let text = para_text(
+            r#"<w:p xmlns:w="x">
+              <w:r><w:t>Answer: </w:t></w:r>
+              <w:sdt>
+                <w:sdtPr><w:id w:val="1"/></w:sdtPr>
+                <w:sdtContent><w:r><w:t>&#x2610;</w:t></w:r></w:sdtContent>
+              </w:sdt>
+              <w:r><w:t> Yes</w:t></w:r>
+            </w:p>"#,
+        );
+        assert_eq!(text, "Answer: ☐ Yes");
+    }
+
+    /// A `<w:sdt>` nested inside another `<w:sdt>`'s content (CT_SdtContentRun
+    /// is EG_PContent) flattens recursively.
+    #[test]
+    fn nested_run_level_sdt_flattens() {
+        let text = para_text(
+            r#"<w:p xmlns:w="x">
+              <w:sdt><w:sdtContent>
+                <w:r><w:t>a</w:t></w:r>
+                <w:sdt><w:sdtContent><w:r><w:t>b</w:t></w:r></w:sdtContent></w:sdt>
+              </w:sdtContent></w:sdt>
+            </w:p>"#,
+        );
+        assert_eq!(text, "ab");
     }
 
     /// Parse a `<w:p>` and return the run-elements of its first `TextRun`.

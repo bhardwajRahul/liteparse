@@ -219,7 +219,15 @@ pub fn fit_lines_with_first(
             line_text_height = Pt::ZERO;
             line_ascent = Pt::ZERO;
             last_break_point = None;
-            // Don't advance i — re-evaluate this fragment on the new line.
+            // Rewind to the break point — not to `i` — so every fragment the
+            // break moved onto the new line is re-accumulated. Re-evaluating
+            // only fragment `i` leaves the widths of fragments in
+            // `break_at..i` out of `line_width`, and the under-counted line
+            // then accepts words past the margin. Reachable whenever several
+            // non-breakpoint fragments follow the last break: a per-character
+            // split of an over-wide word (narrow table cells), or a word
+            // split across `<w:r>` runs.
+            i = break_at;
             continue;
         }
 
@@ -279,6 +287,28 @@ pub fn fit_lines_with_first(
             ascent: line_ascent,
             has_break: false,
         });
+    }
+
+    if std::env::var_os("LITEPARSE_TRACE_OVERFLOW").is_some() {
+        for l in &lines {
+            let interesting = fragments[l.start..l.end].iter().any(|f| matches!(f, Fragment::Text { text, .. } if text.contains("(Date)") || text.contains("Completion") || text.contains("C")));
+            if interesting || l.width > remaining_width.max(first_line_width) + Pt::new(0.1) {
+                let texts: Vec<&str> = fragments[l.start..l.end]
+                    .iter()
+                    .map(|f| match f {
+                        Fragment::Text { text, .. } => &text[..],
+                        _ => "<frag>",
+                    })
+                    .collect();
+                eprintln!(
+                    "  overflow line: width={:.1} max={:.1}/{:.1} frags={:?}",
+                    l.width.raw(),
+                    first_line_width.raw(),
+                    remaining_width.raw(),
+                    texts
+                );
+            }
+        }
     }
 
     lines
@@ -421,6 +451,82 @@ mod tests {
 
         assert_eq!(lines.len(), 1, "oversized fragment still produces a line");
         assert_eq!(lines[0].end, 1);
+    }
+
+    /// Regression: when an overflow breaks at an earlier break point, the
+    /// fragments between the break point and the overflowing fragment move to
+    /// the new line and must be re-accumulated into its width. The old code
+    /// resumed at the overflowing fragment, so a run of non-breakpoint
+    /// fragments (a per-character split word: "C","o","m",…) was carried at
+    /// width 0 and the next word rode past the margin ("Completion (Date)"
+    /// escaping its table cell).
+    #[test]
+    fn break_rewinds_to_break_point_and_reaccumulates() {
+        // max 61: "for " starts line 2; chars overflow at 't' → line 2 becomes
+        // ["for "], chars restart line 3; "(Date)" must then wrap to line 4.
+        let mut frags = vec![text_frag("for ", 18.0)];
+        for ch in ["C", "o", "m", "p", "l", "e", "t", "i", "o", "n"] {
+            frags.push(text_frag(ch, 6.3));
+        }
+        frags.push(text_frag(" ", 3.0));
+        frags.push(text_frag("(Date)", 34.0));
+        let lines = fit_lines(&frags, Pt::new(61.0));
+
+        // Every produced line's width must equal the sum of its fragments —
+        // the old code dropped `break_at..i` widths, reporting 23.8 for a
+        // 63.4pt line and letting "(Date)" ride past the cell border.
+        for l in &lines {
+            let sum: f32 = frags[l.start..l.end].iter().map(|f| f.width().raw()).sum();
+            assert!(
+                (l.width.raw() - sum).abs() < 0.01,
+                "line {}..{} width {} != fragment sum {}",
+                l.start,
+                l.end,
+                l.width.raw(),
+                sum
+            );
+        }
+        // And no multi-fragment line may exceed the max (a single oversized
+        // fragment is the only sanctioned overflow).
+        for l in &lines {
+            if l.end - l.start > 1 {
+                assert!(
+                    l.width <= Pt::new(61.0),
+                    "multi-fragment line {}..{} exceeds max: {lines:?}",
+                    l.start,
+                    l.end
+                );
+            }
+        }
+    }
+
+    /// An oversized first word overflows its line (Word behavior), but the
+    /// NEXT word must still wrap — it may not ride along past the margin.
+    #[test]
+    fn word_after_oversized_word_wraps() {
+        let frags = vec![
+            text_frag("Deadline ", 40.0),
+            text_frag("for ", 18.0),
+            text_frag("Completion ", 61.0),
+            text_frag("(Date)", 30.0),
+        ];
+        let lines = fit_lines(&frags, Pt::new(56.0));
+        // Expect: "Deadline " / "for " ... wait "Deadline "+"for " = 58 > 56 →
+        // "Deadline " / "for " / "Completion " / "(Date)" = 4 lines, or
+        // "Deadline " then "for " joins? 40+18=58>56 → separate. Key claim:
+        // "(Date)" is NOT on the same line as "Completion ".
+        let completion_line = lines
+            .iter()
+            .position(|l| (l.start..l.end).contains(&2))
+            .unwrap();
+        let date_line = lines
+            .iter()
+            .position(|l| (l.start..l.end).contains(&3))
+            .unwrap();
+        assert_ne!(
+            completion_line, date_line,
+            "word after an oversized word must wrap to the next line: {lines:?}"
+        );
     }
 
     #[test]

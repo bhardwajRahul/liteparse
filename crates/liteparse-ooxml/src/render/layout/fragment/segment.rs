@@ -450,6 +450,7 @@ mod tests {
                 field_char_type: FieldCharType::Begin,
                 dirty: None,
                 fld_lock: None,
+                form_checkbox: None,
             }),
             text_run("instr"),
         ];
@@ -748,6 +749,7 @@ mod tests {
                 field_char_type: FieldCharType::Begin,
                 dirty: None,
                 fld_lock: None,
+                form_checkbox: None,
             }),
             text_run("c"),
             text_run("d"),

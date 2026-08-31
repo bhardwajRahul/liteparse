@@ -333,6 +333,19 @@ impl<'a> Emitter<'a> {
                     };
                     self.collect(para, &f.content, url.or(link), out);
                 }
+                // §17.16.7: a FORMCHECKBOX field renders as its ffData state
+                // (☐/☒) — it has no result-zone runs to pick up. Other field
+                // markers stay invisible: the instruction is InstrText (never
+                // a TextRun) and result runs flow through on their own.
+                Inline::FieldChar(fc) => {
+                    if let Some(glyph) = fc.form_checkbox_glyph() {
+                        out.push(Chunk {
+                            fmt: Fmt::default(),
+                            link: link.map(str::to_string),
+                            text: glyph.to_string(),
+                        });
+                    }
+                }
                 Inline::Image(img) => {
                     // Pop the layout-assigned id for this media's next
                     // placement. The queue is keyed by media identity and

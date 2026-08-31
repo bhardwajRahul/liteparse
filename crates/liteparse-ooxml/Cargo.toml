@@ -21,6 +21,9 @@ rustc-hash = "2"
 # fontdb is pinned to the 0.22 line resvg/usvg already bring into the tree.
 fontdb = "0.22"
 skrifa = "0.45"
+# Pair-kerning for text measurement/drawing — pinned to the rustybuzz line
+# usvg 0.44 already brings into the tree.
+rustybuzz = "0.18"
 unicode-segmentation = "1.13"
 unicode-properties = "0.1"
 # `raster` feature only — pinned to the tiny-skia line resvg 0.44 already

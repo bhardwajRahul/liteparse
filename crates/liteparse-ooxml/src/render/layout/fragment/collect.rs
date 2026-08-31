@@ -484,6 +484,9 @@ where
     // Emitted = substitution was rendered, skip remaining result TextRuns until End.
     let mut field_sub_pending: Option<String> = None;
     let mut field_sub_emitted = false;
+    // §17.16.7: FORMCHECKBOX glyph carried by the current field's begin
+    // marker; substituted at Separate/End when no other result exists.
+    let mut field_checkbox: Option<&'static str> = None;
 
     // §17.16.19 MERGEFORMAT — pre-resolve formatting for each complex
     // field's substitution against raw inlines, so empty placeholder
@@ -783,12 +786,21 @@ where
                             field_instr.clear();
                             field_sub_pending = None;
                             field_sub_emitted = false;
+                            // §17.16.7: a FORMCHECKBOX field's rendered state
+                            // rides on the begin marker's ffData — there is no
+                            // result-zone text to fall back to.
+                            field_checkbox = fc.form_checkbox_glyph();
                         }
                         FieldCharType::Separate => {
                             // §17.16.4.1: parse accumulated instruction, evaluate
                             // PAGE/NUMPAGES if field context is available.
                             if let Ok(parsed) = crate::field::parse(&field_instr) {
                                 field_sub_pending = evaluate_field_instruction(&parsed, field_ctx);
+                            }
+                            if field_sub_pending.is_none()
+                                && let Some(glyph) = field_checkbox.take()
+                            {
+                                field_sub_pending = Some(glyph.to_string());
                             }
                             // §17.16.19: bind the formatting source resolved
                             // against raw inlines, so the End fallback path
@@ -800,6 +812,15 @@ where
                             field_depth -= 1; // now collect result runs (unless substituted)
                         }
                         FieldCharType::End => {
+                            // A FORMCHECKBOX authored without a Separate
+                            // marker never reached the Separate arm; its
+                            // glyph is still waiting here.
+                            if field_sub_pending.is_none()
+                                && !field_sub_emitted
+                                && let Some(glyph) = field_checkbox.take()
+                            {
+                                field_sub_pending = Some(glyph.to_string());
+                            }
                             // Substitution still pending at End: the unit
                             // stream never carried a result run (either the
                             // placeholder was empty and got swallowed by
@@ -1287,18 +1308,21 @@ mod tests {
                 field_char_type: FieldCharType::Begin,
                 dirty: None,
                 fld_lock: None,
+                form_checkbox: None,
             }),
             Inline::InstrText("PAGE".into()),
             Inline::FieldChar(FieldChar {
                 field_char_type: FieldCharType::Separate,
                 dirty: None,
                 fld_lock: None,
+                form_checkbox: None,
             }),
             text_run("3"),
             Inline::FieldChar(FieldChar {
                 field_char_type: FieldCharType::End,
                 dirty: None,
                 fld_lock: None,
+                form_checkbox: None,
             }),
         ];
         let ctx = default_ctx(12.0);
@@ -1603,6 +1627,7 @@ mod tests {
             field_char_type: kind,
             dirty: None,
             fld_lock: None,
+            form_checkbox: None,
         })
     }
 

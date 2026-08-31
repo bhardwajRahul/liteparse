@@ -487,10 +487,20 @@ fn draw_text_run(
         let outlines = font.outline_glyphs();
         let location = wght_location(&font, entry.wght);
         let metrics = font.glyph_metrics(Size::new(font_size.raw()), &location);
+        // Kerned per-char advances from the same shaped walk the measurer
+        // sums, so the pen stays inside the measured extent. Fallback: the
+        // unshaped cmap advance, matching the measurer's own fallback.
+        let kerned = crate::render::fonts::kerned_char_advances(
+            data,
+            index,
+            entry.wght,
+            font_size.raw(),
+            text,
+        );
 
         let mut pb = PathBuilder::new();
         let mut pen_x = position.x.raw();
-        for ch in text.chars() {
+        for (i, ch) in text.chars().enumerate() {
             let gid = charmap.map(ch).unwrap_or(skrifa::GlyphId::NOTDEF);
             if let Some(glyph) = outlines.get(gid) {
                 let mut pen = GlyphPen {
@@ -504,7 +514,11 @@ fn draw_text_run(
                 // still moves the pen so the rest of the run stays aligned.
                 let _ = glyph.draw(settings, &mut pen);
             }
-            pen_x += metrics.advance_width(gid).unwrap_or(0.0) * text_scale + char_spacing.raw();
+            let advance = kerned
+                .as_ref()
+                .and_then(|a| a.get(i).copied())
+                .unwrap_or_else(|| metrics.advance_width(gid).unwrap_or(0.0));
+            pen_x += advance * text_scale + char_spacing.raw();
         }
         pb.finish()
     });

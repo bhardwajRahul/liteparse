@@ -1515,6 +1515,18 @@ pub(crate) fn layout_section_with_clearance(
                     let collapse = state.prev_space_after.min(effective_style.space_before);
                     state.cursor_y -= collapse;
                 }
+                if std::env::var_os("LITEPARSE_TRACE_SPACING").is_some() {
+                    eprintln!(
+                        "  para block={} style={:?} cursor={:.1} before={:.1} prev_after={:.1} after={:.1} line_spacing={:?}",
+                        block_idx,
+                        effective_style.style_id,
+                        state.cursor_y.raw(),
+                        effective_style.space_before.raw(),
+                        state.prev_space_after.raw(),
+                        effective_style.space_after.raw(),
+                        effective_style.line_spacing,
+                    );
+                }
 
                 // Register floating images (both relative and absolute).
                 // §20.4.2.18: wrapTopAndBottom images are emitted immediately

@@ -78,6 +78,20 @@ pub struct FieldChar {
     pub dirty: Option<bool>,
     /// Field is locked from updates.
     pub fld_lock: Option<bool>,
+    /// §17.16.7: legacy FORMCHECKBOX state from the begin marker's
+    /// `<w:ffData><w:checkBox>`. `Some(checked)` — the field renders as a
+    /// ☒/☐ glyph and has no result-zone text, so consumers must substitute
+    /// from here or the checkbox vanishes.
+    pub form_checkbox: Option<bool>,
+}
+
+impl FieldChar {
+    /// The ballot-box glyph a FORMCHECKBOX begin marker renders as, matching
+    /// the U+2610/U+2612 pair `w14:checkbox` content controls use.
+    pub fn form_checkbox_glyph(&self) -> Option<&'static str> {
+        self.form_checkbox
+            .map(|checked| if checked { "☒" } else { "☐" })
+    }
 }
 
 /// §17.18.29 ST_FldCharType

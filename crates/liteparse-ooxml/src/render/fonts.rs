@@ -6,7 +6,10 @@
 //! Skia — everything else in `render/layout/` is vendored verbatim.
 //!
 //! Where both engines have the requested face, results agree closely on
-//! widths and are bit-exact on line metrics; divergences beyond that trace to
+//! widths (now pair-kerned via [`kerned_char_advances`]); line metrics
+//! deliberately diverge from upstream's hhea numbers — the measurer derives
+//! them Word-style from OS/2 win metrics (see
+//! `layout::measurer::word_text_metrics`). Divergences beyond that trace to
 //! a *resolution* difference, which is why this file is mostly resolution
 //! policy and hardly any arithmetic.
 //!
@@ -939,6 +942,71 @@ fn variant_for_style(style: FontStyle) -> EmbeddedFontVariant {
 pub fn wght_location(font: &skrifa::FontRef<'_>, wght: u16) -> skrifa::instance::Location {
     use skrifa::MetadataProvider;
     font.axes().location([("wght", f32::from(wght))])
+}
+
+/// Per-char advances for `text` at `size_px`, with pair kerning applied.
+///
+/// Shapes through rustybuzz with every ligature feature disabled
+/// (`liga`/`clig`/`dlig`/`hlig`/`calt`), so substitutions that merge
+/// characters are off and the glyph stream stays 1:1 with the cmap walk the
+/// measurer and the raster both do — the kerned advance for char *i* is
+/// exactly the pen delta the drawing loop should apply after drawing char
+/// *i*'s cmap glyph. Word applies the same model: kerning adjusts pen
+/// positions, it never re-substitutes glyphs.
+///
+/// A shaping-driven merge that survives anyway (e.g. a *required* ligature)
+/// accumulates its whole advance on the cluster's first char and leaves the
+/// rest at 0.0, so the *sum* — what line fitting consumes — is still right.
+///
+/// `None` when the face doesn't parse for shaping; callers keep their
+/// unshaped cmap walk as the fallback so a broken font measures as before.
+pub fn kerned_char_advances(
+    data: &[u8],
+    index: u32,
+    wght: u16,
+    size_px: f32,
+    text: &str,
+) -> Option<Vec<f32>> {
+    let mut face = rustybuzz::Face::from_slice(data, index)?;
+    // Mirrors `wght_location`: set only `wght`; rustybuzz clamps to the
+    // axis range and ignores the variation on a static face.
+    face.set_variations(&[rustybuzz::Variation {
+        tag: rustybuzz::ttf_parser::Tag::from_bytes(b"wght"),
+        value: f32::from(wght),
+    }]);
+    let upem = face.units_per_em() as f32;
+    if upem <= 0.0 {
+        return None;
+    }
+    let scale = size_px / upem;
+
+    let mut buffer = rustybuzz::UnicodeBuffer::new();
+    buffer.push_str(text);
+    // Clusters default to UTF-8 byte offsets; guess script/direction/language
+    // from content like every other shaping consumer does.
+    buffer.guess_segment_properties();
+
+    const OFF: &[&[u8; 4]] = &[b"liga", b"clig", b"dlig", b"hlig", b"calt"];
+    let features: Vec<rustybuzz::Feature> = OFF
+        .iter()
+        .map(|tag| rustybuzz::Feature::new(rustybuzz::ttf_parser::Tag::from_bytes(tag), 0, ..))
+        .collect();
+    let glyphs = rustybuzz::shape(&face, &features, buffer);
+
+    // Map cluster byte offsets back to char ordinals.
+    let byte_starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    let mut advances = vec![0.0f32; byte_starts.len()];
+    for (info, pos) in glyphs
+        .glyph_infos()
+        .iter()
+        .zip(glyphs.glyph_positions().iter())
+    {
+        let ord = byte_starts
+            .binary_search(&(info.cluster as usize))
+            .unwrap_or_else(|next| next.saturating_sub(1));
+        advances[ord] += pos.x_advance as f32 * scale;
+    }
+    Some(advances)
 }
 
 fn system_entry(id: fontdb::ID, wght: u16) -> TypefaceEntry {

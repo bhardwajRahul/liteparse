@@ -2099,6 +2099,7 @@ dependencies = [
  "log",
  "quick-xml",
  "rustc-hash",
+ "rustybuzz",
  "serde",
  "serde_json",
  "skrifa",

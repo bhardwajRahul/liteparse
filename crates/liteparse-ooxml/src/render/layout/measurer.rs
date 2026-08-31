@@ -1,8 +1,9 @@
 //! Text measurer — resolves text widths through a `FontRegistry`.
 //!
-//! A port of the upstream (dxpdf) Skia measurer over fontdb + skrifa. The
-//! measurement arithmetic matches upstream: `measure_str` is a cmap →
-//! sum-of-`hmtx`-advances walk with no shaping or kerning, then §17.3.2.45
+//! A port of the upstream (dxpdf) Skia measurer over fontdb + skrifa, with
+//! pair kerning layered on top via `fonts::kerned_char_advances`. The
+//! measurement arithmetic otherwise matches upstream: `measure_str` is a
+//! cmap → sum-of-`hmtx`-advances walk (the un-kerned fallback), then §17.3.2.45
 //! `text_scale` on the advances and §17.3.2.35 `char_spacing` per character. An
 //! unmapped codepoint contributes glyph 0's (.notdef) advance, which is what a
 //! cmap lookup yields and what Skia does.
@@ -130,13 +131,7 @@ impl<'r> TextMeasurer<'r> {
             let location = wght_location(&font, wght);
             let m = font.metrics(Size::new(px), &location);
             Some((
-                TextMetrics {
-                    ascent: Pt::new(m.ascent),
-                    // skrifa reports descent negative-down; TextMetrics wants
-                    // positive-down.
-                    descent: Pt::new(-m.descent),
-                    leading: Pt::new(m.leading.max(0.0)),
-                },
+                word_text_metrics(&font, px, &m),
                 m.underline.map(|u| (u.offset, u.thickness)),
             ))
         });
@@ -161,14 +156,29 @@ impl<'r> TextMeasurer<'r> {
         }
     }
 
-    /// Raw cmap advance sum for `text` at the slot's size — upstream's
-    /// `measure_str` equivalent (no shaping, no kerning). An unmapped
-    /// codepoint takes glyph 0 (.notdef), which is what a cmap lookup
-    /// genuinely yields — matching Skia rather than skipping the character.
+    /// Raw advance sum for `text` at the slot's size, pair-kerned.
+    ///
+    /// The primary path is the shared shaped walk
+    /// ([`crate::render::fonts::kerned_char_advances`]) — the same per-char
+    /// advances the raster's pen uses, so ink lands inside the measured
+    /// extent by construction. A face that fails shaping falls back to
+    /// upstream's `measure_str` equivalent (cmap walk, no kerning). An
+    /// unmapped codepoint takes glyph 0 (.notdef) in both paths, which is
+    /// what a cmap lookup genuinely yields — matching Skia rather than
+    /// skipping the character.
     fn raw_advance(&self, face: fontdb::ID, wght: u16, size: Pt, text: &str) -> f32 {
         self.registry
             .db()
             .with_face_data(face, |data, index| {
+                if let Some(advances) = crate::render::fonts::kerned_char_advances(
+                    data,
+                    index,
+                    wght,
+                    f32::from(size),
+                    text,
+                ) {
+                    return advances.iter().sum();
+                }
                 let Ok(font) = skrifa::FontRef::from_index(data, index) else {
                     return 0.0;
                 };
@@ -305,11 +315,7 @@ impl<'r> TextMeasurer<'r> {
                 let font = skrifa::FontRef::from_index(data, index).ok()?;
                 let location = wght_location(&font, typeface.wght);
                 let m = font.metrics(Size::new(px), &location);
-                Some(TextMetrics {
-                    ascent: Pt::new(m.ascent),
-                    descent: Pt::new(-m.descent),
-                    leading: Pt::new(m.leading.max(0.0)),
-                })
+                Some(word_text_metrics(&font, px, &m))
             })
             .flatten()
             .unwrap_or(TextMetrics {
@@ -341,6 +347,49 @@ impl<'r> TextMeasurer<'r> {
                 attempted
             );
         }
+    }
+}
+
+/// Vertical metrics the way Word computes a line's height: OS/2
+/// `usWinAscent`/`usWinDescent`, **no** line gap.
+///
+/// Word's auto line height is win-metric based; hhea's
+/// ascent/descent/lineGap (what skrifa's `metrics()` reports, and what CSS
+/// uses) runs taller on most fonts — Arial is 1.150 em vs 1.117 em. Half a
+/// point per 11 pt line sounds free until it compounds: ~40 lines a page is
+/// ~18 pt, one swallowed paragraph, and every page break after it lands one
+/// paragraph early (the 138.docx cascade — Word's own `lastRenderedPageBreak`
+/// markers disagree with the hhea-derived breaks). LibreOffice made the same
+/// choice for the same reason.
+///
+/// Falls back to skrifa's hhea-derived numbers when OS/2 or head is absent
+/// or degenerate (upem 0, zero win metrics) — bitmap-ish or broken faces —
+/// so a face that measured before still measures.
+fn word_text_metrics(
+    font: &skrifa::FontRef<'_>,
+    px: f32,
+    m: &skrifa::metrics::Metrics,
+) -> TextMetrics {
+    use skrifa::raw::TableProvider;
+    if let (Ok(os2), Ok(head)) = (font.os2(), font.head()) {
+        let upem = f32::from(head.units_per_em());
+        let win_ascent = f32::from(os2.us_win_ascent());
+        let win_descent = f32::from(os2.us_win_descent());
+        if upem > 0.0 && win_ascent > 0.0 {
+            let scale = px / upem;
+            return TextMetrics {
+                ascent: Pt::new(win_ascent * scale),
+                descent: Pt::new(win_descent * scale),
+                leading: Pt::ZERO,
+            };
+        }
+    }
+    TextMetrics {
+        ascent: Pt::new(m.ascent),
+        // skrifa reports descent negative-down; TextMetrics wants
+        // positive-down.
+        descent: Pt::new(-m.descent),
+        leading: Pt::new(m.leading.max(0.0)),
     }
 }
 
