@@ -18,6 +18,12 @@ pub mod error;
 pub mod parse;
 pub mod relationships;
 pub(crate) mod whitespace_workaround;
+
+/// Debug-only surface for the `ws_span_probe` example.
+#[doc(hidden)]
+pub fn debug_whitespace_spans(xml: &[u8]) -> Vec<(usize, usize)> {
+    whitespace_workaround::debug_spans(xml)
+}
 pub mod zip;
 
 /// Parse a DOCX file from raw bytes into a fully resolved `Document`.

@@ -76,21 +76,47 @@ fn is_wordprocessingml_namespace(uri: &[u8]) -> bool {
 ///
 /// See module-level docs for why this is necessary.
 pub(crate) fn substitute_whitespace_only_runs(xml: &[u8]) -> Vec<u8> {
-    let spans = whitespace_only_wordprocessingml_text_spans(xml);
+    // quick-xml consumes a leading UTF-8 BOM without counting it in
+    // `buffer_position()`, so every span it reports on a BOM-prefixed part is
+    // shifted 3 bytes left of the source buffer. Scan the BOM-less tail and
+    // slice against that same tail: positions agree by construction.
+    let bom = if xml.starts_with(UTF8_BOM) {
+        UTF8_BOM.len()
+    } else {
+        0
+    };
+    let body = &xml[bom..];
+    let spans = whitespace_only_wordprocessingml_text_spans(body);
     if spans.is_empty() {
         return xml.to_vec();
     }
 
     let mut out: Vec<u8> = Vec::with_capacity(xml.len());
+    out.extend_from_slice(&xml[..bom]);
     let mut cursor = 0;
     for (start, end) in spans {
-        out.extend_from_slice(&xml[cursor..start]);
-        substitute_whitespace(&xml[start..end], &mut out);
+        out.extend_from_slice(&body[cursor..start]);
+        if body[start..end].iter().all(is_xml_whitespace_byte) {
+            substitute_whitespace(&body[start..end], &mut out);
+        } else {
+            // Position bookkeeping drifted (as the unaccounted BOM once made
+            // it). A missed substitution only loses an inter-run space —
+            // never corrupt the part or panic mid-parse over one.
+            debug_assert!(
+                false,
+                "whitespace span {start}..{end} does not cover whitespace"
+            );
+            out.extend_from_slice(&body[start..end]);
+        }
         cursor = end;
     }
-    out.extend_from_slice(&xml[cursor..]);
+    out.extend_from_slice(&body[cursor..]);
     out
 }
+
+/// UTF-8 byte-order mark; legal before the XML declaration and emitted by
+/// several DOCX producers.
+const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
 /// Reverse the sentinel substitution. Returns the original string when no
 /// sentinels are present (zero-allocation common path).
@@ -109,6 +135,21 @@ pub(crate) fn restore_whitespace_sentinels(s: &str) -> String {
         });
     }
     out
+}
+
+/// Debug hook for the `ws_span_probe` example: the span scan exactly as
+/// production applies it (BOM-adjusted), returned as absolute offsets into
+/// the raw buffer so the probe can validate them against the source bytes.
+pub(crate) fn debug_spans(xml: &[u8]) -> Vec<(usize, usize)> {
+    let bom = if xml.starts_with(UTF8_BOM) {
+        UTF8_BOM.len()
+    } else {
+        0
+    };
+    whitespace_only_wordprocessingml_text_spans(&xml[bom..])
+        .into_iter()
+        .map(|(s, e)| (s + bom, e + bom))
+        .collect()
 }
 
 #[inline]
