@@ -3,13 +3,24 @@ use crate::error::LiteParseError;
 use crate::glyph_names::resolve_glyph_name;
 use crate::types::{
     DocumentAnnotation, ExtractedImage, FormField, GraphicPrimitive, ImageRef, OutlineTarget,
-    Page as LitePage, PdfInput, Rect, StructNode, StructureAttributeValue, StructureTree,
-    StructureTreeElement, TextItem, VectorGraphics, VectorLine, VectorShape, WordBox,
+    Page as LitePage, PageError, PdfInput, Rect, StructNode, StructureAttributeValue,
+    StructureTree, StructureTreeElement, TextItem, VectorGraphics, VectorLine, VectorShape,
+    WordBox,
 };
 use image::ImageEncoder;
 use pdfium::{
-    Document, Font, FontType, Library, Page, PathObject, PdfLink, RectF, SegmentKind, TextPage,
+    Document, Font, FontType, FormEnvironment, Library, Page, PathObject, PdfLink, RectF,
+    SegmentKind, TextPage,
 };
+
+/// Dedup spatial-grid cell size bounds (pt). The cell tracks the typical item
+/// footprint so a cell holds O(1) non-overlapping items.
+const DEDUP_MIN_CELL_SIZE: f32 = 8.0;
+const DEDUP_MAX_CELL_SIZE: f32 = 256.0;
+/// Items spanning more grid cells than this (full-page watermarks,
+/// row-spanning leaders) skip the grid and go to a side list that every item
+/// checks against.
+const DEDUP_MAX_CELLS_PER_ITEM: i64 = 64;
 
 /// Open a PDF from path or bytes with an optional password.
 ///
@@ -59,14 +70,32 @@ pub(crate) fn extract_pages_from_document(
         None,
         ExtractionOutputOptions::default(),
     )?
-    .0)
+    .pages)
+}
+
+/// Output of [`extract_pages_and_images`].
+pub(crate) struct ExtractedPages {
+    pub pages: Vec<LitePage>,
+    pub page_errors: Vec<PageError>,
+    /// Empty unless `output_options.extract_images` was set.
+    pub images: Vec<ExtractedImage>,
+    pub image_error_count: u32,
+    /// Whether any page was flattened to recover form-widget text. Flattening
+    /// mutates the open PDFium document, so a caller that still needs the
+    /// original widget annotations must reopen the input.
+    pub flattened_form_widgets: bool,
+    /// The page numbers extraction actually flattened. Flattening is a
+    /// per-page decision, so any consumer reproducing it on a reopened
+    /// document (e.g. OCR raster rendering) must apply it to exactly these
+    /// pages — flattening a page extraction never touched hides that page's
+    /// non-widget annotations from the raster.
+    pub flattened_page_numbers: Vec<u32>,
 }
 
 /// Same as `extract_pages_from_document` but optionally also renders every
 /// raster image object to bytes (when `output_options.extract_images` is true). Returned
 /// `ExtractedImage`s carry the same ids the markdown emitter will reference,
-/// so callers can match them up by id. When image extraction is disabled the
-/// returned image vec is always empty.
+/// so callers can match them up by id.
 pub(crate) fn extract_pages_and_images(
     document: &Document,
     target_pages: Option<&[u32]>,
@@ -74,12 +103,18 @@ pub(crate) fn extract_pages_and_images(
     extract_links: bool,
     glyph_resolver: Option<&dyn crate::GlyphResolver>,
     output_options: ExtractionOutputOptions,
-) -> Result<(Vec<LitePage>, Vec<ExtractedImage>, u32), LiteParseError> {
+) -> Result<ExtractedPages, LiteParseError> {
     let page_count = document.page_count();
     let mut pages = Vec::new();
+    let mut page_errors = Vec::new();
     let mut images: Vec<ExtractedImage> = Vec::new();
     let mut image_cache = ImageCache::default();
     let mut image_error_count = 0u32;
+    let mut flattened_form_widgets = false;
+    let mut flattened_page_numbers: Vec<u32> = Vec::new();
+    // One FFI call keeps the per-page annotation walk off the hot path for
+    // every document without an AcroForm catalog, which is nearly all of them.
+    let document_has_form = document.form_type() != 0;
     let form_environment = output_options
         .extract_form_fields
         .then(|| document.form_environment())
@@ -94,113 +129,238 @@ pub(crate) fn extract_pages_and_images(
             continue;
         }
 
-        if pages.len() >= max_pages {
+        if pages.len() + page_errors.len() >= max_pages {
             break;
         }
 
-        let page = document.page(page_index)?;
+        let page_result = extract_single_page(
+            document,
+            page_index,
+            page_number,
+            extract_links,
+            glyph_resolver,
+            &output_options,
+            form_environment.as_ref(),
+            document_has_form,
+            &mut image_cache,
+        );
+
+        match resolve_page_result(
+            page_number,
+            page_result,
+            output_options.continue_on_page_error,
+            &mut page_errors,
+        )? {
+            Some(extraction) => {
+                if extraction.flattened_form_widgets {
+                    flattened_page_numbers.push(page_number);
+                }
+                pages.push(extraction.page);
+                images.extend(extraction.images);
+                image_error_count += extraction.image_error_count;
+                flattened_form_widgets |= extraction.flattened_form_widgets;
+            }
+            // A failed page's cached renders must not seed dedup for later
+            // pages: a hit would emit `duplicate_of` pointing at an image id
+            // that never made it into the output.
+            None => image_cache.remove_page(page_number),
+        }
+    }
+
+    Ok(ExtractedPages {
+        pages,
+        page_errors,
+        images,
+        image_error_count,
+        flattened_form_widgets,
+        flattened_page_numbers,
+    })
+}
+
+/// Everything one successfully extracted page contributes to the document
+/// output. Accumulated page-locally so a failed page is rolled back by
+/// dropping this value (plus [`ImageCache::remove_page`] for its cache
+/// inserts) instead of undoing shared-state mutations.
+struct PageExtraction {
+    page: LitePage,
+    /// Rendered image bytes; empty unless `extract_images` was set.
+    images: Vec<ExtractedImage>,
+    image_error_count: u32,
+    /// Whether this page was flattened to recover form-widget text.
+    flattened_form_widgets: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_single_page(
+    document: &Document,
+    page_index: i32,
+    page_number: u32,
+    extract_links: bool,
+    glyph_resolver: Option<&dyn crate::GlyphResolver>,
+    output_options: &ExtractionOutputOptions,
+    form_environment: Option<&FormEnvironment<'_, '_>>,
+    document_has_form: bool,
+    image_cache: &mut ImageCache,
+) -> Result<PageExtraction, LiteParseError> {
+    let mut images = Vec::new();
+    let mut image_error_count = 0u32;
+    let mut flattened_form_widgets = false;
+    let page = document.page(page_index)?;
+    let raw_page_width = page.width();
+    let raw_page_height = page.height();
+    let view_box = page.view_box().unwrap_or(RectF {
+        left: 0.0,
+        top: raw_page_height,
+        right: raw_page_width,
+        bottom: 0.0,
+    });
+    // All extracted geometry is converted to the rotation-adjusted
+    // viewport coordinate space. Keep the page dimensions in that same
+    // space so projection, filtering, and consumers do not clip content
+    // at the unrotated MediaBox width on /Rotate 90 or /Rotate 270 pages.
+    let (page_width, page_height) = page.viewport_size(&view_box);
+    // Once a qualifying widget is found, PDFium flattens every visible
+    // annotation on the page. Collect every annotation-backed output first.
+    let links = if extract_links {
+        page.links(&view_box)
+    } else {
+        Vec::new()
+    };
+    // Computed when emitted (`extract_content_bounds`) or needed
+    // internally by the white-fill heuristic (`extract_vector_graphics`).
+    let content_bounds = (output_options.extract_content_bounds
+        || output_options.extract_vector_graphics)
+        .then(|| {
+            page.content_bounds()
+                .map(|bounds| rect_from_pdfium(page.bounds_to_viewport(&view_box, &bounds)))
+        })
+        .flatten();
+    let paths = page.path_objects(&view_box);
+    let graphics = extract_layout_graphics(&paths);
+    let vector_graphics = output_options
+        .extract_vector_graphics
+        .then(|| build_vector_graphics(&paths, content_bounds.as_ref()));
+    let struct_nodes = extract_page_struct_nodes(&page, &view_box);
+    let extracted_refs = extract_page_image_refs(&page, page_number, output_options.extract_images);
+    let mut image_refs = extracted_refs.refs;
+    image_error_count += extracted_refs.error_count;
+    let pdf_annotations = (output_options.extract_annotations
+        || output_options.extract_structure_tree)
+        .then(|| page.annotations(&view_box))
+        .unwrap_or_default();
+    let annotations = output_options
+        .extract_annotations
+        .then(|| pdf_annotations.iter().map(document_annotation).collect());
+    let structure_tree = output_options.extract_structure_tree.then(|| {
+        let annotations_by_object = pdf_annotations
+            .iter()
+            .filter(|annotation| annotation.subtype == "link")
+            .filter_map(|annotation| annotation.object_number.map(|n| (n, annotation)))
+            .collect::<std::collections::HashMap<_, _>>();
+        StructureTree {
+            roots: page
+                .structure_tree()
+                .into_iter()
+                .map(|element| structure_tree_element(element, &annotations_by_object))
+                .collect(),
+        }
+    });
+    let form_fields = output_options.extract_form_fields.then(|| {
+        form_environment.map_or_else(Vec::new, |form| {
+            page.form_fields(form, &view_box, page_number)
+                .into_iter()
+                .map(|field| FormField {
+                    id: field.id,
+                    field_type: field.field_type,
+                    page: field.page,
+                    annotation_index: field.annotation_index,
+                    widget_index: field.widget_index,
+                    object_number: field.object_number,
+                    name: field.name,
+                    alternate_name: field.alternate_name,
+                    value: field.value,
+                    export_value: field.export_value,
+                    field_flags: field.field_flags,
+                    control_count: field.control_count,
+                    control_index: field.control_index,
+                    checked: field.checked,
+                    rect: field.rect.map(rect_from_pdfium),
+                    options: field.options,
+                    selected_options: field.selected_options,
+                })
+                .collect()
+        })
+    });
+
+    if output_options.extract_images && !image_refs.is_empty() {
+        let rendered = render_page_images(&page, page_number, &image_refs, image_cache);
+        image_error_count += rendered.error_count;
+        images.extend(rendered.images);
+        for image_ref in &mut image_refs {
+            image_ref.jpeg_bytes = None;
+            image_ref.raw_bytes = None;
+        }
+    }
+
+    // PDFium's text API reads only the page content stream. Filled form
+    // values commonly live in widget appearance streams, so promote only
+    // those widget appearances into page content and reload before text
+    // extraction. Non-widget annotations are excluded, and this does not
+    // initialize the form environment or execute document JS.
+    //
+    // `widget_text_rects` is empty for the overwhelming majority of pages —
+    // documents with no AcroForm catalog never even reach the annotation
+    // walk — so the whole path costs one `form_type()` call for most files.
+    let extract_text = |page: &Page| -> Result<Vec<TextItem>, LiteParseError> {
         let text_page = page.text()?;
-        let view_box = page.view_box().unwrap_or(RectF {
-            left: 0.0,
-            top: page.height(),
-            right: page.width(),
-            bottom: 0.0,
-        });
-        let mut text_items = extract_page_text_items(
-            &page,
+        extract_page_text_items(
+            page,
             &text_page,
             &view_box,
             glyph_resolver,
             output_options.emit_word_boxes,
             output_options.extract_text_metadata,
-        )?;
-        if extract_links {
-            assign_links(&mut text_items, &page.links(&view_box));
-        }
-        // Computed when emitted (`extract_content_bounds`) or needed
-        // internally by the white-fill heuristic (`extract_vector_graphics`).
-        let content_bounds = (output_options.extract_content_bounds
-            || output_options.extract_vector_graphics)
-            .then(|| {
-                page.content_bounds()
-                    .map(|bounds| rect_from_pdfium(page.bounds_to_viewport(&view_box, &bounds)))
-            })
-            .flatten();
-        let paths = page.path_objects(&view_box);
-        let graphics = extract_layout_graphics(&paths);
-        let vector_graphics = output_options
-            .extract_vector_graphics
-            .then(|| build_vector_graphics(&paths, content_bounds.as_ref()));
-        assign_strikethrough(&mut text_items, &graphics);
-        let struct_nodes = extract_page_struct_nodes(&page, &view_box);
-        let extracted_refs =
-            extract_page_image_refs(&page, page_number, output_options.extract_images);
-        let mut image_refs = extracted_refs.refs;
-        image_error_count += extracted_refs.error_count;
-        let pdf_annotations =
-            if output_options.extract_annotations || output_options.extract_structure_tree {
-                page.annotations(&view_box)
-            } else {
-                Default::default()
-            };
-        let annotations = output_options
-            .extract_annotations
-            .then(|| pdf_annotations.iter().map(document_annotation).collect());
-        let structure_tree = output_options.extract_structure_tree.then(|| {
-            let annotations_by_object = pdf_annotations
-                .iter()
-                .filter(|annotation| annotation.subtype == "link")
-                .filter_map(|annotation| annotation.object_number.map(|n| (n, annotation)))
-                .collect::<std::collections::HashMap<_, _>>();
-            StructureTree {
-                roots: page
-                    .structure_tree()
-                    .into_iter()
-                    .map(|element| structure_tree_element(element, &annotations_by_object))
-                    .collect(),
+        )
+    };
+    let widget_text_rects = if document_has_form {
+        page.form_widget_text_rects(&view_box)
+    } else {
+        Vec::new()
+    };
+    let mut text_items = if widget_text_rects.is_empty() {
+        extract_text(&page)?
+    } else {
+        // PDFium's text layer keeps only one of two runs that start at
+        // essentially the same point, so a flattened appearance can
+        // suppress page text it lands on. Usually widget rects sit over
+        // blank space, and this bounds-only probe says so without touching
+        // the text API; only when a widget really does cover existing text
+        // do we extract twice and put back what was suppressed.
+        let overlaps_existing_text = page.text_objects_overlap(&view_box, &widget_text_rects);
+        let before = overlaps_existing_text
+            .then(|| extract_text(&page))
+            .transpose()?;
+        drop(page);
+        match document.flatten_form_widgets(page_index)? {
+            Some(flattened_page) => {
+                flattened_form_widgets = true;
+                let mut items = extract_text(&flattened_page)?;
+                if let Some(before) = before {
+                    restore_flattened_over_text(&mut items, before, &widget_text_rects);
+                }
+                items
             }
-        });
-        let form_fields = output_options.extract_form_fields.then(|| {
-            form_environment.as_ref().map_or_else(Vec::new, |form| {
-                page.form_fields(form, &view_box, page_number)
-                    .into_iter()
-                    .map(|field| FormField {
-                        id: field.id,
-                        field_type: field.field_type,
-                        page: field.page,
-                        annotation_index: field.annotation_index,
-                        widget_index: field.widget_index,
-                        object_number: field.object_number,
-                        name: field.name,
-                        alternate_name: field.alternate_name,
-                        value: field.value,
-                        export_value: field.export_value,
-                        field_flags: field.field_flags,
-                        control_count: field.control_count,
-                        control_index: field.control_index,
-                        checked: field.checked,
-                        rect: field.rect.map(rect_from_pdfium),
-                        options: field.options,
-                        selected_options: field.selected_options,
-                    })
-                    .collect()
-            })
-        });
-
-        if output_options.extract_images && !image_refs.is_empty() {
-            let rendered = render_page_images(&page, page_number, &image_refs, &mut image_cache);
-            image_error_count += rendered.error_count;
-            images.extend(rendered.images);
-            for image_ref in &mut image_refs {
-                image_ref.jpeg_bytes = None;
-                image_ref.raw_bytes = None;
-            }
+            None => extract_text(&document.page(page_index)?)?,
         }
+    };
+    assign_links(&mut text_items, &links);
+    assign_strikethrough(&mut text_items, &graphics);
 
-        pages.push(LitePage {
+    Ok(PageExtraction {
+        page: LitePage {
             page_number: page_number as usize,
-            page_width: page.width(),
-            page_height: page.height(),
+            page_width,
+            page_height,
             content_bounds: output_options
                 .extract_content_bounds
                 .then_some(content_bounds)
@@ -213,14 +373,83 @@ pub(crate) fn extract_pages_and_images(
             annotations,
             form_fields,
             structure_tree,
-        });
-    }
+        },
+        images,
+        image_error_count,
+        flattened_form_widgets,
+    })
+}
 
-    Ok((pages, images, image_error_count))
+fn resolve_page_result<T>(
+    page_number: u32,
+    result: Result<T, LiteParseError>,
+    continue_on_page_error: bool,
+    page_errors: &mut Vec<PageError>,
+) -> Result<Option<T>, LiteParseError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if continue_on_page_error => {
+            page_errors.push(PageError {
+                page_number,
+                message: error.to_string(),
+            });
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Put back page text that flattening suppressed.
+///
+/// PDFium's text layer emits only one of two text runs that start at
+/// essentially the same point, so a flattened widget appearance can knock out
+/// page text it lands on. When the two carry the *same* string — a producer
+/// that wrote the value into both the content stream and the appearance — that
+/// is precisely the dedup a partially flattened file needs, and matching on
+/// trimmed text leaves it alone. When they differ, such as a pre-printed label
+/// sitting where the value is typed, dropping one is pure data loss, so the
+/// pre-flatten copy is restored.
+///
+/// Only called for the page where a widget rect actually covers existing text;
+/// `before` is the pre-flatten extraction of the same page.
+///
+/// Note this recovers one direction only. If the collision goes the other way
+/// PDFium can suppress the *appearance* text instead, and the field value is
+/// lost with no pre-flatten copy to restore it from.
+fn restore_flattened_over_text(
+    items: &mut Vec<TextItem>,
+    before: Vec<TextItem>,
+    widget_rects: &[RectF],
+) {
+    let surviving: std::collections::HashSet<&str> = items
+        .iter()
+        .map(|item| item.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect();
+    let mut restored: Vec<TextItem> = before
+        .iter()
+        .filter(|item| {
+            let text = item.text.trim();
+            !text.is_empty()
+                && !surviving.contains(text)
+                && widget_rects
+                    .iter()
+                    .any(|rect| rect_contains_center(rect, item))
+        })
+        .cloned()
+        .collect();
+    items.append(&mut restored);
+}
+
+fn rect_contains_center(rect: &RectF, item: &TextItem) -> bool {
+    let cx = item.x + item.width / 2.0;
+    let cy = item.y + item.height / 2.0;
+    cx >= rect.left && cx <= rect.right && cy >= rect.top && cy <= rect.bottom
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ExtractionOutputOptions {
+    pub continue_on_page_error: bool,
     pub extract_content_bounds: bool,
     pub extract_text_metadata: bool,
     pub extract_images: bool,
@@ -524,6 +753,9 @@ const IMAGE_MAX_COVERAGE: f32 = 0.9;
 struct CachedImage {
     raw_bytes: Vec<u8>,
     id: String,
+    /// Source page of the canonical render; lets a failed page's inserts be
+    /// rolled back so later duplicates never reference a dropped image id.
+    page: u32,
     format: String,
     bytes: std::sync::Arc<Vec<u8>>,
 }
@@ -571,6 +803,16 @@ impl ImageCache {
             .entry(Self::key(r, &entry.raw_bytes))
             .or_default()
             .push(entry);
+    }
+
+    /// Drop every entry rendered from `page_number`. Called when that page
+    /// fails after its images were cached, so a later duplicate can't resolve
+    /// to a canonical image that was rolled back out of the output.
+    fn remove_page(&mut self, page_number: u32) {
+        self.entries.retain(|_, bucket| {
+            bucket.retain(|entry| entry.page != page_number);
+            !bucket.is_empty()
+        });
     }
 }
 
@@ -653,6 +895,7 @@ fn render_page_images(
                 CachedImage {
                     raw_bytes,
                     id: r.id.clone(),
+                    page: page_number,
                     format,
                     bytes,
                 },
@@ -665,13 +908,40 @@ fn render_page_images(
     }
 }
 
-/// Encode RGBA pixel bytes to PNG. Lives here (always-compiled) rather than in
-/// `render` so the image-embed path is available on wasm, where the `render`
-/// module (page rasterization / screenshots) is compiled out.
+/// Encode RGBA pixel bytes to PNG. Used by both the image-embed path and the
+/// `render` module (page rasterization / screenshots).
 pub(crate) fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, LiteParseError> {
     let mut png_buf = Vec::new();
     let encoder = image::codecs::png::PngEncoder::new(&mut png_buf);
     encoder.write_image(rgba, width, height, image::ColorType::Rgba8.into())?;
+    Ok(png_buf)
+}
+
+/// Encode tightly-packed pixel bytes to PNG, inferring the color type from the
+/// buffer length: 1 byte/px (grayscale), 3 (RGB), or 4 (RGBA). The OCR render
+/// pipeline produces the first two (`RenderedPage::pixels`); the wasm OCR
+/// bridge uses this to hand PNG bytes to the JS `recognize` callback.
+pub fn encode_pixels_png(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, LiteParseError> {
+    let px = width as usize * height as usize;
+    let color = if px > 0 && pixels.len() == px {
+        image::ExtendedColorType::L8
+    } else if px > 0 && pixels.len() == px * 3 {
+        image::ExtendedColorType::Rgb8
+    } else if px > 0 && pixels.len() == px * 4 {
+        image::ExtendedColorType::Rgba8
+    } else {
+        return Err(LiteParseError::Other(format!(
+            "pixel buffer length {} does not match {width}x{height} at 1/3/4 bytes per pixel",
+            pixels.len()
+        )));
+    };
+    let mut png_buf = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut png_buf);
+    encoder.write_image(pixels, width, height, color)?;
     Ok(png_buf)
 }
 
@@ -1180,10 +1450,19 @@ fn extract_page_text_items(
     let mut font_space_cal: std::collections::HashMap<String, Vec<f32>> =
         std::collections::HashMap::new();
 
-    // Pre-scan: check if ALL text on this page is invisible (render mode 3).
-    // Some scanned PDFs have an invisible OCR text layer as the only text.
-    // In that case we should use the invisible text rather than skipping it.
-    let skip_invisible = should_skip_invisible(text_page, char_count);
+    // Pre-scan: check if ALL text on this page is invisible (render mode 3)
+    // — some scanned PDFs have an invisible OCR text layer as the only text,
+    // which we should use rather than skip — and detect garbage-CMap fonts.
+    // With the fork's batch API both prescans fold into one chunked pass;
+    // otherwise they each walk the page with per-char FFI calls.
+    let mut char_chunks = CharInfoChunks::new(text_page);
+    let (skip_invisible, garbage_fonts) = match char_chunks.as_mut() {
+        Some(chunks) => prescan_page_batched(chunks, char_count),
+        None => (
+            should_skip_invisible(text_page, char_count),
+            detect_garbage_unicode_fonts(text_page, char_count),
+        ),
+    };
 
     if debug {
         eprintln!("[extract-debug] char_count={char_count}, skip_invisible={skip_invisible}");
@@ -1193,7 +1472,7 @@ fn extract_page_text_items(
     let vp_xform = page.viewport_transform(view_box);
     let mut items: Vec<TextItem> = Vec::new();
     let mut seg = SegmentBuilder::new(emit_word_boxes, extract_text_metadata);
-    let garbage_fonts = detect_garbage_unicode_fonts(text_page, char_count);
+    let mut obj_meta = ObjMetaCache::default();
     let mut glyph_decoder = GlyphDecoder::new(
         std::env::var("LITEPARSE_DEBUG_GLYPH").is_ok(),
         garbage_fonts,
@@ -1202,12 +1481,16 @@ fn extract_page_text_items(
 
     for i in 0..char_count {
         let ch = text_page.char_at_unchecked(i);
-        let unicode = ch.unicode();
-        let is_generated = ch.is_generated();
+        let cv = CharView {
+            ch: &ch,
+            rec: char_chunks.as_mut().and_then(|chunks| chunks.record(i)),
+        };
+        let unicode = cv.unicode();
+        let is_generated = cv.is_generated();
 
         // Skip invisible text (render mode 3) only when the page also has visible text.
         // If all text is invisible, it's likely an OCR text layer and we should keep it.
-        if skip_invisible && ch.text_render_mode() == Some(3) {
+        if skip_invisible && cv.text_render_mode() == Some(3) {
             if debug {
                 let c_display = char::from_u32(unicode).unwrap_or('?');
                 eprintln!(
@@ -1222,7 +1505,7 @@ fn extract_page_text_items(
         let decoded: Option<&str> = if is_generated {
             None
         } else {
-            glyph_decoder.decode(&ch, unicode)
+            glyph_decoder.decode(&cv, unicode)
         };
         // A glyph the decoder recovered (glyph-name / reverse-cmap / outline-hash
         // resolver) carries correct text even though PDFium still reports a
@@ -1279,7 +1562,7 @@ fn extract_page_text_items(
         // Whitespace: mark that we're in a pending-space state while retaining
         // the source character code and PDFium-generated distinction.
         if c.is_whitespace() {
-            seg.mark_pending_space(is_generated, ch.char_code());
+            seg.mark_pending_space(is_generated, cv.char_code());
             // Keep PDFium-generated gaps as item boundaries so the emitted
             // item can retain the same trailing-space-generated distinction
             // as the source extractor. The visible text remains trimmed.
@@ -1300,7 +1583,7 @@ fn extract_page_text_items(
         }
 
         // Get loose bounds in viewport space for the item bounding box
-        let Some(loose_box) = ch.loose_char_box() else {
+        let Some(loose_box) = cv.loose_char_box() else {
             if debug {
                 eprintln!("[extract-debug] i={i} SKIP no loose_char_box char='{c}'");
             }
@@ -1324,17 +1607,11 @@ fn extract_page_text_items(
         }
 
         // Also get strict char box for gap calculation (stays in viewport space)
-        let Some(strict_box) = ch.char_box() else {
+        let Some(strict_rect) = cv.strict_char_box() else {
             if debug {
                 eprintln!("[extract-debug] i={i} SKIP no char_box char='{c}'");
             }
             continue;
-        };
-        let strict_rect = RectF {
-            left: strict_box.left as f32,
-            top: strict_box.top as f32,
-            right: strict_box.right as f32,
-            bottom: strict_box.bottom as f32,
         };
         let vp_strict = vp_xform.transform_bounds(&strict_rect);
 
@@ -1393,7 +1670,11 @@ fn extract_page_text_items(
                     || (seg.pending_space && gap > seg.avg_char_width() * 2.2);
                 let loose_gap = seg.loose_gap_to(&vp_strict, c);
                 let em_vp = (vp_loose.bottom - vp_loose.top).abs();
-                let space_w = ch.font_space_width().map(|w| w * em_vp).unwrap_or(-1.0);
+                let space_w = obj_meta
+                    .meta_for(&ch, cv.text_object())
+                    .font_space_width
+                    .map(|w| w * em_vp)
+                    .unwrap_or(-1.0);
                 eprintln!(
                     "[gap] {} gap={:.2} loose={:.2} sw={:.2} g/sw={:.2} fs={:.2} g/fs={:.2} avgcw={:.2} g/cw={:.2} ps={} -> after='{:.20}' next='{}'",
                     if split { "SPLIT" } else { "merge" },
@@ -1416,13 +1697,31 @@ fn extract_page_text_items(
             }
             if !y_overlap || line_changed || gap >= MAX_INLINE_GAP || dot_leader_break {
                 seg.flush(&mut items);
-                seg.start(c, &vp_loose, &vp_strict, &ch, recovered, page_rotation);
+                let meta = obj_meta.meta_for(&ch, cv.text_object());
+                seg.start(
+                    c,
+                    &vp_loose,
+                    &vp_strict,
+                    &cv,
+                    recovered,
+                    page_rotation,
+                    &meta,
+                );
                 seg.append_ligature_tail(ligature_tail);
             } else if seg.pending_space {
                 let avg_cw = seg.avg_char_width();
                 if gap > avg_cw * 2.2 {
                     seg.flush(&mut items);
-                    seg.start(c, &vp_loose, &vp_strict, &ch, recovered, page_rotation);
+                    let meta = obj_meta.meta_for(&ch, cv.text_object());
+                    seg.start(
+                        c,
+                        &vp_loose,
+                        &vp_strict,
+                        &cv,
+                        recovered,
+                        page_rotation,
+                        &meta,
+                    );
                     seg.append_ligature_tail(ligature_tail);
                 } else {
                     // Genuine inline space PDFium emitted: sample its size
@@ -1446,7 +1745,7 @@ fn extract_page_text_items(
                         }
                     }
                     seg.commit_pending_space();
-                    seg.push_char(c, &vp_loose, &vp_strict, &ch, recovered);
+                    seg.push_char(c, &vp_loose, &vp_strict, &cv, recovered);
                     seg.append_ligature_tail(ligature_tail);
                 }
             } else {
@@ -1460,7 +1759,11 @@ fn extract_page_text_items(
                 // metric (common in embedded subset fonts) fall back to a fraction
                 // of the rendered em height as the space estimate.
                 let em_vp = (vp_loose.bottom - vp_loose.top).abs();
-                let space_w = ch.font_space_width().map(|w| w * em_vp).unwrap_or(0.0);
+                let space_w = obj_meta
+                    .meta_for(&ch, cv.text_object())
+                    .font_space_width
+                    .map(|w| w * em_vp)
+                    .unwrap_or(0.0);
                 let loose_gap = seg.loose_gap_to(&vp_strict, c);
                 let both_alnum = c.is_ascii_alphanumeric()
                     && seg
@@ -1489,11 +1792,20 @@ fn extract_page_text_items(
                     seg.text.push(' ');
                     seg.break_word();
                 }
-                seg.push_char(c, &vp_loose, &vp_strict, &ch, recovered);
+                seg.push_char(c, &vp_loose, &vp_strict, &cv, recovered);
                 seg.append_ligature_tail(ligature_tail);
             }
         } else {
-            seg.start(c, &vp_loose, &vp_strict, &ch, recovered, page_rotation);
+            let meta = obj_meta.meta_for(&ch, cv.text_object());
+            seg.start(
+                c,
+                &vp_loose,
+                &vp_strict,
+                &cv,
+                recovered,
+                page_rotation,
+                &meta,
+            );
             seg.append_ligature_tail(ligature_tail);
         }
     }
@@ -1504,8 +1816,11 @@ fn extract_page_text_items(
     // PDFs carry the neighbouring page's text at x beyond the page edge in
     // the same content stream; viewers never show it. Partially-visible
     // items are kept.
-    let vb_w = (view_box.right - view_box.left).abs();
-    let vb_h = (view_box.top - view_box.bottom).abs();
+    // Item coordinates have already been transformed into the
+    // rotation-adjusted viewport. Clip against dimensions in that same space;
+    // using the raw CropBox dimensions here drops the right/bottom portion of
+    // /Rotate 90 and /Rotate 270 pages.
+    let (vb_w, vb_h) = page.viewport_size(view_box);
     let pre_clip_count = items.len();
     items.retain(|it| {
         it.x < vb_w
@@ -1544,123 +1859,201 @@ fn extract_page_text_items(
 
 /// Remove duplicate text items: exact text matches with any bbox overlap,
 /// and near-duplicates (different text) with high bbox overlap (>50% area).
+/// Pair predicate for [`dedup_overlapping_items`]: should the *earlier* item
+/// `i` be dropped in favor of the later item `j` (later = painted on top)?
+///
+/// Callers must already have filtered out diagonal items (see the comment in
+/// `dedup_overlapping_items`).
+fn dedup_pair_drops_earlier(items: &[TextItem], i: usize, j: usize, debug: bool) -> bool {
+    let a = &items[i];
+    let b = &items[j];
+
+    // Compute intersection area
+    let ix_left = a.x.max(b.x);
+    let ix_right = (a.x + a.width).min(b.x + b.width);
+    let iy_top = a.y.max(b.y);
+    let iy_bottom = (a.y + a.height).min(b.y + b.height);
+
+    if ix_left >= ix_right || iy_top >= iy_bottom {
+        return false; // no overlap
+    }
+
+    let intersection = (ix_right - ix_left) * (iy_bottom - iy_top);
+    let area_a = a.width * a.height;
+    let area_b = b.width * b.height;
+    let smaller_area = area_a.min(area_b);
+
+    // Strong overlap: >50% of the smaller item is covered. Guards against
+    // dropping legitimate repeats of the same word elsewhere on the page —
+    // true duplicate stamps overlap essentially 100%, unrelated repeats
+    // share at most a sliver of slack loose-box area.
+    if !(smaller_area > 0.0 && intersection / smaller_area > 0.5) {
+        return false;
+    }
+
+    if a.text == b.text {
+        if debug {
+            eprintln!(
+                "[extract-debug] DEDUP exact-match drop i={i} text='{}' at ({:.1},{:.1} {}x{}) in favor of j={j} at ({:.1},{:.1} {}x{}) overlap_ratio={:.2}",
+                a.text,
+                a.x,
+                a.y,
+                a.width,
+                a.height,
+                b.x,
+                b.y,
+                b.width,
+                b.height,
+                intersection / smaller_area
+            );
+        }
+        return true;
+    }
+
+    // Different text but strong overlap: likely overpainted text layers
+    // (e.g. old/new branding); keep the later one (on top in paint order).
+    // Skip when sizes differ wildly (area ratio > 5x) — a small cell value
+    // inside a row-spanning dotted leader is separate content, not a layer.
+    let larger_area = area_a.max(area_b);
+    if larger_area / smaller_area > 5.0 {
+        if debug {
+            eprintln!(
+                "[extract-debug] DEDUP skip (area ratio {:.1}x) i={i} text='{}' j={j} text='{}'",
+                larger_area / smaller_area,
+                a.text,
+                b.text
+            );
+        }
+        return false;
+    }
+    if debug {
+        eprintln!(
+            "[extract-debug] DEDUP overlap drop i={i} text='{}' at ({:.1},{:.1} {}x{}) in favor of j={j} text='{}' at ({:.1},{:.1} {}x{}) overlap_ratio={:.2}",
+            a.text,
+            a.x,
+            a.y,
+            a.width,
+            a.height,
+            b.text,
+            b.x,
+            b.y,
+            b.width,
+            b.height,
+            intersection / smaller_area
+        );
+    }
+    true
+}
+
+/// Remove items an overlapping later item duplicates or overpaints.
+///
+/// An item is dropped iff *some later item* passes
+/// [`dedup_pair_drops_earlier`] — drops only ever hit the earlier item of a
+/// pair, so the result is independent of comparison order and the search can
+/// consult a uniform spatial grid: only items whose bounding boxes can
+/// intersect are ever compared. This must stay near-linear — single-page CAD
+/// exports and receipt ribbons reach 10⁵–10⁶ items, and this pass runs while
+/// holding the process-global PDFium lock.
+///
+/// Diagonal (non-right-angle) text never participates: its *loose*
+/// axis-aligned bounding box — the hull of a rotated glyph run — is far
+/// larger than the ink, so two stacked lines of the same skewed block report
+/// heavy bbox overlap even though the glyphs never touch. True duplicate
+/// stamps are upright and still handled.
 fn dedup_overlapping_items(items: &mut Vec<TextItem>, debug: bool) {
     if items.len() < 2 {
         return;
     }
 
-    let mut keep = vec![true; items.len()];
-    for i in 0..items.len() {
-        if !keep[i] {
+    let upright: Vec<u32> = (0..items.len())
+        .filter(|&i| !is_diagonal_rotation(items[i].rotation))
+        .map(|i| i as u32)
+        .collect();
+    if upright.len() < 2 {
+        return;
+    }
+
+    let (sum_w, sum_h) = upright.iter().fold((0.0f64, 0.0f64), |(w, h), &i| {
+        let it = &items[i as usize];
+        (w + it.width.max(0.0) as f64, h + it.height.max(0.0) as f64)
+    });
+    let avg_dim = ((sum_w + sum_h) / (2 * upright.len()) as f64) as f32;
+    let cell = avg_dim.clamp(DEDUP_MIN_CELL_SIZE, DEDUP_MAX_CELL_SIZE);
+    let cell_range = |it: &TextItem| -> (i32, i32, i32, i32) {
+        (
+            (it.x / cell).floor() as i32,
+            ((it.x + it.width) / cell).floor() as i32,
+            (it.y / cell).floor() as i32,
+            ((it.y + it.height) / cell).floor() as i32,
+        )
+    };
+
+    let mut grid: std::collections::HashMap<(i32, i32), Vec<u32>> =
+        std::collections::HashMap::new();
+    let mut oversized: Vec<u32> = Vec::new();
+    for &idx in &upright {
+        let (cx0, cx1, cy0, cy1) = cell_range(&items[idx as usize]);
+        let cells = (cx1 as i64 - cx0 as i64 + 1) * (cy1 as i64 - cy0 as i64 + 1);
+        if cells > DEDUP_MAX_CELLS_PER_ITEM {
+            oversized.push(idx);
             continue;
         }
-        for j in (i + 1)..items.len() {
-            if !keep[j] {
-                continue;
+        for cx in cx0..=cx1 {
+            for cy in cy0..=cy1 {
+                grid.entry((cx, cy)).or_default().push(idx);
             }
+        }
+    }
 
-            let a = &items[i];
-            let b = &items[j];
-
-            // Diagonal (non-right-angle) text has a *loose* axis-aligned
-            // bounding box — the hull of a rotated glyph run is far larger than
-            // the ink, so two stacked lines of the same skewed block (e.g.
-            // "Paris has the" above "eiffel tower" at 51°) report heavy bbox
-            // overlap even though the glyphs never touch. Dedup keys off AABB
-            // overlap, so it would wrongly drop one of those lines. Skip the
-            // comparison entirely when either item is diagonal; true duplicate
-            // stamps are upright and still handled below.
-            if is_diagonal_rotation(a.rotation) || is_diagonal_rotation(b.rotation) {
-                continue;
+    let mut keep = vec![true; items.len()];
+    // Generation stamps so a candidate sharing several cells with the current
+    // item is only tested once.
+    let mut last_seen = vec![u32::MAX; items.len()];
+    for (generation, &i) in upright.iter().enumerate() {
+        let i = i as usize;
+        let generation = generation as u32;
+        last_seen[i] = generation;
+        let mut check = |j: u32, keep_i: &mut bool| -> bool {
+            let j = j as usize;
+            if j <= i || last_seen[j] == generation {
+                return false;
             }
-
-            // Compute intersection area
-            let ix_left = a.x.max(b.x);
-            let ix_right = (a.x + a.width).min(b.x + b.width);
-            let iy_top = a.y.max(b.y);
-            let iy_bottom = (a.y + a.height).min(b.y + b.height);
-
-            if ix_left >= ix_right || iy_top >= iy_bottom {
-                continue; // no overlap
+            last_seen[j] = generation;
+            if dedup_pair_drops_earlier(items, i, j, debug) {
+                *keep_i = false;
+                return true; // i is gone, move to next i
             }
-
-            let intersection = (ix_right - ix_left) * (iy_bottom - iy_top);
-            let area_a = a.width * a.height;
-            let area_b = b.width * b.height;
-            let smaller_area = area_a.min(area_b);
-
-            if items[i].text == items[j].text {
-                // Exact text match: require strong bounding-box overlap before
-                // dedup. The same word routinely appears more than once on a
-                // page in different positions; firing on any overlap would drop
-                // a legitimate occurrence when two identical words' bboxes share
-                // even a sliver of area (e.g. one column's word vertically
-                // adjacent to another column's identical word with a slack
-                // loose-box), corrupting that line.
-                //
-                // Require ≥50% overlap of the smaller item — same threshold
-                // as the non-exact branch. True duplicate stamps overlap
-                // essentially 100%; unrelated repeats overlap 0%.
-                let strong_overlap = smaller_area > 0.0 && intersection / smaller_area > 0.5;
-                if !strong_overlap {
-                    continue;
-                }
-                if debug {
-                    eprintln!(
-                        "[extract-debug] DEDUP exact-match drop i={i} text='{}' at ({:.1},{:.1} {}x{}) in favor of j={j} at ({:.1},{:.1} {}x{}) overlap_ratio={:.2}",
-                        items[i].text,
-                        items[i].x,
-                        items[i].y,
-                        items[i].width,
-                        items[i].height,
-                        items[j].x,
-                        items[j].y,
-                        items[j].width,
-                        items[j].height,
-                        intersection / smaller_area
-                    );
-                }
-                keep[i] = false;
-                break; // i is gone, move to next i
-            } else if smaller_area > 0.0 && intersection / smaller_area > 0.5 {
-                // Different text but >50% overlap of the smaller item:
-                // likely overlapping text layers (e.g. old/new branding).
-                // Keep the later one (rendered on top in PDF paint order).
-                //
-                // However, skip dedup when the items have very different sizes
-                // (area ratio > 5x). This happens when a small cell value sits
-                // inside a row-spanning element like a dotted leader — these are
-                // separate content, not overlapping layers.
-                let larger_area = area_a.max(area_b);
-                if larger_area / smaller_area > 5.0 {
-                    if debug {
-                        eprintln!(
-                            "[extract-debug] DEDUP skip (area ratio {:.1}x) i={i} text='{}' j={j} text='{}'",
-                            larger_area / smaller_area,
-                            items[i].text,
-                            items[j].text
-                        );
+            false
+        };
+        let (cx0, cx1, cy0, cy1) = cell_range(&items[i]);
+        let cells = (cx1 as i64 - cx0 as i64 + 1) * (cy1 as i64 - cy0 as i64 + 1);
+        'search: {
+            // An oversized item's cell walk would be huge; its overlap
+            // partners are found by the exhaustive pass below instead.
+            if cells <= DEDUP_MAX_CELLS_PER_ITEM {
+                for cx in cx0..=cx1 {
+                    for cy in cy0..=cy1 {
+                        let Some(bucket) = grid.get(&(cx, cy)) else {
+                            continue;
+                        };
+                        for &j in bucket {
+                            if check(j, &mut keep[i]) {
+                                break 'search;
+                            }
+                        }
                     }
-                    continue;
                 }
-                if debug {
-                    eprintln!(
-                        "[extract-debug] DEDUP overlap drop i={i} text='{}' at ({:.1},{:.1} {}x{}) in favor of j={j} text='{}' at ({:.1},{:.1} {}x{}) overlap_ratio={:.2}",
-                        items[i].text,
-                        items[i].x,
-                        items[i].y,
-                        items[i].width,
-                        items[i].height,
-                        items[j].text,
-                        items[j].x,
-                        items[j].y,
-                        items[j].width,
-                        items[j].height,
-                        intersection / smaller_area
-                    );
+                for &j in &oversized {
+                    if check(j, &mut keep[i]) {
+                        break 'search;
+                    }
                 }
-                keep[i] = false;
-                break; // i is gone, move to next i
+            } else {
+                for &j in &upright {
+                    if check(j, &mut keep[i]) {
+                        break 'search;
+                    }
+                }
             }
         }
     }
@@ -1862,12 +2255,12 @@ impl<'a> GlyphDecoder<'a> {
     /// Returns replacement text for this char when its glyph name resolves
     /// and the current unicode is suspicious (control/PUA/sentinel/map-error)
     /// or the font's unicode mapping is untrusted altogether.
-    fn decode(&mut self, ch: &pdfium::TextChar, unicode: u32) -> Option<&str> {
+    fn decode(&mut self, cv: &CharView<'_, '_>, unicode: u32) -> Option<&str> {
         let cheap_suspicious = matches!(unicode, 0 | 0xFFFE | 0xFFFF)
             || (unicode < 0x20 && !matches!(unicode, 0x09 | 0x0A | 0x0D))
             || (0xE000..=0xF8FF).contains(&unicode);
 
-        let obj_ptr = ch.text_object()?;
+        let obj_ptr = cv.text_object()?;
         let obj = obj_ptr as usize;
         let key = if obj == self.last_obj {
             self.last_key
@@ -1930,13 +2323,13 @@ impl<'a> GlyphDecoder<'a> {
 
         // map-error FFI check is the expensive part of "suspicious"; only
         // consult it when the cheap checks and font trust don't decide.
-        if !info.untrusted && !cheap_suspicious && !ch.has_unicode_map_error() {
+        if !info.untrusted && !cheap_suspicious && !cv.has_unicode_map_error() {
             return None;
         }
         let debug = self.debug;
         let resolver = self.resolver;
 
-        let char_code = ch.char_code();
+        let char_code = cv.char_code();
         let encoding_lies = info.encoding_lies;
         let FontGlyphInfo {
             font,
@@ -2040,6 +2433,11 @@ impl<'a> GlyphDecoder<'a> {
     }
 }
 
+/// Control/PUA/sentinel codepoints that signal a garbage /ToUnicode mapping.
+fn is_suspicious_unicode(unicode: u32) -> bool {
+    matches!(unicode, 0 | 0xFFFE | 0xFFFF) || unicode < 0x20 || (0xE000..=0xF8FF).contains(&unicode)
+}
+
 /// Prescan: flag fonts whose /ToUnicode maps a high fraction of chars into
 /// control/PUA/sentinel codepoints — a structurally present but garbage CMap
 /// (e.g. `text_simple__spd`). Chars from flagged fonts get glyph-name /
@@ -2048,6 +2446,20 @@ fn detect_garbage_unicode_fonts(
     text_page: &TextPage,
     char_count: i32,
 ) -> std::collections::HashSet<usize> {
+    // Cheap gate: a font is only flagged when some of its chars map into
+    // suspicious codepoints, so a page with no suspicious unicode at all (the
+    // overwhelmingly common case) can skip the per-char text-object and font
+    // resolution below — one FFI call per char instead of three. The gate
+    // scans all chars (a superset of what the counting pass considers), so an
+    // all-clear here is an all-clear for the full pass.
+    let any_suspicious = (0..char_count).any(|i| {
+        let unicode = text_page.char_at_unchecked(i).unicode();
+        !matches!(unicode, 0x09 | 0x0A | 0x0D | 0x20) && is_suspicious_unicode(unicode)
+    });
+    if !any_suspicious {
+        return std::collections::HashSet::new();
+    }
+
     let mut counts: std::collections::HashMap<usize, (u32, u32)> = std::collections::HashMap::new();
     let mut last_obj: usize = 0;
     let mut last_key: usize = 0;
@@ -2076,10 +2488,7 @@ fn detect_garbage_unicode_fonts(
         };
         let entry = counts.entry(key).or_insert((0, 0));
         entry.0 += 1;
-        let suspicious = matches!(unicode, 0 | 0xFFFE | 0xFFFF)
-            || unicode < 0x20
-            || (0xE000..=0xF8FF).contains(&unicode);
-        if suspicious {
+        if is_suspicious_unicode(unicode) {
             entry.1 += 1;
         }
     }
@@ -2095,6 +2504,394 @@ fn detect_garbage_unicode_fonts(
 /// `flush`).
 fn counts_as_unmapped(recovered: bool, raw_map_error: bool) -> bool {
     !recovered && raw_map_error
+}
+
+/// Text metadata that is constant across one text object, captured once and
+/// reused by every segment that starts inside it. Nearly all of
+/// [`SegmentBuilder::start`]'s FFI round-trips and string allocations resolve
+/// per-object or per-font constants; on dense pages (hundreds of thousands of
+/// tiny text objects sharing a handful of fonts) re-deriving them at every
+/// segment start dominated extraction time.
+struct ObjTextMeta {
+    font_name: Option<String>,
+    font_flags: Option<i32>,
+    font_weight: Option<i32>,
+    /// Raw pdfium font size for the object; <= 0 means "unavailable" and the
+    /// segment falls back to its loose-box height (resolved in `start`).
+    font_size: f32,
+    /// Ascent/descent at `font_size`. None when the font is missing or
+    /// `font_size <= 0` (that case is recomputed per segment against the
+    /// fallback size).
+    font_ascent: Option<f32>,
+    font_descent: Option<f32>,
+    /// Vertical scale of the char matrix (font_height = font_size * scale_y).
+    scale_y: Option<f32>,
+    /// Mirrors the pre-cache logic: only probed when the font has a base
+    /// name, false otherwise.
+    font_is_embedded: bool,
+    /// Buggy-by-name verdict (embedded + known-bad name/type). Per-char buggy
+    /// codepoint checks still run in the segment.
+    font_name_is_buggy: bool,
+    font: Option<Font>,
+    fill_color: Option<String>,
+    stroke_color: Option<String>,
+    mcid: Option<i32>,
+    /// Advance width of the ASCII space in this object's font, per em
+    /// (mirrors [`pdfium::TextChar::font_space_width`]).
+    font_space_width: Option<f32>,
+}
+
+/// Font-level constants shared by every text object using the same font,
+/// keyed by `FPDF_FONT` handle.
+struct FontMeta {
+    base_name: Option<String>,
+    /// Name/flags from `FPDFText_GetFontInfo`; the name is only used when the
+    /// font exposes no base name.
+    info_name: Option<String>,
+    flags: Option<i32>,
+    weight: Option<i32>,
+    is_embedded: bool,
+    name_is_buggy: bool,
+    space_width_per_em: Option<f32>,
+}
+
+#[derive(Default)]
+struct ObjMetaCache {
+    last_obj: usize,
+    last: Option<std::rc::Rc<ObjTextMeta>>,
+    fonts: std::collections::HashMap<usize, FontMeta>,
+    /// (font handle, font_size bits) -> (ascent, descent).
+    metrics: std::collections::HashMap<(usize, u32), (Option<f32>, Option<f32>)>,
+    /// Packed ARGB -> hex string, shared across objects.
+    colors: std::collections::HashMap<u32, String>,
+}
+
+impl ObjMetaCache {
+    /// `obj_ptr` is the char's text object (from [`CharView::text_object`]),
+    /// passed in so the batch path avoids the per-char FFI lookup.
+    fn meta_for(
+        &mut self,
+        ch: &pdfium::TextChar,
+        obj_ptr: Option<pdfium::pdfium_sys::FPDF_PAGEOBJECT>,
+    ) -> std::rc::Rc<ObjTextMeta> {
+        let key = obj_ptr.map_or(0, |p| p as usize);
+        if key != 0
+            && key == self.last_obj
+            && let Some(meta) = &self.last
+        {
+            return std::rc::Rc::clone(meta);
+        }
+        let meta = std::rc::Rc::new(self.build(ch, obj_ptr));
+        self.last_obj = key;
+        self.last = Some(std::rc::Rc::clone(&meta));
+        meta
+    }
+
+    fn hex(&mut self, c: &pdfium::Color) -> String {
+        let key = u32::from_be_bytes([c.a, c.r, c.g, c.b]);
+        self.colors
+            .entry(key)
+            .or_insert_with(|| color_to_argb_hex(c))
+            .clone()
+    }
+
+    fn build(
+        &mut self,
+        ch: &pdfium::TextChar,
+        obj_ptr: Option<pdfium::pdfium_sys::FPDF_PAGEOBJECT>,
+    ) -> ObjTextMeta {
+        let font = obj_ptr.and_then(|obj| unsafe { Font::from_text_object(obj) });
+        let fs = ch.font_size() as f32;
+        let mut font_name = None;
+        let mut font_flags = None;
+        let font_weight;
+        let font_space_width;
+        let mut font_is_embedded = false;
+        let mut font_name_is_buggy = false;
+        let mut font_ascent = None;
+        let mut font_descent = None;
+        match &font {
+            Some(f) => {
+                let handle = f.handle() as usize;
+                let fm = self.fonts.entry(handle).or_insert_with(|| {
+                    let base_name = f.base_name();
+                    let (is_embedded, name_is_buggy) = match &base_name {
+                        Some(name) => {
+                            let embedded = f.is_embedded();
+                            (embedded, embedded && is_buggy_font(name, f.font_type()))
+                        }
+                        None => (false, false),
+                    };
+                    let (info_name, flags) = match ch.font_info() {
+                        Some((name, flags)) => (Some(name), Some(flags)),
+                        None => (None, None),
+                    };
+                    let weight = ch.font_weight();
+                    // Same probe order as `TextChar::font_space_width`.
+                    let space_width_per_em = f
+                        .glyph_width_from_char_code(0x20, 1.0)
+                        .filter(|w| *w > 0.0)
+                        .or_else(|| f.glyph_width(0x20, 1.0).filter(|w| *w > 0.0));
+                    FontMeta {
+                        base_name,
+                        info_name,
+                        flags,
+                        weight: (weight > 0).then_some(weight),
+                        is_embedded,
+                        name_is_buggy,
+                        space_width_per_em,
+                    }
+                });
+                font_name = fm.base_name.clone().or_else(|| fm.info_name.clone());
+                font_flags = fm.flags;
+                font_weight = fm.weight;
+                font_is_embedded = fm.is_embedded;
+                font_name_is_buggy = fm.name_is_buggy;
+                font_space_width = fm.space_width_per_em;
+                if fs > 0.0 {
+                    let (ascent, descent) = *self
+                        .metrics
+                        .entry((handle, fs.to_bits()))
+                        .or_insert_with(|| (f.ascent(fs), f.descent(fs)));
+                    font_ascent = ascent;
+                    font_descent = descent;
+                }
+            }
+            None => {
+                if let Some((name, flags)) = ch.font_info() {
+                    font_name = Some(name);
+                    font_flags = Some(flags);
+                }
+                let weight = ch.font_weight();
+                font_weight = (weight > 0).then_some(weight);
+                font_space_width = None;
+            }
+        }
+        let scale_y = if obj_ptr.is_some() {
+            ch.matrix().map(|m| decompose_scale(&m).1)
+        } else {
+            None
+        };
+        let stroke_color = ch.stroke_color().map(|c| self.hex(&c));
+        let fill_color = ch.fill_color().map(|c| self.hex(&c));
+        ObjTextMeta {
+            font_name,
+            font_flags,
+            font_weight,
+            font_size: fs,
+            font_ascent,
+            font_descent,
+            scale_y,
+            font_is_embedded,
+            font_name_is_buggy,
+            font,
+            fill_color,
+            stroke_color,
+            mcid: ch.marked_content_id(),
+            font_space_width,
+        }
+    }
+}
+
+/// Raw `CPDF_TextPage::CharType` values surfaced by the fork's batched
+/// char-info records (`FPDF_CHARINFO_LP::char_type`).
+const CHAR_TYPE_GENERATED: i32 = 1;
+const CHAR_TYPE_NOT_UNICODE: i32 = 2;
+
+/// Records per `FPDFText_GetCharInfoBatch` call (80 bytes each → ~1.3 MB).
+const CHAR_INFO_CHUNK: usize = 16 * 1024;
+
+/// Chunked reader over the fork's batched char-info API (chromium/8028+).
+/// `new` returns None when the loaded pdfium predates the API; callers then
+/// fall back to the per-character FFI getters.
+struct CharInfoChunks<'a, 'page, 'lib: 'page> {
+    text_page: &'a TextPage<'page, 'lib>,
+    buf: Vec<pdfium::pdfium_sys::FPDF_CHARINFO_LP>,
+    /// Absolute char index of `buf[0]`.
+    start: i32,
+}
+
+impl<'a, 'page, 'lib: 'page> CharInfoChunks<'a, 'page, 'lib> {
+    fn new(text_page: &'a TextPage<'page, 'lib>) -> Option<Self> {
+        // Empty-buffer call probes symbol support without reading records.
+        text_page.char_infos_batch(0, &mut [])?;
+        Some(Self {
+            text_page,
+            buf: Vec::new(),
+            start: 0,
+        })
+    }
+
+    /// Record for absolute char index `i` (must be within the page's char
+    /// count), refilling the chunk buffer on demand. Returns None only if
+    /// the batch call unexpectedly comes back empty for a valid index.
+    fn record(&mut self, i: i32) -> Option<pdfium::pdfium_sys::FPDF_CHARINFO_LP> {
+        let off = i - self.start;
+        if off < 0 || off as usize >= self.buf.len() {
+            self.buf.resize(CHAR_INFO_CHUNK, Default::default());
+            let written = self
+                .text_page
+                .char_infos_batch(i, &mut self.buf)
+                .unwrap_or(0);
+            self.buf.truncate(written);
+            self.start = i;
+        }
+        self.buf.get((i - self.start) as usize).copied()
+    }
+}
+
+/// Per-character accessor that reads from a batched record when available
+/// and falls back to the per-character FFI getters otherwise. Method
+/// semantics mirror the corresponding [`pdfium::TextChar`] methods exactly.
+struct CharView<'a, 'tp> {
+    ch: &'a pdfium::TextChar<'tp>,
+    rec: Option<pdfium::pdfium_sys::FPDF_CHARINFO_LP>,
+}
+
+impl CharView<'_, '_> {
+    fn unicode(&self) -> u32 {
+        match &self.rec {
+            Some(rec) => rec.unicode,
+            None => self.ch.unicode(),
+        }
+    }
+
+    fn char_code(&self) -> u32 {
+        match &self.rec {
+            Some(rec) => rec.char_code,
+            None => self.ch.char_code(),
+        }
+    }
+
+    fn is_generated(&self) -> bool {
+        match &self.rec {
+            Some(rec) => rec.char_type == CHAR_TYPE_GENERATED,
+            None => self.ch.is_generated(),
+        }
+    }
+
+    fn has_unicode_map_error(&self) -> bool {
+        match &self.rec {
+            Some(rec) => rec.char_type == CHAR_TYPE_NOT_UNICODE,
+            None => self.ch.has_unicode_map_error(),
+        }
+    }
+
+    fn text_render_mode(&self) -> Option<i32> {
+        match &self.rec {
+            Some(rec) => (rec.text_render_mode >= 0).then_some(rec.text_render_mode),
+            None => self.ch.text_render_mode(),
+        }
+    }
+
+    fn text_object(&self) -> Option<pdfium::pdfium_sys::FPDF_PAGEOBJECT> {
+        match &self.rec {
+            Some(rec) => (!rec.text_object.is_null()).then_some(rec.text_object),
+            None => self.ch.text_object(),
+        }
+    }
+
+    fn loose_char_box(&self) -> Option<RectF> {
+        match &self.rec {
+            Some(rec) => Some(RectF {
+                left: rec.loose_box.left,
+                top: rec.loose_box.top,
+                right: rec.loose_box.right,
+                bottom: rec.loose_box.bottom,
+            }),
+            None => self.ch.loose_char_box(),
+        }
+    }
+
+    /// Strict char box as an f32 rect (page space).
+    fn strict_char_box(&self) -> Option<RectF> {
+        match &self.rec {
+            Some(rec) => Some(RectF {
+                left: rec.left as f32,
+                top: rec.top as f32,
+                right: rec.right as f32,
+                bottom: rec.bottom as f32,
+            }),
+            None => self.ch.char_box().map(|b| RectF {
+                left: b.left as f32,
+                top: b.top as f32,
+                right: b.right as f32,
+                bottom: b.bottom as f32,
+            }),
+        }
+    }
+}
+
+/// One chunked pass computing both [`should_skip_invisible`] and
+/// [`detect_garbage_unicode_fonts`] from batched records. Must mirror those
+/// functions' logic exactly — they remain the behavior reference (and the
+/// live path) for pdfium builds without the batch API.
+fn prescan_page_batched(
+    chunks: &mut CharInfoChunks<'_, '_, '_>,
+    char_count: i32,
+) -> (bool, std::collections::HashSet<usize>) {
+    let mut visible = 0u32;
+    let mut invisible = 0u32;
+    let mut counts: std::collections::HashMap<usize, (u32, u32)> = std::collections::HashMap::new();
+    let mut last_obj: usize = 0;
+    let mut last_key: usize = 0;
+
+    for i in 0..char_count {
+        let Some(rec) = chunks.record(i) else {
+            continue;
+        };
+        let unicode = rec.unicode;
+        let generated = rec.char_type == CHAR_TYPE_GENERATED;
+
+        // Visible/invisible tally (mirrors `should_skip_invisible`).
+        if !matches!(unicode, 0 | 0xFFFE | 0xFFFF) {
+            let ws_or_ctrl =
+                char::from_u32(unicode).is_some_and(|c| c.is_whitespace() || c.is_control());
+            if !ws_or_ctrl && !generated {
+                if rec.text_render_mode == 3 {
+                    invisible += 1;
+                } else {
+                    visible += 1;
+                }
+            }
+        }
+
+        // Garbage-font tally (mirrors `detect_garbage_unicode_fonts`).
+        if generated || matches!(unicode, 0x09 | 0x0A | 0x0D | 0x20) {
+            continue;
+        }
+        if rec.text_object.is_null() {
+            continue;
+        }
+        let obj = rec.text_object as usize;
+        let key = if obj == last_obj {
+            last_key
+        } else {
+            let Some(font) = (unsafe { Font::from_text_object(rec.text_object) }) else {
+                continue;
+            };
+            last_obj = obj;
+            last_key = font.handle() as usize;
+            last_key
+        };
+        let entry = counts.entry(key).or_insert((0, 0));
+        entry.0 += 1;
+        if is_suspicious_unicode(unicode) {
+            entry.1 += 1;
+        }
+    }
+
+    let skip_invisible = if visible == 0 || invisible == 0 {
+        false
+    } else {
+        (invisible as f64 / (visible + invisible) as f64) < 0.3
+    };
+    let garbage_fonts = counts
+        .into_iter()
+        .filter(|&(_, (total, suspicious))| total >= 20 && suspicious * 10 >= total)
+        .map(|(key, _)| key)
+        .collect();
+    (skip_invisible, garbage_fonts)
 }
 
 /// Accumulates characters into a single TextItem segment.
@@ -2310,15 +3107,18 @@ impl SegmentBuilder {
         }
     }
 
-    /// Start a new segment with the given character.
+    /// Start a new segment with the given character. `meta` carries the
+    /// object/font-level metadata for the character's text object (see
+    /// [`ObjMetaCache`]); only per-character values are read from `cv`.
     fn start(
         &mut self,
         c: char,
         vp_loose: &RectF,
         vp_strict: &RectF,
-        ch: &pdfium::TextChar,
+        cv: &CharView<'_, '_>,
         recovered: bool,
         page_rotation: i32,
+        meta: &ObjTextMeta,
     ) {
         self.text.clear();
         self.text.push(c);
@@ -2334,7 +3134,7 @@ impl SegmentBuilder {
         self.dir_rtl = None;
         self.note_direction(c);
         self.char_count = 1;
-        self.unmapped_char_count = if counts_as_unmapped(recovered, ch.has_unicode_map_error()) {
+        self.unmapped_char_count = if counts_as_unmapped(recovered, cv.has_unicode_map_error()) {
             1
         } else {
             0
@@ -2351,35 +3151,27 @@ impl SegmentBuilder {
         self.text_width = 0.0;
         if self.extract_text_metadata {
             self.char_codes.clear();
-            self.char_codes.push(ch.char_code());
+            self.char_codes.push(cv.char_code());
         }
         self.font_is_buggy = false;
         self.font_is_embedded = false;
         self.font = None;
 
-        // Font info
-        if let Some((name, flags)) = ch.font_info() {
-            self.font_name = Some(name);
-            self.font_flags = Some(flags);
-        } else {
-            self.font_name = None;
-            self.font_flags = None;
-        }
+        // Font info (object/font-level, precomputed in `meta`)
+        self.font_name = meta.font_name.clone();
+        self.font_flags = meta.font_flags;
 
-        let fs = ch.font_size() as f32;
+        let fs = meta.font_size;
         self.font_size = if fs > 0.0 {
             fs
         } else {
             (vp_loose.bottom - vp_loose.top).abs()
         };
 
-        self.font_weight = {
-            let w = ch.font_weight();
-            if w > 0 { Some(w) } else { None }
-        };
+        self.font_weight = meta.font_weight;
 
         // Angle adjusted for page rotation
-        let angle_rad = ch.angle();
+        let angle_rad = cv.ch.angle();
         self.rotation_deg = if angle_rad >= 0.0 {
             adjust_angle_for_rotation(angle_rad, page_rotation).to_degrees()
         } else {
@@ -2387,47 +3179,45 @@ impl SegmentBuilder {
         };
 
         // Font object for ascent/descent/glyph widths/buggy detection
-        if let Some(obj) = ch.text_object() {
-            if let Some(font) = unsafe { Font::from_text_object(obj) } {
-                if let Some(name) = font.base_name() {
-                    let ft = font.font_type();
-                    self.font_is_embedded = font.is_embedded();
+        if let Some(font) = &meta.font {
+            self.font_is_embedded = meta.font_is_embedded;
+            if meta.font_name_is_buggy {
+                self.font_is_buggy = true;
+            }
 
-                    if self.font_is_embedded && is_buggy_font(&name, ft) {
-                        self.font_is_buggy = true;
-                    }
-
-                    self.font_name = Some(name);
-                }
-
+            if fs > 0.0 {
+                self.font_ascent = meta.font_ascent;
+                self.font_descent = meta.font_descent;
+            } else {
+                // Metrics scale with the effective size, which fell back to
+                // this segment's loose-box height above.
                 self.font_ascent = font.ascent(self.font_size);
                 self.font_descent = font.descent(self.font_size);
-
-                // Glyph width for first char
-                let char_code = ch.char_code();
-                if let Some(w) = font.glyph_width_from_char_code(char_code, self.font_size) {
-                    self.text_width += w;
-                }
-
-                self.font = Some(font);
             }
 
-            // fontHeight = fontSize * scaleY
-            if let Some(matrix) = ch.matrix() {
-                let (_sx, sy) = decompose_scale(&matrix);
-                self.font_height = Some(self.font_size * sy);
+            // Glyph width for first char
+            let char_code = cv.char_code();
+            if let Some(w) = font.glyph_width_from_char_code(char_code, self.font_size) {
+                self.text_width += w;
             }
+
+            self.font = Some(font.clone());
+        }
+
+        // fontHeight = fontSize * scaleY
+        if let Some(sy) = meta.scale_y {
+            self.font_height = Some(self.font_size * sy);
         }
 
         // Colors from first glyph
-        self.stroke_color = ch.stroke_color().map(|c| color_to_argb_hex(&c));
-        self.fill_color = ch.fill_color().map(|c| color_to_argb_hex(&c));
+        self.stroke_color = meta.stroke_color.clone();
+        self.fill_color = meta.fill_color.clone();
 
         // Marked content from first glyph
-        self.mcid = ch.marked_content_id();
+        self.mcid = meta.mcid;
 
         // Check codepoint for buggy encoding
-        let unicode = ch.unicode();
+        let unicode = cv.unicode();
         if !self.font_is_buggy && self.font_is_embedded && is_buggy_codepoint(unicode) {
             self.font_is_buggy = true;
         }
@@ -2439,7 +3229,7 @@ impl SegmentBuilder {
         c: char,
         vp_loose: &RectF,
         vp_strict: &RectF,
-        ch: &pdfium::TextChar,
+        cv: &CharView<'_, '_>,
         recovered: bool,
     ) {
         self.text.push(c);
@@ -2456,17 +3246,17 @@ impl SegmentBuilder {
         self.note_direction(c);
         self.char_count += 1;
         if self.extract_text_metadata {
-            self.char_codes.push(ch.char_code());
+            self.char_codes.push(cv.char_code());
         }
-        if counts_as_unmapped(recovered, ch.has_unicode_map_error()) {
+        if counts_as_unmapped(recovered, cv.has_unicode_map_error()) {
             self.unmapped_char_count += 1;
         }
 
         // Accumulate glyph width
         if let Some(ref font) = self.font {
-            let char_code = ch.char_code();
-            if ch.is_generated() {
-                if let Some(w) = font.glyph_width(ch.unicode(), self.font_size) {
+            let char_code = cv.char_code();
+            if cv.is_generated() {
+                if let Some(w) = font.glyph_width(cv.unicode(), self.font_size) {
                     self.text_width += w;
                 }
             } else if let Some(w) = font.glyph_width_from_char_code(char_code, self.font_size) {
@@ -2476,7 +3266,7 @@ impl SegmentBuilder {
 
         // Check codepoint for buggy encoding on subsequent chars
         if !self.font_is_buggy && self.font_is_embedded {
-            let unicode = ch.unicode();
+            let unicode = cv.unicode();
             if is_buggy_codepoint(unicode) {
                 self.font_is_buggy = true;
             }
@@ -2585,6 +3375,207 @@ impl SegmentBuilder {
 mod tests {
     use super::*;
     use std::f32::consts::PI;
+
+    #[test]
+    fn encode_pixels_png_infers_color_type() {
+        for (bpp, expected_color) in [
+            (1, image::ColorType::L8),
+            (3, image::ColorType::Rgb8),
+            (4, image::ColorType::Rgba8),
+        ] {
+            let pixels = vec![0x7Fu8; 2 * 3 * bpp];
+            let png = encode_pixels_png(&pixels, 2, 3).unwrap();
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+            let decoded = image::load_from_memory(&png).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (2, 3));
+            assert_eq!(decoded.color(), expected_color);
+        }
+    }
+
+    #[test]
+    fn encode_pixels_png_rejects_mismatched_length() {
+        assert!(encode_pixels_png(&[0u8; 5], 2, 3).is_err());
+        assert!(encode_pixels_png(&[], 2, 3).is_err());
+        assert!(encode_pixels_png(&[0u8; 3], 0, 0).is_err());
+    }
+
+    fn rotated_text_pdf() -> Vec<u8> {
+        let content =
+            b"BT /F1 10 Tf 20 40 Td (FIRSTMARK) Tj ET\nBT /F1 10 Tf 20 250 Td (SECONDMARK) Tj ET";
+        let objects: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Rotate 90 /Resources << /Font << /F1 7 0 R >> >> /Contents 5 0 R >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Rotate 270 /Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>".to_vec(),
+            [
+                format!("<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+                content,
+                b"\nendstream",
+            ]
+            .concat(),
+            [
+                format!("<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+                content,
+                b"\nendstream",
+            ]
+            .concat(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ];
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            pdf.extend_from_slice(object);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    /// One normal page plus a `/UserUnit 36` page whose text is written at
+    /// 0.3 pt — real size 10.8 pt. PDFium reports the raw sub-point metrics,
+    /// so without the user-unit rescale every char on page 2 dies in the
+    /// zero-height (< 0.5 pt) filter, which is exactly how spreadsheet-export
+    /// invoices used to parse as completely empty pages.
+    fn user_unit_pdf() -> Vec<u8> {
+        let normal = b"BT /F1 10 Tf 20 40 Td (NORMALMARK) Tj ET";
+        let tiny = b"BT /F1 0.3 Tf 2 50 Td (TINYMARK) Tj ET";
+        let objects: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Resources << /Font << /F1 7 0 R >> >> /Contents 5 0 R >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 40 100] /UserUnit 36 /Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>".to_vec(),
+            [
+                format!("<< /Length {} >>\nstream\n", normal.len()).as_bytes(),
+                normal.as_slice(),
+                b"\nendstream",
+            ]
+            .concat(),
+            [
+                format!("<< /Length {} >>\nstream\n", tiny.len()).as_bytes(),
+                tiny.as_slice(),
+                b"\nendstream",
+            ]
+            .concat(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ];
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            pdf.extend_from_slice(object);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn user_unit_page_extracts_text_at_real_scale() {
+        let pages =
+            extract_pages_from_input(&PdfInput::Bytes(user_unit_pdf()), None, usize::MAX, None)
+                .unwrap();
+
+        assert_eq!(pages.len(), 2);
+
+        // The normal page is untouched by the user-unit machinery.
+        assert_eq!((pages[0].page_width, pages[0].page_height), (200.0, 300.0));
+        let normal_text: String = pages[0]
+            .text_items
+            .iter()
+            .map(|i| i.text.as_str())
+            .collect();
+        assert!(normal_text.contains("NORMALMARK"), "page 1: {normal_text}");
+
+        // The /UserUnit 36 page reports its real dimensions...
+        assert_eq!(
+            (pages[1].page_width, pages[1].page_height),
+            (40.0 * 36.0, 100.0 * 36.0)
+        );
+        // ...and its 0.3 pt-written text survives extraction at ~10.8 pt.
+        let tiny_items: Vec<_> = pages[1]
+            .text_items
+            .iter()
+            .filter(|i| i.text.contains("TINYMARK"))
+            .collect();
+        assert_eq!(tiny_items.len(), 1, "items: {:?}", pages[1].text_items);
+        let item = tiny_items[0];
+        assert!(
+            item.height > 5.0 && item.height < 20.0,
+            "expected ~10.8pt tall text, got {}",
+            item.height
+        );
+        // Baseline sanity: the text sits in the upper half of the page in
+        // top-left viewport coordinates (written at y=50 of 100, scaled 36x).
+        assert!(
+            (item.y - (100.0 - 50.3) * 36.0).abs() < 36.0,
+            "unexpected y: {}",
+            item.y
+        );
+    }
+
+    #[test]
+    fn rotated_pages_use_viewport_dimensions_and_keep_edge_text() {
+        let pages =
+            extract_pages_from_input(&PdfInput::Bytes(rotated_text_pdf()), None, usize::MAX, None)
+                .unwrap();
+
+        assert_eq!(pages.len(), 2);
+        for page in &pages {
+            assert_eq!((page.page_width, page.page_height), (300.0, 200.0));
+            let raw_text = page
+                .text_items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<String>()
+                .replace(char::is_whitespace, "");
+            assert!(raw_text.contains("FIRSTMARK"), "raw text: {raw_text}");
+            assert!(raw_text.contains("SECONDMARK"), "raw text: {raw_text}");
+        }
+
+        let parsed = crate::projection::project_pages_to_grid(pages);
+        for page in parsed {
+            let text = page
+                .text_items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<String>()
+                .replace(char::is_whitespace, "");
+            assert!(text.contains("FIRSTMARK"), "extracted text: {text}");
+            assert!(text.contains("SECONDMARK"), "extracted text: {text}");
+            assert!(
+                page.text_items
+                    .iter()
+                    .all(|item| item.x + item.width <= page.page_width + 0.1)
+            );
+        }
+    }
 
     // A glyph PDFium flags with a raw /ToUnicode map error normally counts
     // toward the item's unmapped tally...
@@ -2777,6 +3768,117 @@ mod tests {
         ];
         dedup_overlapping_items(&mut items, false);
         assert_eq!(items.len(), 2);
+    }
+
+    /// Exhaustive-search oracle: applies the dedup rule ("drop an item iff
+    /// some later upright item passes the pair predicate") by checking every
+    /// pair. The grid-backed search must match this on any layout.
+    fn dedup_overlapping_items_exhaustive(items: &mut Vec<TextItem>) {
+        if items.len() < 2 {
+            return;
+        }
+        let mut keep = vec![true; items.len()];
+        for i in 0..items.len() {
+            for j in (i + 1)..items.len() {
+                if is_diagonal_rotation(items[i].rotation)
+                    || is_diagonal_rotation(items[j].rotation)
+                {
+                    continue;
+                }
+                if dedup_pair_drops_earlier(items, i, j, false) {
+                    keep[i] = false;
+                    break;
+                }
+            }
+        }
+        let mut idx = 0;
+        items.retain(|_| {
+            let k = keep[idx];
+            idx += 1;
+            k
+        });
+    }
+
+    #[test]
+    fn dedup_grid_matches_exhaustive_on_random_layouts() {
+        // Deterministic LCG so failures reproduce.
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as f32 / (1u64 << 31) as f32
+        };
+        for round in 0..50 {
+            let n = 20 + (round * 17) % 300;
+            let mut items: Vec<TextItem> = (0..n)
+                .map(|k| {
+                    // Cluster positions so overlaps are common, vary size so
+                    // both the area-ratio skip and the oversized side-list
+                    // trigger, and reuse a small text alphabet so exact-match
+                    // dedup fires.
+                    let big = next() < 0.05;
+                    TextItem {
+                        rotation: if next() < 0.1 { 51.0 } else { 0.0 },
+                        ..ti(
+                            ["a", "b", "cc", "ddd"][k % 4],
+                            next() * 200.0,
+                            next() * 3000.0,
+                            if big { 500.0 } else { 4.0 + next() * 30.0 },
+                            if big { 2000.0 } else { 4.0 + next() * 12.0 },
+                        )
+                    }
+                })
+                .collect();
+            let mut expected = items.clone();
+            dedup_overlapping_items_exhaustive(&mut expected);
+            dedup_overlapping_items(&mut items, false);
+            let got: Vec<_> = items
+                .iter()
+                .map(|it| (it.text.clone(), it.x, it.y))
+                .collect();
+            let want: Vec<_> = expected
+                .iter()
+                .map(|it| (it.text.clone(), it.x, it.y))
+                .collect();
+            assert_eq!(
+                got, want,
+                "grid dedup diverged from oracle on round {round}"
+            );
+        }
+    }
+
+    #[test]
+    fn dedup_scales_to_ribbon_pages() {
+        // Single-page CAD exports / receipt ribbons put 10⁵–10⁶ items on one
+        // page; dedup must stay effectively linear there. A hang here (CI
+        // timeout) means quadratic behavior regressed.
+        let n: usize = 200_000;
+        let mut items: Vec<TextItem> = (0..n)
+            .map(|k| {
+                // Every 10th item is a near-exact restamp of its predecessor
+                // (slightly nudged, same text) so the exact-match dedup path
+                // fires; everything else is a disjoint grid cell.
+                let dup = k % 10 == 0 && k > 0;
+                let base = if dup { k - 1 } else { k };
+                let col = (base % 40) as f32;
+                let row = (base / 40) as f32;
+                ti(
+                    "cell",
+                    col * 5.0 + if dup { 0.3 } else { 0.0 },
+                    row * 8.0,
+                    4.0,
+                    6.0,
+                )
+            })
+            .collect();
+        dedup_overlapping_items(&mut items, false);
+        let dups = (n - 1) / 10;
+        assert!(
+            items.len() <= n - dups && items.len() >= n - 2 * dups,
+            "expected ~{dups} restamped predecessors dropped, got {} of {n} items left",
+            items.len()
+        );
     }
 
     #[test]
@@ -3274,5 +4376,86 @@ mod tests {
             None,
         );
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn page_error_is_fail_fast_by_default() {
+        let mut page_errors = Vec::new();
+        let result = resolve_page_result::<()>(
+            3,
+            Err(LiteParseError::Other("broken page".into())),
+            false,
+            &mut page_errors,
+        );
+
+        assert!(result.is_err());
+        assert!(page_errors.is_empty());
+    }
+
+    #[test]
+    fn page_error_can_be_collected_and_skipped() {
+        let mut page_errors = Vec::new();
+        let result = resolve_page_result::<()>(
+            3,
+            Err(LiteParseError::Other("broken page".into())),
+            true,
+            &mut page_errors,
+        )
+        .unwrap();
+
+        assert!(result.is_none());
+        assert_eq!(
+            page_errors,
+            vec![PageError {
+                page_number: 3,
+                message: "broken page".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn image_cache_remove_page_drops_failed_pages_renders() {
+        let image_ref = |id: &str, raw: &[u8]| ImageRef {
+            id: id.to_string(),
+            bbox: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            obj_index: 0,
+            format: "png".into(),
+            pixel_width: 1,
+            pixel_height: 1,
+            rotation: 0.0,
+            jpeg_bytes: None,
+            raw_bytes: Some(raw.to_vec()),
+            bits_per_pixel: 32,
+            colorspace: 0,
+        };
+        let cached = |id: &str, page: u32, raw: &[u8]| CachedImage {
+            raw_bytes: raw.to_vec(),
+            id: id.to_string(),
+            page,
+            format: "png".into(),
+            bytes: std::sync::Arc::new(Vec::new()),
+        };
+
+        let mut cache = ImageCache::default();
+        cache.insert(&image_ref("p2_1", b"two"), cached("p2_1", 2, b"two"));
+        cache.insert(&image_ref("p3_1", b"three"), cached("p3_1", 3, b"three"));
+
+        // Page 2 failed after rendering: its cache entry must go so a later
+        // duplicate of the same bytes can't claim `duplicate_of: "p2_1"` for
+        // an image that was rolled back out of the output.
+        cache.remove_page(2);
+
+        assert!(cache.get(&image_ref("p5_1", b"two"), b"two").is_none());
+        assert_eq!(
+            cache
+                .get(&image_ref("p5_2", b"three"), b"three")
+                .map(|c| c.id.as_str()),
+            Some("p3_1")
+        );
     }
 }

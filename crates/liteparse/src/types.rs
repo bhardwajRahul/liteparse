@@ -244,6 +244,17 @@ pub struct Page {
     pub structure_tree: Option<StructureTree>,
 }
 
+/// A page that could not be extracted while tolerant page errors were enabled.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PageError {
+    /// Source page number (1-indexed). Serialized as `page` to match the
+    /// sibling per-page fields in the JSON output (`pages[]`, `images[]`).
+    #[serde(rename = "page")]
+    pub page_number: u32,
+    /// Human-readable extraction failure.
+    pub message: String,
+}
+
 /// One PDF page annotation. Coordinates use the same top-left, 72-DPI
 /// viewport space as [`TextItem`].
 #[derive(Debug, Clone, Serialize)]
@@ -460,6 +471,12 @@ pub struct ParsedPage {
     /// Tagged-PDF logical structure when `extract_structure_tree` is true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structure_tree: Option<StructureTree>,
+    /// Classified layout blocks when `extract_blocks` is true, in reading
+    /// order. `None` means extraction was disabled; `Some([])` means enabled
+    /// but the page had no structural decomposition (blank, or fully-OCR
+    /// without the font metadata the classifier needs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocks: Option<Vec<crate::layout::LayoutBlock>>,
 }
 
 /// One embedded raster image on a page. `id` is a stable, page-scoped slug
@@ -515,6 +532,35 @@ pub struct Rect {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+}
+
+impl Rect {
+    /// Smallest rect containing both inputs. Used by the block classifier to
+    /// grow a block's bbox as source lines are appended to it (paragraph
+    /// accumulation, wrapped headings, list-item continuations) and to merge
+    /// blocks that are spliced together after construction.
+    pub fn union(&self, other: &Rect) -> Rect {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = (self.x + self.width).max(other.x + other.width);
+        let bottom = (self.y + self.height).max(other.y + other.height);
+        Rect {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+        }
+    }
+
+    /// Fold `rect` into an optional accumulator. `None` adopts the rect; `Some`
+    /// unions. Blocks whose sources carry no geometry stay `None` rather than
+    /// reporting a bogus rect anchored at the origin.
+    pub fn extend(acc: &mut Option<Rect>, rect: &Rect) {
+        *acc = Some(match acc {
+            Some(existing) => existing.union(rect),
+            None => rect.clone(),
+        });
+    }
 }
 
 /// Page-scoped vector path output. Coordinates use the same top-left,

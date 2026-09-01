@@ -64,6 +64,7 @@ All optional, camelCase:
 | `ocrEnabled` | `boolean` | `true` | Run OCR on text-sparse pages |
 | `maxPages` | `number` | `1000` | Stop after this many pages |
 | `targetPages` | `string` | — | e.g. `"1-5,10,15-20"` |
+| `extractScreenshots` | `boolean` | `false` | Return parsed pages as PNG bytes on `result.screenshots` |
 | `dpi` | `number` | `150` | Render DPI for OCR / screenshots |
 | `outputFormat` | `"json" \| "text" \| "markdown"` | `"json"` | Output format; `"markdown"` returns rendered Markdown on `result.text` |
 | `imageMode` | `"off" \| "placeholder" \| "embed"` | `"placeholder"` | How raster images are surfaced in markdown output |

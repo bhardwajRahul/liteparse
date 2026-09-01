@@ -79,6 +79,10 @@ struct ParseCommand {
     #[arg(long)]
     target_pages: Option<String>,
 
+    /// Continue after page-level extraction errors and report them in JSON.
+    #[arg(long)]
+    continue_on_page_error: bool,
+
     /// DPI for rendering (default: 150)
     #[arg(long, default_value = "150")]
     dpi: f32,
@@ -142,6 +146,11 @@ struct ParseCommand {
     /// Include the tagged-PDF logical structure tree.
     #[arg(long)]
     extract_structure_tree: bool,
+    /// Include each page's classified layout blocks (headings, paragraphs,
+    /// list items, tables with per-cell boxes, code, rules, figures) with
+    /// bounding boxes, in reading order.
+    #[arg(long)]
+    extract_blocks: bool,
     /// Include raw XFA packets (name + XML content) in JSON output.
     #[arg(long)]
     extract_xfa_packets: bool,
@@ -226,6 +235,10 @@ struct BatchParseCommand {
     #[arg(long, default_value = "1000")]
     max_pages: usize,
 
+    /// Continue after page-level extraction errors and report them in JSON.
+    #[arg(long)]
+    continue_on_page_error: bool,
+
     /// DPI for rendering
     #[arg(long, default_value = "150")]
     dpi: f32,
@@ -273,6 +286,11 @@ struct BatchParseCommand {
     /// Include the tagged-PDF logical structure tree.
     #[arg(long)]
     extract_structure_tree: bool,
+    /// Include each page's classified layout blocks (headings, paragraphs,
+    /// list items, tables with per-cell boxes, code, rules, figures) with
+    /// bounding boxes, in reading order.
+    #[arg(long)]
+    extract_blocks: bool,
     /// Include raw XFA packets (name + XML content) in JSON output.
     #[arg(long)]
     extract_xfa_packets: bool,
@@ -373,6 +391,24 @@ fn parse_image_mode(s: &str) -> Result<liteparse::config::ImageMode, String> {
     }
 }
 
+/// Surface tolerated page failures on stderr. JSON output carries
+/// `page_errors` itself, but text/markdown would otherwise silently omit the
+/// failed pages, so this prints unconditionally (not gated on `--quiet`).
+fn warn_page_errors(result: &liteparse::parser::ParseResult, file: Option<&str>) {
+    for error in &result.page_errors {
+        match file {
+            Some(file) => eprintln!(
+                "[liteparse] {}: page {} failed to extract and was skipped: {}",
+                file, error.page_number, error.message
+            ),
+            None => eprintln!(
+                "[liteparse] page {} failed to extract and was skipped: {}",
+                error.page_number, error.message
+            ),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -388,6 +424,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tessdata_path: cmd.tessdata_path,
                 max_pages: cmd.max_pages,
                 target_pages: cmd.target_pages,
+                continue_on_page_error: cmd.continue_on_page_error,
                 dpi: cmd.dpi,
                 output_format: format,
                 preserve_very_small_text: cmd.preserve_small_text,
@@ -403,6 +440,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 extract_annotations: cmd.extract_annotations,
                 extract_form_fields: cmd.extract_form_fields,
                 extract_structure_tree: cmd.extract_structure_tree,
+                extract_blocks: cmd.extract_blocks,
                 extract_xfa_packets: cmd.extract_xfa_packets,
                 extract_content_bounds: cmd.extract_content_bounds,
                 include_complexity: cmd.complexity,
@@ -420,6 +458,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 lp.parse(&cmd.file).await?
             };
+            warn_page_errors(&result, None);
             let formatted = match lp.config().output_format {
                 OutputFormat::Json => {
                     json::format_json_result(&result, lp.config().extract_text_metadata)?
@@ -491,6 +530,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tessdata_path: cmd.tessdata_path,
                 max_pages: cmd.max_pages,
                 target_pages: None,
+                continue_on_page_error: cmd.continue_on_page_error,
                 dpi: cmd.dpi,
                 output_format: format.clone(),
                 preserve_very_small_text: false,
@@ -505,6 +545,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 extract_annotations: cmd.extract_annotations,
                 extract_form_fields: cmd.extract_form_fields,
                 extract_structure_tree: cmd.extract_structure_tree,
+                extract_blocks: cmd.extract_blocks,
                 extract_xfa_packets: cmd.extract_xfa_packets,
                 extract_content_bounds: cmd.extract_content_bounds,
                 ..Default::default()
@@ -548,6 +589,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 match lp.parse(file_path).await {
                     Ok(result) => {
+                        warn_page_errors(&result, Some(file_path));
                         let fmt_result: Result<String, Box<dyn std::error::Error>> =
                             match lp.config().output_format {
                                 OutputFormat::Json => json::format_json_result(

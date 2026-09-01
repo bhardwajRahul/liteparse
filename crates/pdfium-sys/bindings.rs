@@ -155,6 +155,11 @@ pub const FPDF_ANNOT_AACTION_KEY_STROKE: u32 = 12;
 pub const FPDF_ANNOT_AACTION_FORMAT: u32 = 13;
 pub const FPDF_ANNOT_AACTION_VALIDATE: u32 = 14;
 pub const FPDF_ANNOT_AACTION_CALCULATE: u32 = 15;
+pub const FLATTEN_FAIL: u32 = 0;
+pub const FLATTEN_SUCCESS: u32 = 1;
+pub const FLATTEN_NOTHINGTODO: u32 = 2;
+pub const FLAT_NORMALDISPLAY: u32 = 0;
+pub const FLAT_PRINT: u32 = 1;
 pub const FPDF_TEXT_RENDERMODE_FPDF_TEXTRENDERMODE_UNKNOWN: FPDF_TEXT_RENDERMODE = -1;
 pub const FPDF_TEXT_RENDERMODE_FPDF_TEXTRENDERMODE_FILL: FPDF_TEXT_RENDERMODE = 0;
 pub const FPDF_TEXT_RENDERMODE_FPDF_TEXTRENDERMODE_STROKE: FPDF_TEXT_RENDERMODE = 1;
@@ -443,6 +448,7 @@ pub struct FPDF_LIBRARY_CONFIG_ {
     pub m_pPlatform: *mut ::std::os::raw::c_void,
     pub m_RendererType: FPDF_RENDERER_TYPE,
     pub m_FontLibraryType: FPDF_FONT_BACKEND_TYPE,
+    pub m_BrotliEnabled: FPDF_BOOL,
 }
 impl Default for FPDF_LIBRARY_CONFIG_ {
     fn default() -> Self {
@@ -562,22 +568,6 @@ unsafe extern "C" {
         doc: FPDF_DOCUMENT,
         fileVersion: *mut ::std::os::raw::c_int,
     ) -> FPDF_BOOL;
-}
-unsafe extern "C" {
-    pub fn FPDF_GetSignatureCount(document: FPDF_DOCUMENT) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
-    pub fn FPDF_GetSignatureObject(
-        document: FPDF_DOCUMENT,
-        index: ::std::os::raw::c_int,
-    ) -> FPDF_SIGNATURE;
-}
-unsafe extern "C" {
-    pub fn FPDFSignatureObj_GetByteRange(
-        signature: FPDF_SIGNATURE,
-        buffer: *mut ::std::os::raw::c_int,
-        length: ::std::os::raw::c_ulong,
-    ) -> ::std::os::raw::c_ulong;
 }
 unsafe extern "C" {
     pub fn FPDF_GetLastError() -> ::std::os::raw::c_ulong;
@@ -829,6 +819,39 @@ unsafe extern "C" {
         index: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_uint;
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct FPDF_CHARINFO_LP_ {
+    pub text_object: FPDF_PAGEOBJECT,
+    pub left: f64,
+    pub right: f64,
+    pub bottom: f64,
+    pub top: f64,
+    pub loose_box: FS_RECTF,
+    pub font_size: f32,
+    pub unicode: ::std::os::raw::c_uint,
+    pub char_code: ::std::os::raw::c_uint,
+    pub char_type: ::std::os::raw::c_int,
+    pub text_render_mode: ::std::os::raw::c_int,
+}
+impl Default for FPDF_CHARINFO_LP_ {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+pub type FPDF_CHARINFO_LP = FPDF_CHARINFO_LP_;
+unsafe extern "C" {
+    pub fn FPDFText_GetCharInfoBatch(
+        text_page: FPDF_TEXTPAGE,
+        start_index: ::std::os::raw::c_int,
+        count: ::std::os::raw::c_int,
+        buffer: *mut FPDF_CHARINFO_LP,
+    ) -> ::std::os::raw::c_int;
+}
 unsafe extern "C" {
     pub fn FPDFText_GetTextObject(
         text_page: FPDF_TEXTPAGE,
@@ -1079,6 +1102,9 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn FPDFPage_GetRotation(page: FPDF_PAGE) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn FPDFPage_GetUserUnit(page: FPDF_PAGE) -> f32;
 }
 unsafe extern "C" {
     pub fn FPDFPage_SetRotation(page: FPDF_PAGE, rotate: ::std::os::raw::c_int);
@@ -1541,6 +1567,14 @@ unsafe extern "C" {
     ) -> FPDF_BOOL;
 }
 unsafe extern "C" {
+    pub fn FPDFPath_GetBezierControlPoints(
+        path: FPDF_PAGEOBJECT,
+        index: usize,
+        first_control_point: *mut FS_POINTF,
+        second_control_point: *mut FS_POINTF,
+    ) -> FPDF_BOOL;
+}
+unsafe extern "C" {
     pub fn FPDFPath_Close(path: FPDF_PAGEOBJECT) -> FPDF_BOOL;
 }
 unsafe extern "C" {
@@ -1797,6 +1831,14 @@ unsafe extern "C" {
     pub fn FPDFBookmark_GetAction(bookmark: FPDF_BOOKMARK) -> FPDF_ACTION;
 }
 unsafe extern "C" {
+    pub fn FPDFBookmark_GetColor(
+        bookmark: FPDF_BOOKMARK,
+        R: *mut f32,
+        G: *mut f32,
+        B: *mut f32,
+    ) -> FPDF_BOOL;
+}
+unsafe extern "C" {
     pub fn FPDFAction_GetType(action: FPDF_ACTION) -> ::std::os::raw::c_ulong;
 }
 unsafe extern "C" {
@@ -1903,6 +1945,11 @@ unsafe extern "C" {
         buflen: ::std::os::raw::c_ulong,
     ) -> ::std::os::raw::c_ulong;
 }
+pub const FPDF_TEXT_DIRECTION_FPDF_TEXTDIR_UNKNOWN: FPDF_TEXT_DIRECTION = 0;
+pub const FPDF_TEXT_DIRECTION_FPDF_TEXTDIR_AUTO: FPDF_TEXT_DIRECTION = 1;
+pub const FPDF_TEXT_DIRECTION_FPDF_TEXTDIR_LTR: FPDF_TEXT_DIRECTION = 2;
+pub const FPDF_TEXT_DIRECTION_FPDF_TEXTDIR_RTL: FPDF_TEXT_DIRECTION = 3;
+pub type FPDF_TEXT_DIRECTION = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct _IPDF_JsPlatform {
@@ -2253,6 +2300,183 @@ unsafe extern "C" {
     pub fn FPDFDOC_ExitFormFillEnvironment(hHandle: FPDF_FORMHANDLE);
 }
 unsafe extern "C" {
+    pub fn FORM_OnAfterLoadPage(page: FPDF_PAGE, hHandle: FPDF_FORMHANDLE);
+}
+unsafe extern "C" {
+    pub fn FORM_OnBeforeClosePage(page: FPDF_PAGE, hHandle: FPDF_FORMHANDLE);
+}
+unsafe extern "C" {
+    pub fn FORM_DoDocumentJSAction(hHandle: FPDF_FORMHANDLE);
+}
+unsafe extern "C" {
+    pub fn FORM_DoDocumentOpenAction(hHandle: FPDF_FORMHANDLE);
+}
+unsafe extern "C" {
+    pub fn FORM_DoDocumentAAction(hHandle: FPDF_FORMHANDLE, aaType: ::std::os::raw::c_int);
+}
+unsafe extern "C" {
+    pub fn FORM_DoPageAAction(
+        page: FPDF_PAGE,
+        hHandle: FPDF_FORMHANDLE,
+        aaType: ::std::os::raw::c_int,
+    );
+}
+unsafe extern "C" {
+    pub fn FORM_OnMouseMove(
+        hHandle: FPDF_FORMHANDLE,
+        page: FPDF_PAGE,
+        modifier: ::std::os::raw::c_int,
+        page_x: f64,
+        page_y: f64,
+    ) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_OnMouseWheel(
+        hHandle: FPDF_FORMHANDLE,
+        page: FPDF_PAGE,
+        modifier: ::std::os::raw::c_int,
+        page_coord: *const FS_POINTF,
+        delta_x: ::std::os::raw::c_int,
+        delta_y: ::std::os::raw::c_int,
+    ) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_OnFocus(
+        hHandle: FPDF_FORMHANDLE,
+        page: FPDF_PAGE,
+        modifier: ::std::os::raw::c_int,
+        page_x: f64,
+        page_y: f64,
+    ) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_OnLButtonDown(
+        hHandle: FPDF_FORMHANDLE,
+        page: FPDF_PAGE,
+        modifier: ::std::os::raw::c_int,
+        page_x: f64,
+        page_y: f64,
+    ) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_OnRButtonDown(
+        hHandle: FPDF_FORMHANDLE,
+        page: FPDF_PAGE,
+        modifier: ::std::os::raw::c_int,
+        page_x: f64,
+        page_y: f64,
+    ) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_OnLButtonUp(
+        hHandle: FPDF_FORMHANDLE,
+        page: FPDF_PAGE,
+        modifier: ::std::os::raw::c_int,
+        page_x: f64,
+        page_y: f64,
+    ) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_OnRButtonUp(
+        hHandle: FPDF_FORMHANDLE,
+        page: FPDF_PAGE,
+        modifier: ::std::os::raw::c_int,
+        page_x: f64,
+        page_y: f64,
+    ) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_OnLButtonDoubleClick(
+        hHandle: FPDF_FORMHANDLE,
+        page: FPDF_PAGE,
+        modifier: ::std::os::raw::c_int,
+        page_x: f64,
+        page_y: f64,
+    ) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_OnKeyDown(
+        hHandle: FPDF_FORMHANDLE,
+        page: FPDF_PAGE,
+        nKeyCode: ::std::os::raw::c_int,
+        modifier: ::std::os::raw::c_int,
+    ) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_OnKeyUp(
+        hHandle: FPDF_FORMHANDLE,
+        page: FPDF_PAGE,
+        nKeyCode: ::std::os::raw::c_int,
+        modifier: ::std::os::raw::c_int,
+    ) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_OnChar(
+        hHandle: FPDF_FORMHANDLE,
+        page: FPDF_PAGE,
+        nChar: ::std::os::raw::c_int,
+        modifier: ::std::os::raw::c_int,
+    ) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_GetFocusedText(
+        hHandle: FPDF_FORMHANDLE,
+        page: FPDF_PAGE,
+        buffer: *mut ::std::os::raw::c_void,
+        buflen: ::std::os::raw::c_ulong,
+    ) -> ::std::os::raw::c_ulong;
+}
+unsafe extern "C" {
+    pub fn FORM_GetSelectedText(
+        hHandle: FPDF_FORMHANDLE,
+        page: FPDF_PAGE,
+        buffer: *mut ::std::os::raw::c_void,
+        buflen: ::std::os::raw::c_ulong,
+    ) -> ::std::os::raw::c_ulong;
+}
+unsafe extern "C" {
+    pub fn FORM_ReplaceAndKeepSelection(
+        hHandle: FPDF_FORMHANDLE,
+        page: FPDF_PAGE,
+        wsText: FPDF_WIDESTRING,
+    );
+}
+unsafe extern "C" {
+    pub fn FORM_ReplaceSelection(
+        hHandle: FPDF_FORMHANDLE,
+        page: FPDF_PAGE,
+        wsText: FPDF_WIDESTRING,
+    );
+}
+unsafe extern "C" {
+    pub fn FORM_SelectAllText(hHandle: FPDF_FORMHANDLE, page: FPDF_PAGE) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_CanUndo(hHandle: FPDF_FORMHANDLE, page: FPDF_PAGE) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_CanRedo(hHandle: FPDF_FORMHANDLE, page: FPDF_PAGE) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_Undo(hHandle: FPDF_FORMHANDLE, page: FPDF_PAGE) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_Redo(hHandle: FPDF_FORMHANDLE, page: FPDF_PAGE) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_ForceToKillFocus(hHandle: FPDF_FORMHANDLE) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_GetFocusedAnnot(
+        handle: FPDF_FORMHANDLE,
+        page_index: *mut ::std::os::raw::c_int,
+        annot: *mut FPDF_ANNOTATION,
+    ) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_SetFocusedAnnot(handle: FPDF_FORMHANDLE, annot: FPDF_ANNOTATION) -> FPDF_BOOL;
+}
+unsafe extern "C" {
     pub fn FPDFPage_HasFormFieldAtPoint(
         hHandle: FPDF_FORMHANDLE,
         page: FPDF_PAGE,
@@ -2299,6 +2523,34 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn FPDF_GetFormType(document: FPDF_DOCUMENT) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn FORM_SetIndexSelected(
+        hHandle: FPDF_FORMHANDLE,
+        page: FPDF_PAGE,
+        index: ::std::os::raw::c_int,
+        selected: FPDF_BOOL,
+    ) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_IsIndexSelected(
+        hHandle: FPDF_FORMHANDLE,
+        page: FPDF_PAGE,
+        index: ::std::os::raw::c_int,
+    ) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FORM_GetTextDirection(
+        handle: FPDF_FORMHANDLE,
+        annot: FPDF_ANNOTATION,
+    ) -> FPDF_TEXT_DIRECTION;
+}
+unsafe extern "C" {
+    pub fn FORM_SetTextDirection(
+        handle: FPDF_FORMHANDLE,
+        annot: FPDF_ANNOTATION,
+        direction: FPDF_TEXT_DIRECTION,
+    ) -> FPDF_BOOL;
 }
 unsafe extern "C" {
     pub fn FPDF_LoadXFA(document: FPDF_DOCUMENT) -> FPDF_BOOL;
@@ -2987,21 +3239,55 @@ unsafe extern "C" {
     pub fn FPDFPage_InsertClipPath(page: FPDF_PAGE, clipPath: FPDF_CLIPPATH);
 }
 unsafe extern "C" {
-    pub fn FORM_OnAfterLoadPage(page: FPDF_PAGE, hHandle: FPDF_FORMHANDLE);
+    pub fn FPDF_GetSignatureCount(document: FPDF_DOCUMENT) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
-    pub fn FORM_OnBeforeClosePage(page: FPDF_PAGE, hHandle: FPDF_FORMHANDLE);
+    pub fn FPDF_GetSignatureObject(
+        document: FPDF_DOCUMENT,
+        index: ::std::os::raw::c_int,
+    ) -> FPDF_SIGNATURE;
 }
 unsafe extern "C" {
-    pub fn FORM_DoDocumentJSAction(hHandle: FPDF_FORMHANDLE);
+    pub fn FPDFSignatureObj_GetContents(
+        signature: FPDF_SIGNATURE,
+        buffer: *mut ::std::os::raw::c_void,
+        length: ::std::os::raw::c_ulong,
+    ) -> ::std::os::raw::c_ulong;
 }
 unsafe extern "C" {
-    pub fn FORM_DoDocumentOpenAction(hHandle: FPDF_FORMHANDLE);
+    pub fn FPDFSignatureObj_GetByteRange(
+        signature: FPDF_SIGNATURE,
+        buffer: *mut ::std::os::raw::c_int,
+        length: ::std::os::raw::c_ulong,
+    ) -> ::std::os::raw::c_ulong;
 }
 unsafe extern "C" {
-    pub fn FORM_DoPageAAction(
-        page: FPDF_PAGE,
-        hHandle: FPDF_FORMHANDLE,
-        aaType: ::std::os::raw::c_int,
-    );
+    pub fn FPDFSignatureObj_GetSubFilter(
+        signature: FPDF_SIGNATURE,
+        buffer: *mut ::std::os::raw::c_char,
+        length: ::std::os::raw::c_ulong,
+    ) -> ::std::os::raw::c_ulong;
+}
+unsafe extern "C" {
+    pub fn FPDFSignatureObj_GetReason(
+        signature: FPDF_SIGNATURE,
+        buffer: *mut ::std::os::raw::c_void,
+        length: ::std::os::raw::c_ulong,
+    ) -> ::std::os::raw::c_ulong;
+}
+unsafe extern "C" {
+    pub fn FPDFSignatureObj_GetTime(
+        signature: FPDF_SIGNATURE,
+        buffer: *mut ::std::os::raw::c_char,
+        length: ::std::os::raw::c_ulong,
+    ) -> ::std::os::raw::c_ulong;
+}
+unsafe extern "C" {
+    pub fn FPDFSignatureObj_GetDocMDPPermission(
+        signature: FPDF_SIGNATURE,
+    ) -> ::std::os::raw::c_uint;
+}
+unsafe extern "C" {
+    pub fn FPDFPage_Flatten(page: FPDF_PAGE, nFlag: ::std::os::raw::c_int)
+        -> ::std::os::raw::c_int;
 }

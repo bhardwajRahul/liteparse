@@ -106,8 +106,24 @@ impl Library {
             return Err(PdfiumError::from_last_error());
         }
 
+        // PDFium ignores `/UserUnit`, so recover it from the raw bytes (see
+        // `crate::user_unit`) when the fork's dict-reading export isn't
+        // available. The chunked containment probe keeps the common
+        // no-UserUnit case to a single streaming pass with no whole-file
+        // allocation.
+        let page_user_units = if !Self::user_unit_api_available()
+            && crate::user_unit::file_mentions_user_unit(path)
+        {
+            std::fs::read(path)
+                .map(|bytes| Self::page_user_units(handle, &bytes))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         Ok(Document {
             handle,
+            page_user_units,
             _lib: std::marker::PhantomData,
         })
     }
@@ -139,7 +155,52 @@ impl Library {
         // For now, this is the caller's responsibility.
         Ok(Document {
             handle,
+            page_user_units: if Self::user_unit_api_available() {
+                Vec::new()
+            } else {
+                Self::page_user_units(handle, data)
+            },
             _lib: std::marker::PhantomData,
         })
+    }
+
+    /// Whether the loaded pdfium binary exports the fork's
+    /// `FPDFPage_GetUserUnit`. When it does, `Document::page` reads
+    /// `/UserUnit` through it and the byte-scan table is skipped entirely.
+    fn user_unit_api_available() -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            pdfium_sys::dynamic::pdfium().FPDFPage_GetUserUnit.is_some()
+        }
+        // Statically linked on wasm; a pinned release without the export
+        // would fail at link time, so present-at-runtime is guaranteed.
+        #[cfg(target_arch = "wasm32")]
+        {
+            true
+        }
+    }
+
+    /// Build the per-page `/UserUnit` table by matching scanned page objects
+    /// against PDFium's reported page sizes (see `crate::user_unit`).
+    fn page_user_units(handle: pdfium_sys::FPDF_DOCUMENT, data: &[u8]) -> Vec<f32> {
+        let entries = crate::user_unit::scan_user_units(data);
+        if entries.is_empty() {
+            return Vec::new();
+        }
+        let page_count = unsafe { ffi!(FPDF_GetPageCount(handle)) };
+        (0..page_count.max(0))
+            .map(|index| {
+                let mut size = pdfium_sys::FS_SIZEF {
+                    width: 0.0,
+                    height: 0.0,
+                };
+                let ok = unsafe { ffi!(FPDF_GetPageSizeByIndexF(handle, index, &mut size)) };
+                if ok != 0 {
+                    crate::user_unit::match_user_unit(&entries, size.width, size.height)
+                } else {
+                    1.0
+                }
+            })
+            .collect()
     }
 }

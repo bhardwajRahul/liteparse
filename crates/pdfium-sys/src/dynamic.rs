@@ -109,6 +109,9 @@ pub struct PdfiumBindings {
         *mut std::os::raw::c_ulong,
     ) -> FPDF_BOOL,
 
+    pub FPDF_GetPageSizeByIndexF:
+        unsafe extern "C" fn(FPDF_DOCUMENT, std::os::raw::c_int, *mut FS_SIZEF) -> FPDF_BOOL,
+
     // -- Page --
     pub FPDF_LoadPage: unsafe extern "C" fn(FPDF_DOCUMENT, std::os::raw::c_int) -> FPDF_PAGE,
     pub FPDF_ClosePage: unsafe extern "C" fn(FPDF_PAGE),
@@ -116,6 +119,11 @@ pub struct PdfiumBindings {
     pub FPDF_GetPageHeightF: unsafe extern "C" fn(FPDF_PAGE) -> f32,
     pub FPDF_GetPageBoundingBox: unsafe extern "C" fn(FPDF_PAGE, *mut FS_RECTF) -> FPDF_BOOL,
     pub FPDFPage_GetRotation: unsafe extern "C" fn(FPDF_PAGE) -> std::os::raw::c_int,
+    /// LlamaParse fork API (absent from stock pdfium and older fork
+    /// releases); callers fall back to the raw-byte `/UserUnit` scan.
+    pub FPDFPage_GetUserUnit: Option<unsafe extern "C" fn(FPDF_PAGE) -> f32>,
+    pub FPDFPage_Flatten:
+        Option<unsafe extern "C" fn(FPDF_PAGE, std::os::raw::c_int) -> std::os::raw::c_int>,
     pub FPDF_PageToDevice: unsafe extern "C" fn(
         FPDF_PAGE,
         std::os::raw::c_int,
@@ -204,6 +212,15 @@ pub struct PdfiumBindings {
         unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int) -> std::os::raw::c_uint,
     pub FPDFText_GetCharCode:
         unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int) -> std::os::raw::c_uint,
+    /// Fork API (chromium/8028+); absent in older fork builds, so optional.
+    pub FPDFText_GetCharInfoBatch: Option<
+        unsafe extern "C" fn(
+            FPDF_TEXTPAGE,
+            std::os::raw::c_int,
+            std::os::raw::c_int,
+            *mut FPDF_CHARINFO_LP,
+        ) -> std::os::raw::c_int,
+    >,
     pub FPDFText_GetFontSize: unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int) -> f64,
     pub FPDFText_GetFontWeight:
         unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int) -> std::os::raw::c_int,
@@ -394,6 +411,8 @@ pub struct PdfiumBindings {
         unsafe extern "C" fn(FPDF_ANNOTATION, FPDF_BYTESTRING) -> FPDF_ANNOTATION,
     pub FPDFAnnot_GetObjNum: unsafe extern "C" fn(FPDF_ANNOTATION) -> std::os::raw::c_int,
     pub FPDFAnnot_GetFlags: unsafe extern "C" fn(FPDF_ANNOTATION) -> std::os::raw::c_int,
+    pub FPDFAnnot_SetFlags:
+        Option<unsafe extern "C" fn(FPDF_ANNOTATION, std::os::raw::c_int) -> FPDF_BOOL>,
     pub FPDFAnnot_GetObjectCount: unsafe extern "C" fn(FPDF_ANNOTATION) -> std::os::raw::c_int,
     pub FPDFAnnot_GetObject:
         unsafe extern "C" fn(FPDF_ANNOTATION, std::os::raw::c_int) -> FPDF_PAGEOBJECT,
@@ -545,6 +564,7 @@ impl PdfiumBindings {
             FPDF_LoadMemDocument: load_fn!(lib, "FPDF_LoadMemDocument"),
             FPDF_CloseDocument: load_fn!(lib, "FPDF_CloseDocument"),
             FPDF_GetPageCount: load_fn!(lib, "FPDF_GetPageCount"),
+            FPDF_GetPageSizeByIndexF: load_fn!(lib, "FPDF_GetPageSizeByIndexF"),
             FPDF_GetFormType: load_fn!(lib, "FPDF_GetFormType"),
             FPDFDOC_InitFormFillEnvironment: load_fn!(lib, "FPDFDOC_InitFormFillEnvironment"),
             FPDFDOC_ExitFormFillEnvironment: load_fn!(lib, "FPDFDOC_ExitFormFillEnvironment"),
@@ -570,6 +590,8 @@ impl PdfiumBindings {
             FPDF_GetPageHeightF: load_fn!(lib, "FPDF_GetPageHeightF"),
             FPDF_GetPageBoundingBox: load_fn!(lib, "FPDF_GetPageBoundingBox"),
             FPDFPage_GetRotation: load_fn!(lib, "FPDFPage_GetRotation"),
+            FPDFPage_GetUserUnit: load_fn_opt!(lib, "FPDFPage_GetUserUnit"),
+            FPDFPage_Flatten: load_fn_opt!(lib, "FPDFPage_Flatten"),
             FPDF_PageToDevice: load_fn!(lib, "FPDF_PageToDevice"),
             FPDFPage_CountObjects: load_fn!(lib, "FPDFPage_CountObjects"),
             FPDFPage_GetObject: load_fn!(lib, "FPDFPage_GetObject"),
@@ -600,6 +622,7 @@ impl PdfiumBindings {
             FPDFText_CountChars: load_fn!(lib, "FPDFText_CountChars"),
             FPDFText_GetUnicode: load_fn!(lib, "FPDFText_GetUnicode"),
             FPDFText_GetCharCode: load_fn!(lib, "FPDFText_GetCharCode"),
+            FPDFText_GetCharInfoBatch: load_fn_opt!(lib, "FPDFText_GetCharInfoBatch"),
             FPDFText_GetFontSize: load_fn!(lib, "FPDFText_GetFontSize"),
             FPDFText_GetFontWeight: load_fn!(lib, "FPDFText_GetFontWeight"),
             FPDFText_GetFontInfo: load_fn!(lib, "FPDFText_GetFontInfo"),
@@ -667,6 +690,7 @@ impl PdfiumBindings {
             FPDFAnnot_GetLinkedAnnot: load_fn!(lib, "FPDFAnnot_GetLinkedAnnot"),
             FPDFAnnot_GetObjNum: load_fn!(lib, "FPDFAnnot_GetObjNum"),
             FPDFAnnot_GetFlags: load_fn!(lib, "FPDFAnnot_GetFlags"),
+            FPDFAnnot_SetFlags: load_fn_opt!(lib, "FPDFAnnot_SetFlags"),
             FPDFAnnot_GetObjectCount: load_fn!(lib, "FPDFAnnot_GetObjectCount"),
             FPDFAnnot_GetObject: load_fn!(lib, "FPDFAnnot_GetObject"),
             FPDFAnnot_GetFormFieldFlags: load_fn!(lib, "FPDFAnnot_GetFormFieldFlags"),

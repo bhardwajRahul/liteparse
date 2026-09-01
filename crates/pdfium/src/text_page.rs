@@ -46,6 +46,46 @@ impl<'page, 'lib: 'page> TextPage<'page, 'lib> {
         }
     }
 
+    /// Fill `buf` with per-character records starting at `start` using the
+    /// fork's `FPDFText_GetCharInfoBatch` (chromium/8028+), replacing several
+    /// FFI round-trips per character with one per chunk. Returns the number
+    /// of records written (0 at end of range), or `None` when the loaded
+    /// pdfium build predates the batch API — callers must fall back to the
+    /// per-character getters.
+    ///
+    /// Record fields mirror the single-char getters exactly: raw page-space
+    /// boxes, `char_type` as the raw `CPDF_TextPage::CharType` value
+    /// (1 = generated, 2 = no-unicode-mapping), and `text_render_mode` of the
+    /// char's text object (-1 when it has none).
+    pub fn char_infos_batch(
+        &self,
+        start: i32,
+        buf: &mut [pdfium_sys::FPDF_CHARINFO_LP],
+    ) -> Option<usize> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let written = {
+            let batch_fn = pdfium_sys::dynamic::pdfium().FPDFText_GetCharInfoBatch?;
+            if buf.is_empty() {
+                return Some(0);
+            }
+            unsafe { batch_fn(self.handle, start, buf.len() as i32, buf.as_mut_ptr()) }
+        };
+        #[cfg(target_arch = "wasm32")]
+        if buf.is_empty() {
+            return Some(0);
+        }
+        #[cfg(target_arch = "wasm32")]
+        let written = unsafe {
+            pdfium_sys::FPDFText_GetCharInfoBatch(
+                self.handle,
+                start,
+                buf.len() as i32,
+                buf.as_mut_ptr(),
+            )
+        };
+        Some(written.max(0) as usize)
+    }
+
     /// Count rectangular areas occupied by a text segment.
     /// Must be called before `rect()`.
     pub fn count_rects(&self, start: i32, count: i32) -> i32 {

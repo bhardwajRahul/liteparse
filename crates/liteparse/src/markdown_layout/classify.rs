@@ -1,6 +1,6 @@
-use crate::types::{OutlineTarget, ParsedPage, ProjectedLine};
+use crate::types::{OutlineTarget, ParsedPage, ProjectedLine, Rect};
 
-use super::blocks::{Block, paragraph_from_accum};
+use super::blocks::{Block, PositionedBlock, paragraph_from_accum};
 use super::headings::{
     HEADING_MAX_TEXT_CHARS, MAX_HEADING_LEVELS, heading_level_for, heading_size_of,
     is_caption_line, is_toc_title, looks_like_bold_heading, looks_like_numbered_bold_heading,
@@ -28,12 +28,13 @@ use super::tables::{detect_ruled_tables, detect_tables_banded, merge_table_runs}
 /// other.
 #[derive(Clone)]
 enum Interruption {
-    Hr,
+    /// A divider rule, carrying the region of the stroke that produced it.
+    Hr(crate::types::Rect),
     Figure(crate::types::ImageRef),
     /// A ruled table detected by the global pass, already fully built. Emitted
     /// at its top-y position like other interruptions; its lines were pulled
     /// out of the region pipeline so it won't be re-detected per-region.
-    Table(super::blocks::Block),
+    Table(super::blocks::PositionedBlock),
 }
 
 /// Returns true if any span on the line is rotated more than ~5° off
@@ -51,7 +52,7 @@ pub(super) fn is_rotated_line(line: &ProjectedLine) -> bool {
 
 /// Classify a single page's `ProjectedLine`s into blocks.
 #[cfg(test)]
-pub(super) fn classify_page(page: &ParsedPage, heading_map: &[(f32, u8)]) -> Vec<Block> {
+pub(super) fn classify_page(page: &ParsedPage, heading_map: &[(f32, u8)]) -> Vec<PositionedBlock> {
     classify_page_with_filters(
         page,
         heading_map,
@@ -77,7 +78,7 @@ pub fn classify_page_with_filters(
     outline: &[OutlineTarget],
     image_mode: crate::config::ImageMode,
     chrome_indices: &std::collections::HashSet<usize>,
-) -> Vec<Block> {
+) -> Vec<PositionedBlock> {
     let debug = *super::flags::DEBUG_MD;
 
     // TOC suppression: when ≥3 lines on this page look like TOC entries
@@ -163,7 +164,7 @@ pub fn classify_page_with_filters(
     // Rule segments are extracted from the page graphics once and shared by
     // every table-detection pass below (global, per-region, leaf veto, bands).
     let rule_segments = super::tables::extract_rule_segments(&page.graphics);
-    let mut global_ruled_tables: Vec<(f32, Block)> = Vec::new();
+    let mut global_ruled_tables: Vec<(f32, PositionedBlock)> = Vec::new();
     let mut global_ruled_consumed: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
     for (run, consumed) in super::tables::detect_ruled_tables_global(
@@ -233,7 +234,7 @@ pub fn classify_page_with_filters(
             .iter()
             .map(|&i| lines[i].bbox.y)
             .fold(f32::INFINITY, f32::min);
-        global_ruled_tables.push((top_y, run.block));
+        global_ruled_tables.push((top_y, PositionedBlock::new(run.block, run.bbox)));
         global_ruled_consumed.extend(consumed);
     }
     let global_ruled_owned: Option<Vec<ProjectedLine>> = if global_ruled_consumed.is_empty() {
@@ -308,7 +309,7 @@ pub fn classify_page_with_filters(
     // that no leaf covers) are emitted between regions in y order.
     let mut all_interruptions: Vec<(f32, Interruption)> = detect_horizontal_rules(page)
         .into_iter()
-        .map(|y| (y, Interruption::Hr))
+        .map(|r| (r.y, Interruption::Hr(r)))
         .collect();
     if !matches!(image_mode, crate::config::ImageMode::Off) {
         for r in &page.image_refs {
@@ -327,17 +328,10 @@ pub fn classify_page_with_filters(
     // governs intra-region merging — no second source of truth.
     let mut region_boundaries: Vec<usize> = Vec::new();
     let mut interrupt_cursor = 0usize;
-    let mut blocks: Vec<Block> = Vec::new();
+    let mut blocks: Vec<PositionedBlock> = Vec::new();
 
-    let push_interruption = |blocks: &mut Vec<Block>, kind: Interruption| {
-        blocks.push(match kind {
-            Interruption::Hr => Block::HorizontalRule,
-            Interruption::Figure(r) => Block::Figure {
-                id: r.id,
-                format: r.format,
-            },
-            Interruption::Table(b) => b,
-        });
+    let push_interruption = |blocks: &mut Vec<PositionedBlock>, kind: Interruption| {
+        blocks.push(positioned_interruption(kind));
     };
 
     for (rstart, rend) in region_ranges {
@@ -406,6 +400,23 @@ pub fn classify_page_with_filters(
     stitch_regions(blocks, &region_boundaries)
 }
 
+/// Turn an interruption into a positioned block. Both the page-level walker
+/// and `FlowState::emit_before` funnel through here so the two emission paths
+/// stay identical.
+fn positioned_interruption(kind: Interruption) -> PositionedBlock {
+    match kind {
+        Interruption::Hr(rect) => PositionedBlock::new(Block::HorizontalRule, Some(rect)),
+        Interruption::Figure(r) => PositionedBlock::new(
+            Block::Figure {
+                id: r.id,
+                format: r.format,
+            },
+            Some(r.bbox),
+        ),
+        Interruption::Table(b) => b,
+    }
+}
+
 /// Mutable per-line flow state threaded through `classify_region`: the active
 /// paragraph accumulator, the active code run, and the current list run. The
 /// flush/reset/emit methods live here so list-state resets collapse to method
@@ -414,7 +425,7 @@ pub fn classify_page_with_filters(
 #[derive(Default)]
 struct FlowState {
     paragraph: Option<ParaAccum>,
-    code: Option<Vec<String>>,
+    code: Option<(Vec<String>, Option<Rect>)>,
     list_base_indent: Option<f32>,
     last_list_item_idx: Option<usize>,
     last_list_line: Option<usize>,
@@ -430,21 +441,22 @@ impl FlowState {
     }
 
     /// Emit the active paragraph (if it has non-blank content) and clear it.
-    fn flush_paragraph(&mut self, blocks: &mut Vec<Block>) {
+    fn flush_paragraph(&mut self, blocks: &mut Vec<PositionedBlock>) {
         if let Some(acc) = self.paragraph.take()
             && !acc.raw.trim().is_empty()
         {
-            blocks.push(paragraph_from_accum(acc));
+            let bbox = acc.bbox.clone();
+            blocks.push(PositionedBlock::new(paragraph_from_accum(acc), bbox));
         }
     }
 
     /// Emit the active code run (if non-empty) and clear it.
-    fn flush_code(&mut self, blocks: &mut Vec<Block>) {
-        if let Some(lines) = self.code.take()
+    fn flush_code(&mut self, blocks: &mut Vec<PositionedBlock>) {
+        if let Some((lines, bbox)) = self.code.take()
             && !lines.is_empty()
         {
             let lang = detect_code_language(&lines);
-            blocks.push(Block::CodeBlock { lines, lang });
+            blocks.push(PositionedBlock::new(Block::CodeBlock { lines, lang }, bbox));
         }
     }
 
@@ -452,7 +464,7 @@ impl FlowState {
     /// active paragraph/code/list state first so each lands as its own block.
     fn emit_before(
         &mut self,
-        blocks: &mut Vec<Block>,
+        blocks: &mut Vec<PositionedBlock>,
         iter: &mut std::iter::Peekable<std::vec::IntoIter<(f32, Interruption)>>,
         before_y: f32,
     ) {
@@ -464,14 +476,7 @@ impl FlowState {
             self.flush_paragraph(blocks);
             self.flush_code(blocks);
             self.reset_list();
-            blocks.push(match kind {
-                Interruption::Hr => Block::HorizontalRule,
-                Interruption::Figure(r) => Block::Figure {
-                    id: r.id,
-                    format: r.format,
-                },
-                Interruption::Table(b) => b,
-            });
+            blocks.push(positioned_interruption(kind));
         }
     }
 }
@@ -493,8 +498,8 @@ fn classify_region(
     toc_page: bool,
     debug: bool,
     precomputed_tables: Option<Vec<super::tables::TableRun>>,
-) -> Vec<Block> {
-    let mut blocks: Vec<Block> = Vec::new();
+) -> Vec<PositionedBlock> {
+    let mut blocks: Vec<PositionedBlock> = Vec::new();
     let mut state = FlowState::default();
     let mut heading_run: Option<(u8, usize)> = None;
     // Track whether we've already emitted a TOC title on this page. Once seen,
@@ -563,7 +568,7 @@ fn classify_region(
             state.flush_code(&mut blocks);
             state.reset_list();
             let run = table_iter.next().unwrap();
-            blocks.push(run.block);
+            blocks.push(PositionedBlock::new(run.block, run.bbox));
             idx = run.end;
             continue;
         }
@@ -601,10 +606,9 @@ fn classify_region(
         if line.all_mono {
             state.flush_paragraph(&mut blocks);
             state.reset_list();
-            state
-                .code
-                .get_or_insert_with(Vec::new)
-                .push(line.text.trim_end().to_string());
+            let code = state.code.get_or_insert_with(Default::default);
+            code.0.push(line.text.trim_end().to_string());
+            Rect::extend(&mut code.1, &line.bbox);
             continue;
         }
         // Any non-mono line ends the current code block (if any).
@@ -618,7 +622,10 @@ fn classify_region(
             state.reset_list();
             heading_run = None;
             if is_rule {
-                blocks.push(Block::HorizontalRule);
+                blocks.push(PositionedBlock::new(
+                    Block::HorizontalRule,
+                    Some(line.bbox.clone()),
+                ));
             }
             if debug {
                 eprintln!(
@@ -750,12 +757,19 @@ fn classify_region(
             && cont_looks_like_heading
             && let Some((run_level, run_idx)) = heading_run.as_ref()
             && continues_heading(&lines[*run_idx], line)
-            && let Some(Block::Heading {
-                level: last_level,
-                text: htext,
+            && let Some(PositionedBlock {
+                block:
+                    Block::Heading {
+                        level: last_level,
+                        text: htext,
+                    },
+                bbox: heading_bbox,
+                ..
             }) = blocks.last_mut()
             && *last_level == *run_level
         {
+            // The continuation line is part of the same heading.
+            Rect::extend(heading_bbox, &line.bbox);
             let combined_chars = htext.chars().count() + 1 + text.chars().count();
             if combined_chars <= HEADING_MAX_TEXT_CHARS {
                 let run_level = *run_level;
@@ -784,9 +798,13 @@ fn classify_region(
             if let Some((run_level, run_idx)) = heading_run.as_ref()
                 && *run_level == level
                 && continues_heading(&lines[*run_idx], line)
-                && let Some(Block::Heading {
-                    level: last_level,
-                    text: htext,
+                && let Some(PositionedBlock {
+                    block:
+                        Block::Heading {
+                            level: last_level,
+                            text: htext,
+                        },
+                    ..
                 }) = blocks.last_mut()
                 && *last_level == level
             {
@@ -808,6 +826,7 @@ fn classify_region(
                         inline: demoted,
                         last: lines[*run_idx].clone(),
                         uniform: None,
+                        bbox: Some(lines[*run_idx].bbox.clone()),
                     });
                     heading_run = None;
                     demoted_heading = true;
@@ -829,10 +848,13 @@ fn classify_region(
                         line.dominant_font_size,
                     );
                 }
-                blocks.push(Block::Heading {
-                    level,
-                    text: collapse_whitespace(text),
-                });
+                blocks.push(PositionedBlock::new(
+                    Block::Heading {
+                        level,
+                        text: collapse_whitespace(text),
+                    },
+                    Some(line.bbox.clone()),
+                ));
                 heading_run = Some((level, line_idx));
                 continue;
             }
@@ -874,10 +896,13 @@ fn classify_region(
                 state.flush_paragraph(&mut blocks);
                 state.reset_list();
                 let level = (heading_map.len() as u8 + 1).clamp(1, MAX_HEADING_LEVELS as u8);
-                blocks.push(Block::Heading {
-                    level,
-                    text: collapse_whitespace(text),
-                });
+                blocks.push(PositionedBlock::new(
+                    Block::Heading {
+                        level,
+                        text: collapse_whitespace(text),
+                    },
+                    Some(line.bbox.clone()),
+                ));
                 continue;
             }
             state.flush_paragraph(&mut blocks);
@@ -893,14 +918,17 @@ fn classify_region(
             // which still contain the marker span — render the line and then
             // peel the marker off the front of the rendered string.
             let item_text = render_list_item_text(line, &marker, rest);
-            blocks.push(Block::ListItem {
-                ordered,
-                marker,
-                level,
-                text: item_text,
-                bold: false,
-                italic: false,
-            });
+            blocks.push(PositionedBlock::new(
+                Block::ListItem {
+                    ordered,
+                    marker,
+                    level,
+                    text: item_text,
+                    bold: false,
+                    italic: false,
+                },
+                Some(line.bbox.clone()),
+            ));
             continue;
         }
 
@@ -911,14 +939,17 @@ fn classify_region(
         if let Some(item_idx) = state.last_list_item_idx
             && let Some(prev_idx) = state.last_list_line
             && continues_list_item(&lines[prev_idx], line)
-            && let Some(Block::ListItem {
+            && let Some(item) = blocks.get_mut(item_idx)
+            && let Block::ListItem {
                 text: prev_text, ..
-            }) = blocks.get_mut(item_idx)
+            } = &mut item.block
         {
             // De-hyphenate against the prior rendered text, then append the
             // inline-styled continuation.
             let cont_inline = render_line_inline(line);
             append_inline_continuation(prev_text, text, &cont_inline);
+            // The wrapped line belongs to the same item, so it grows its box.
+            Rect::extend(&mut item.bbox, &line.bbox);
             state.last_list_line = Some(line_idx);
             continue;
         }
@@ -950,10 +981,13 @@ fn classify_region(
                     line.dominant_font_size,
                 );
             }
-            blocks.push(Block::Heading {
-                level,
-                text: collapse_whitespace(text),
-            });
+            blocks.push(PositionedBlock::new(
+                Block::Heading {
+                    level,
+                    text: collapse_whitespace(text),
+                },
+                Some(line.bbox.clone()),
+            ));
             // Arm the heading_run so a wrapped continuation on the next line
             // merges into this heading instead of emitting as a second one.
             heading_run = Some((level, line_idx));
@@ -978,6 +1012,7 @@ fn classify_region(
                 state.paragraph = Some(ParaAccum {
                     raw,
                     inline,
+                    bbox: Some(line.bbox.clone()),
                     last: line.clone(),
                     uniform,
                 });
@@ -1112,13 +1147,13 @@ fn detect_code_language(lines: &[String]) -> Option<String> {
 /// A bullet point split across columns is rare and a false merge is worse
 /// than a true split; a table split across leaves indicates a projection-side
 /// issue better fixed there than papered over here.
-fn stitch_regions(blocks: Vec<Block>, region_starts: &[usize]) -> Vec<Block> {
+fn stitch_regions(blocks: Vec<PositionedBlock>, region_starts: &[usize]) -> Vec<PositionedBlock> {
     if region_starts.len() <= 1 {
         return blocks;
     }
     let boundary_set: std::collections::HashSet<usize> =
         region_starts.iter().skip(1).copied().collect();
-    let mut out: Vec<Block> = Vec::with_capacity(blocks.len());
+    let mut out: Vec<PositionedBlock> = Vec::with_capacity(blocks.len());
     for (i, block) in blocks.into_iter().enumerate() {
         if boundary_set.contains(&i)
             && let Some(prev) = out.last_mut()
@@ -1131,8 +1166,15 @@ fn stitch_regions(blocks: Vec<Block>, region_starts: &[usize]) -> Vec<Block> {
                     bold: false,
                     italic: false,
                 },
-            ) = (prev, &block)
+            ) = (&mut prev.block, &block.block)
         {
+            // Either merge below fuses the two blocks, so the survivor covers
+            // both leaves. Computed up front because `prev_text` borrows
+            // `prev` for the rest of the arm.
+            let merged_bbox = match (&prev.bbox, &block.bbox) {
+                (Some(a), Some(b)) => Some(a.union(b)),
+                (some, None) | (None, some) => some.clone(),
+            };
             let prev_trim = prev_text.trim_end();
             let starts_lower = cur_text
                 .trim_start()
@@ -1149,6 +1191,7 @@ fn stitch_regions(blocks: Vec<Block>, region_starts: &[usize]) -> Vec<Block> {
                 }
                 prev_text.pop(); // the '-'
                 prev_text.push_str(cur_text.trim_start());
+                prev.bbox = merged_bbox;
                 continue;
             }
             let ends_open = !prev_trim.ends_with(|c: char| {
@@ -1160,6 +1203,7 @@ fn stitch_regions(blocks: Vec<Block>, region_starts: &[usize]) -> Vec<Block> {
             if ends_open && starts_lower {
                 prev_text.push(' ');
                 prev_text.push_str(cur_text.trim_start());
+                prev.bbox = merged_bbox;
                 continue;
             }
         }
@@ -1180,6 +1224,53 @@ mod tests {
     use crate::types::TextItem;
 
     #[test]
+    fn blocks_report_the_region_they_were_read_from() {
+        // Same shape as the heading/paragraph case below: an 18pt title, a
+        // two-line paragraph, then a separate paragraph further down.
+        let p = page(vec![
+            line("Title of the document goes here", 50.0, 50.0, 18.0, 18.0),
+            line("First sentence of the para-", 50.0, 80.0, 10.0, 10.0),
+            line("graph continues here.", 50.0, 92.0, 10.0, 10.0),
+            line("Another paragraph.", 50.0, 130.0, 10.0, 10.0),
+        ]);
+        let pages = vec![p];
+        let body = compute_body_size(&pages);
+        let map = build_heading_map(&pages, body);
+        let blocks = classify_page(&pages[0], &map);
+
+        let bbox = |i: usize| blocks[i].bbox.clone().expect("block should be located");
+        // The heading is one line: its own band.
+        let h = bbox(0);
+        assert_eq!((h.y, h.height), (50.0, 18.0));
+        // The paragraph wraps two lines, so it spans from the top of the first
+        // to the bottom of the second (80.0 → 92.0 + 10.0), not just one line.
+        let para = bbox(1);
+        assert_eq!((para.y, para.height), (80.0, 22.0));
+        // The following paragraph keeps its own band rather than inheriting it.
+        let next = bbox(2);
+        assert_eq!((next.y, next.height), (130.0, 10.0));
+    }
+
+    #[test]
+    fn horizontal_rule_reports_the_stroke_it_came_from() {
+        let lines = vec![
+            line("before the rule", 50.0, 100.0, 10.0, 10.0),
+            line("after the rule", 50.0, 300.0, 10.0, 10.0),
+        ];
+        let p = page_with_graphics(lines, vec![stroke(50.0, 200.0, 450.0, 200.0, 0.5)]);
+        let blocks = classify_page(&p, &[]);
+        let hr = blocks
+            .iter()
+            .find(|b| matches!(b.block, Block::HorizontalRule))
+            .expect("expected an HR block");
+        // The rule carries the drawn stroke's x-extent, not just its y.
+        let r = hr.bbox.clone().expect("HR should be located");
+        assert_eq!(r.y, 200.0);
+        assert_eq!(r.x, 50.0);
+        assert_eq!(r.width, 400.0);
+    }
+
+    #[test]
     fn classify_emits_heading_and_paragraph() {
         let p = page(vec![
             line("Title of the document goes here", 50.0, 50.0, 18.0, 18.0),
@@ -1192,21 +1283,21 @@ mod tests {
         let map = build_heading_map(&pages, body);
         let blocks = classify_page(&pages[0], &map);
         assert_eq!(blocks.len(), 3);
-        match &blocks[0] {
+        match &blocks[0].block {
             Block::Heading { level, text } => {
                 assert_eq!(*level, 1);
                 assert_eq!(text, "Title of the document goes here");
             }
             other => panic!("expected heading, got {other:?}"),
         }
-        match &blocks[1] {
+        match &blocks[1].block {
             Block::Paragraph { text: t, .. } => {
                 assert!(t.contains("paragraph continues"), "got: {t}");
                 assert!(!t.contains("para-"), "de-hyphenation failed: {t}");
             }
             other => panic!("expected paragraph, got {other:?}"),
         }
-        match &blocks[2] {
+        match &blocks[2].block {
             Block::Paragraph { text: t, .. } => assert_eq!(t, "Another paragraph."),
             other => panic!("expected paragraph, got {other:?}"),
         }
@@ -1240,6 +1331,7 @@ mod tests {
         let blocks = classify_page(&pages[0], &map);
         let list_items: Vec<&Block> = blocks
             .iter()
+            .map(|b| &b.block)
             .filter(|b| matches!(b, Block::ListItem { .. }))
             .collect();
         assert_eq!(list_items.len(), 4);
@@ -1271,7 +1363,7 @@ mod tests {
         let blocks = classify_page(&pages[0], &map);
         // Expect: Paragraph("Intro line."), CodeBlock(2 lines), Paragraph("After...")
         assert_eq!(blocks.len(), 3);
-        match &blocks[1] {
+        match &blocks[1].block {
             Block::CodeBlock { lines, .. } => {
                 assert_eq!(lines.len(), 2);
                 assert!(lines[0].contains("let x = 1;"));
@@ -1338,7 +1430,7 @@ mod tests {
         let map = build_heading_map(&pages, body);
         let blocks = classify_page(&pages[0], &map);
         assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
+        match &blocks[0].block {
             Block::Paragraph { bold, italic, .. } => {
                 assert!(*bold);
                 assert!(!*italic);
@@ -1371,7 +1463,7 @@ mod tests {
         let map = build_heading_map(&pages, body);
         let blocks = classify_page(&pages[0], &map);
         assert_eq!(blocks.len(), 1, "got: {blocks:?}");
-        match &blocks[0] {
+        match &blocks[0].block {
             Block::Table { header, rows } => {
                 // Header isn't bold so no header row promoted.
                 assert!(header.is_none());
@@ -1426,7 +1518,7 @@ mod tests {
         let map = build_heading_map(&pages, body);
         let blocks = classify_page(&pages[0], &map);
         assert_eq!(blocks.len(), 1, "got: {blocks:?}");
-        match &blocks[0] {
+        match &blocks[0].block {
             Block::Paragraph { text, bold, italic } => {
                 assert!(!*bold, "mixed-style paragraph shouldn't set block bold");
                 assert!(!*italic);
@@ -1454,7 +1546,7 @@ mod tests {
         let map = build_heading_map(&pages, body);
         let blocks = classify_page(&pages[0], &map);
         assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
+        match &blocks[0].block {
             Block::ListItem { text, .. } => {
                 assert_eq!(text, "**important item**");
             }
@@ -1473,7 +1565,7 @@ mod tests {
         let blocks = classify_page(&p, &[]);
         let has_hr = blocks
             .iter()
-            .position(|b| matches!(b, Block::HorizontalRule));
+            .position(|b| matches!(b.block, Block::HorizontalRule));
         assert!(has_hr.is_some(), "expected an HR block, got {blocks:?}");
         // HR must land between the two paragraphs, not before/after both.
         let pos = has_hr.unwrap();

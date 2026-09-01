@@ -49,6 +49,15 @@ pub struct LiteParseConfig {
     tessdata_path: Option<String>,
     max_pages: Option<usize>,
     target_pages: Option<String>,
+    /// Skip page-level PDF extraction failures and report them in
+    /// `ParseResult.pageErrors`. Document-level failures remain fatal.
+    continue_on_page_error: Option<bool>,
+    /// Render parsed pages to PNG and return them in
+    /// `ParseResult.screenshots`. Default false; PNG payloads can be large.
+    extract_screenshots: Option<bool>,
+    /// Scan rendered screenshots for solid rectangles/lines and attach
+    /// them to each screenshot result. Default false.
+    detect_screenshot_rects: Option<bool>,
     dpi: Option<f32>,
     #[tsify(type = "\"json\" | \"text\" | \"markdown\" | \"md\"")]
     output_format: Option<String>,
@@ -97,6 +106,9 @@ pub struct LiteParseConfig {
     /// Draw AcroForm field appearances into OCR rasters (runs document
     /// open/JS actions). Default false.
     render_form_fields: Option<bool>,
+    /// Attach the markdown classifier's block decomposition to each page as
+    /// `ParsedPage.blocks`. Default false.
+    extract_blocks: Option<bool>,
 }
 
 /// A page sub-region as the fraction cropped from each side (top-left origin,
@@ -134,6 +146,15 @@ impl LiteParseConfig {
         }
         if self.target_pages.is_some() {
             cfg.target_pages = self.target_pages;
+        }
+        if let Some(v) = self.continue_on_page_error {
+            cfg.continue_on_page_error = v;
+        }
+        if let Some(v) = self.extract_screenshots {
+            cfg.extract_screenshots = v;
+        }
+        if let Some(v) = self.detect_screenshot_rects {
+            cfg.detect_screenshot_rects = v;
         }
         if let Some(v) = self.dpi {
             cfg.dpi = v;
@@ -226,6 +247,9 @@ impl LiteParseConfig {
         if let Some(v) = self.render_form_fields {
             cfg.render_form_fields = v;
         }
+        if let Some(v) = self.extract_blocks {
+            cfg.extract_blocks = v;
+        }
         cfg.num_workers = 1;
         Ok(cfg)
     }
@@ -243,6 +267,9 @@ impl LiteParseConfig {
             tessdata_path: cfg.tessdata_path.clone(),
             max_pages: Some(cfg.max_pages),
             target_pages: cfg.target_pages.clone(),
+            continue_on_page_error: Some(cfg.continue_on_page_error),
+            extract_screenshots: Some(cfg.extract_screenshots),
+            detect_screenshot_rects: Some(cfg.detect_screenshot_rects),
             dpi: Some(cfg.dpi),
             output_format: Some(match cfg.output_format {
                 OutputFormat::Json => "json".into(),
@@ -280,6 +307,7 @@ impl LiteParseConfig {
             extract_vector_graphics: Some(cfg.extract_vector_graphics),
             extract_text_metadata: Some(cfg.extract_text_metadata),
             render_form_fields: Some(cfg.render_form_fields),
+            extract_blocks: Some(cfg.extract_blocks),
         }
     }
 }
@@ -369,6 +397,10 @@ pub struct ParsedPage {
     pub form_fields: Option<Vec<FormField>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structure_tree: Option<StructureTree>,
+    /// Classified layout blocks in reading order; present only when
+    /// `extractBlocks` is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocks: Option<Vec<LayoutBlock>>,
 }
 
 #[derive(Serialize, Tsify)]
@@ -463,6 +495,122 @@ impl DocumentAnnotation {
             rect: annotation.rect.as_ref().map(to_rect),
             quadpoint_rects: annotation.quadpoint_rects.iter().map(to_rect).collect(),
             uri: annotation.uri.clone(),
+        }
+    }
+}
+
+/// One table cell: its rendered text and the region it occupied.
+///
+/// `bbox` is absent for cells with no ink behind them — padding inserted to
+/// square off a ragged grid, or halves of a merged run split at an estimated
+/// position.
+#[derive(Serialize, Tsify)]
+#[tsify(into_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct LayoutCell {
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<AnnotationRect>,
+}
+
+/// A classified block plus where it sits on the page.
+///
+/// `kind` discriminates the block and every field that doesn't apply to that
+/// kind is omitted, so a heading serializes as `{kind, text, level, bbox}`.
+/// Blocks appear in reading order, matching the page's markdown.
+#[derive(Serialize, Tsify)]
+#[tsify(into_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct LayoutBlock {
+    /// One of `heading`, `paragraph`, `list_item`, `code`, `table`,
+    /// `grid_fallback`, `rule`, `figure`.
+    pub kind: String,
+    /// Rendered text for the text-bearing kinds (`heading`, `paragraph`,
+    /// `list_item`). Table text lives in `header`/`rows`; code and grid text
+    /// in `lines`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Heading level (1–6), or list nesting depth for `list_item`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<u8>,
+    /// Whether the block's text is uniformly bold / italic. `paragraph` and
+    /// `list_item` only; omitted when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub bold: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub italic: bool,
+    /// `list_item`: whether the list is ordered, and the original marker as it
+    /// appeared on the page (`138.`, `iii)`, `•`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ordered: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marker: Option<String>,
+    /// Verbatim source lines for `code` and `grid_fallback`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines: Option<Vec<String>>,
+    /// Best-effort language hint for `code`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    /// `table`: the header row, when one was detected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header: Option<Vec<LayoutCell>>,
+    /// `table`: the body rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<Vec<Vec<LayoutCell>>>,
+    /// `figure`: the image's page-scoped id and encoded format, matching the
+    /// `img_{id}.{format}` target the markdown renderer emits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Region of the page this block occupies, in the same top-left, 72-DPI
+    /// viewport space as `textItems`. Absent when the block has no page
+    /// geometry behind it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<AnnotationRect>,
+}
+
+fn to_annotation_rect(rect: &liteparse::types::Rect) -> AnnotationRect {
+    AnnotationRect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    }
+}
+
+impl LayoutCell {
+    fn from_rust(cell: &liteparse::layout::LayoutCell) -> Self {
+        Self {
+            text: cell.text.clone(),
+            bbox: cell.bbox.as_ref().map(to_annotation_rect),
+        }
+    }
+}
+
+impl LayoutBlock {
+    fn from_rust(block: &liteparse::layout::LayoutBlock) -> Self {
+        let cells = |row: &Vec<liteparse::layout::LayoutCell>| {
+            row.iter().map(LayoutCell::from_rust).collect::<Vec<_>>()
+        };
+        Self {
+            kind: block.kind.to_string(),
+            text: block.text.clone(),
+            level: block.level,
+            bold: block.bold,
+            italic: block.italic,
+            ordered: block.ordered,
+            marker: block.marker.clone(),
+            lines: block.lines.clone(),
+            lang: block.lang.clone(),
+            header: block.header.as_ref().map(&cells),
+            rows: block
+                .rows
+                .as_ref()
+                .map(|rows| rows.iter().map(&cells).collect()),
+            id: block.id.clone(),
+            format: block.format.clone(),
+            bbox: block.bbox.as_ref().map(to_annotation_rect),
         }
     }
 }
@@ -614,10 +762,16 @@ impl StructureTreeElement {
 #[tsify(into_wasm_abi)]
 #[serde(rename_all = "camelCase")]
 pub struct ParseResult {
+    /// Total source-document pages before target/max-page filtering.
+    pub total_pages: u32,
     pub pages: Vec<ParsedPage>,
     pub text: String,
     pub images: Vec<ExtractedImage>,
+    /// Page screenshots encoded as PNG. Empty unless `extractScreenshots`
+    /// is enabled.
+    pub screenshots: Vec<ScreenshotResult>,
     pub image_error_count: u32,
+    pub page_errors: Vec<PageError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub form_type: Option<i32>,
     /// The document's `/Info` `Creator` entry, when present.
@@ -633,6 +787,46 @@ pub struct ParseResult {
     /// Raw XFA packets; present only when `extractXfaPackets` is enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub xfa_packets: Option<Vec<XfaPacket>>,
+}
+
+#[derive(Serialize, Tsify)]
+#[tsify(into_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct PageError {
+    pub page_num: u32,
+    pub message: String,
+}
+
+/// One page rendered to PNG, plus raster-derived signals.
+#[derive(Serialize, Tsify)]
+#[tsify(into_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenshotResult {
+    pub page_num: u32,
+    pub width: u32,
+    pub height: u32,
+    /// PNG-encoded image bytes.
+    pub image_bytes: Vec<u8>,
+    /// True when every pixel has the same color (blank page after render).
+    pub is_solid_fill: bool,
+    /// Solid rectangles/lines detected in the raster (viewport coords).
+    /// Empty unless `detectScreenshotRects` is enabled.
+    pub rects: Vec<ScreenshotRect>,
+}
+
+/// A solid rectangle or line detected in a rendered page.
+#[derive(Serialize, Tsify)]
+#[tsify(into_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenshotRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    /// Fill color as ARGB hex string (e.g. "ff1a2b3c").
+    pub color: String,
+    /// True when the rect is thin enough to be a rule/divider line.
+    pub is_line: bool,
 }
 
 #[derive(Serialize, Tsify)]
@@ -740,7 +934,8 @@ pub struct ImageRect {
 // ---------------------------------------------------------------------------
 
 /// Wraps a JS object that exposes an async `recognize(imageData, width, height, language)`
-/// method, returning `Promise<Array<{text, bbox, confidence}>>`.
+/// method, returning `Promise<Array<{text, bbox, confidence}>>`. `imageData`
+/// is PNG-encoded (the documented contract), not the raw pixel buffer.
 ///
 /// `JsValue` is `!Send`, but on `wasm32` (single-threaded) the trait does not
 /// require `Send + Sync`, so this works.
@@ -776,13 +971,18 @@ impl OcrEngine for JsOcrEngine {
                 > + '_,
         >,
     > {
-        // Copy bytes into a JS Uint8Array up-front (must happen on the
-        // current thread anyway in wasm).
-        let arr = Uint8Array::new_with_length(image_data.len() as u32);
-        arr.copy_from(image_data);
+        // The documented JS contract is PNG bytes (packages/wasm/README.md):
+        // browser OCR libraries (tesseract.js, remote services) consume
+        // encoded images, not raw pixel buffers. `image_data` is the render
+        // pipeline's tightly-packed grayscale or RGB buffer.
+        let png = liteparse::extract::encode_pixels_png(image_data, width, height)
+            .map_err(|e| format!("failed to PNG-encode page for ocrEngine.recognize: {e}"));
         let language = options.language.clone();
 
         Box::pin(async move {
+            let png = png?;
+            let arr = Uint8Array::new_with_length(png.len() as u32);
+            arr.copy_from(&png);
             let recognize: JsValue = Reflect::get(&self.obj, &JsValue::from_str("recognize"))
                 .map_err(|e| format!("ocrEngine.recognize lookup failed: {:?}", e))?;
             let recognize: Function = recognize
@@ -843,6 +1043,7 @@ pub struct OcrResult {
 #[wasm_bindgen(typescript_custom_section)]
 const TS_EXTRA: &'static str = r#"
 export interface OcrEngine {
+  /** `imageData` is a PNG-encoded render of the page, `width`/`height` its pixel dimensions. */
   recognize(imageData: Uint8Array, width: number, height: number, language: string): Promise<OcrResult[]>;
 }
 
@@ -909,167 +1110,218 @@ impl LiteParse {
             .await
             .map_err(|e| JsError::new(&format!("parse failed: {}", e)))?;
 
-        let extract_text_metadata = self.inner.config().extract_text_metadata;
-        let pages: Vec<ParsedPage> = result
-            .pages
-            .iter()
-            .map(|p| ParsedPage {
-                page_num: p.page_number,
-                width: p.page_width,
-                height: p.page_height,
-                content_bounds: p.content_bounds.as_ref().map(|b| VectorRect {
-                    x: b.x,
-                    y: b.y,
-                    width: b.width,
-                    height: b.height,
-                }),
-                text: p.text.clone(),
-                markdown: p.markdown.clone(),
-                text_items: p
-                    .text_items
+        Ok(to_js_result(
+            &result,
+            self.inner.config().extract_text_metadata,
+        ))
+    }
+}
+
+/// Convert a core [`CoreParseResult`] into the wasm-bindgen view.
+///
+/// Shared by `parse()` and `ParseSession::nextBatch()` so a batch is mapped
+/// exactly the same way a whole-document result is.
+fn to_js_result(result: &liteparse::ParseResult, extract_text_metadata: bool) -> ParseResult {
+    let pages: Vec<ParsedPage> = result
+        .pages
+        .iter()
+        .map(|p| ParsedPage {
+            page_num: p.page_number,
+            width: p.page_width,
+            height: p.page_height,
+            content_bounds: p.content_bounds.as_ref().map(|b| VectorRect {
+                x: b.x,
+                y: b.y,
+                width: b.width,
+                height: b.height,
+            }),
+            text: p.text.clone(),
+            markdown: p.markdown.clone(),
+            text_items: p
+                .text_items
+                .iter()
+                .map(|i| {
+                    // Core-gated metadata view; `TextMetadata` defines
+                    // which fields `extractTextMetadata` covers.
+                    let meta = i.text_metadata(extract_text_metadata);
+                    TextItem {
+                        text: i.text.clone(),
+                        x: i.x,
+                        y: i.y,
+                        width: i.width,
+                        height: i.height,
+                        font_name: i.font_name.clone(),
+                        font_size: i.font_size,
+                        confidence: i.confidence,
+                        rotation: i.rotation,
+                        font_height: meta.font_height,
+                        font_ascent: meta.font_ascent,
+                        font_descent: meta.font_descent,
+                        font_weight: meta.font_weight,
+                        text_width: meta.text_width,
+                        font_is_buggy: meta.font_is_buggy,
+                        mcid: meta.mcid,
+                        fill_color: meta.fill_color.map(str::to_owned),
+                        stroke_color: meta.stroke_color.map(str::to_owned),
+                        char_codes: meta
+                            .char_codes
+                            .filter(|codes| !codes.is_empty())
+                            .map(<[u32]>::to_vec),
+                        trailing_space_generated: meta.trailing_space_generated,
+                        words: if i.words.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                i.words
+                                    .iter()
+                                    .map(|w| WordBox {
+                                        text: w.text.clone(),
+                                        x: w.x,
+                                        y: w.y,
+                                        width: w.width,
+                                        height: w.height,
+                                    })
+                                    .collect(),
+                            )
+                        },
+                    }
+                })
+                .collect(),
+            complexity: p.complexity.as_ref().map(PageComplexityStats::from_rust),
+            vector_graphics: p.vector_graphics.as_ref().map(|v| VectorGraphics {
+                shapes: v
+                    .shapes
                     .iter()
-                    .map(|i| {
-                        // Core-gated metadata view; `TextMetadata` defines
-                        // which fields `extractTextMetadata` covers.
-                        let meta = i.text_metadata(extract_text_metadata);
-                        TextItem {
-                            text: i.text.clone(),
-                            x: i.x,
-                            y: i.y,
-                            width: i.width,
-                            height: i.height,
-                            font_name: i.font_name.clone(),
-                            font_size: i.font_size,
-                            confidence: i.confidence,
-                            rotation: i.rotation,
-                            font_height: meta.font_height,
-                            font_ascent: meta.font_ascent,
-                            font_descent: meta.font_descent,
-                            font_weight: meta.font_weight,
-                            text_width: meta.text_width,
-                            font_is_buggy: meta.font_is_buggy,
-                            mcid: meta.mcid,
-                            fill_color: meta.fill_color.map(str::to_owned),
-                            stroke_color: meta.stroke_color.map(str::to_owned),
-                            char_codes: meta
-                                .char_codes
-                                .filter(|codes| !codes.is_empty())
-                                .map(<[u32]>::to_vec),
-                            trailing_space_generated: meta.trailing_space_generated,
-                            words: if i.words.is_empty() {
-                                None
-                            } else {
-                                Some(
-                                    i.words
-                                        .iter()
-                                        .map(|w| WordBox {
-                                            text: w.text.clone(),
-                                            x: w.x,
-                                            y: w.y,
-                                            width: w.width,
-                                            height: w.height,
-                                        })
-                                        .collect(),
-                                )
-                            },
-                        }
+                    .map(|s| VectorShape {
+                        bbox: VectorRect {
+                            x: s.bbox.x,
+                            y: s.bbox.y,
+                            width: s.bbox.width,
+                            height: s.bbox.height,
+                        },
+                        stroke: s.stroke,
+                        stroke_color: s.stroke_color.clone(),
+                        fill: s.fill,
+                        fill_color: s.fill_color.clone(),
+                        has_curve: s.has_curve,
                     })
                     .collect(),
-                complexity: p.complexity.as_ref().map(PageComplexityStats::from_rust),
-                vector_graphics: p.vector_graphics.as_ref().map(|v| VectorGraphics {
-                    shapes: v
-                        .shapes
-                        .iter()
-                        .map(|s| VectorShape {
-                            bbox: VectorRect {
-                                x: s.bbox.x,
-                                y: s.bbox.y,
-                                width: s.bbox.width,
-                                height: s.bbox.height,
-                            },
-                            stroke: s.stroke,
-                            stroke_color: s.stroke_color.clone(),
-                            fill: s.fill,
-                            fill_color: s.fill_color.clone(),
-                            has_curve: s.has_curve,
-                        })
-                        .collect(),
-                    lines: v
-                        .lines
-                        .iter()
-                        .map(|l| VectorLine {
-                            x1: l.x1,
-                            y1: l.y1,
-                            x2: l.x2,
-                            y2: l.y2,
-                            stroke: l.stroke,
-                            stroke_width: l.stroke_width,
-                            stroke_color: l.stroke_color.clone(),
-                            fill: l.fill,
-                            fill_color: l.fill_color.clone(),
-                        })
-                        .collect(),
-                }),
-                annotations: p.annotations.as_ref().map(|annotations| {
-                    annotations
-                        .iter()
-                        .map(DocumentAnnotation::from_rust)
-                        .collect()
-                }),
-                form_fields: p
-                    .form_fields
-                    .as_ref()
-                    .map(|fields| fields.iter().map(FormField::from_rust).collect()),
-                structure_tree: p.structure_tree.as_ref().map(StructureTree::from_rust),
-            })
-            .collect();
-
-        let images: Vec<ExtractedImage> = result
-            .images
-            .iter()
-            .map(|img| ExtractedImage {
-                id: img.id.clone(),
-                name: img.name.clone(),
-                path: img.path.clone(),
-                page: img.page,
-                bbox: ImageRect {
-                    x: img.bbox.x,
-                    y: img.bbox.y,
-                    width: img.bbox.width,
-                    height: img.bbox.height,
-                },
-                width: img.width,
-                height: img.height,
-                rotation: img.rotation,
-                format: img.format.clone(),
-                duplicate_of: img.duplicate_of.clone(),
-                bytes: img.bytes.as_slice().to_vec(),
-            })
-            .collect();
-
-        Ok(ParseResult {
-            pages,
-            text: result.text.clone(),
-            images,
-            image_error_count: result.image_error_count,
-            form_type: result.form_type,
-            creator: result.creator.clone(),
-            producer: result.producer.clone(),
-            doc_meta: result.doc_meta.as_ref().map(DocumentMetadata::from),
-            xfa_packets: result.xfa_packets.as_ref().map(|packets| {
-                packets
+                lines: v
+                    .lines
                     .iter()
-                    .map(|packet| XfaPacket {
-                        index: packet.index,
-                        name: packet.name.clone(),
-                        content_length: packet.content_length,
-                        content: packet.content.clone(),
+                    .map(|l| VectorLine {
+                        x1: l.x1,
+                        y1: l.y1,
+                        x2: l.x2,
+                        y2: l.y2,
+                        stroke: l.stroke,
+                        stroke_width: l.stroke_width,
+                        stroke_color: l.stroke_color.clone(),
+                        fill: l.fill,
+                        fill_color: l.fill_color.clone(),
                     })
+                    .collect(),
+            }),
+            annotations: p.annotations.as_ref().map(|annotations| {
+                annotations
+                    .iter()
+                    .map(DocumentAnnotation::from_rust)
                     .collect()
             }),
+            form_fields: p
+                .form_fields
+                .as_ref()
+                .map(|fields| fields.iter().map(FormField::from_rust).collect()),
+            structure_tree: p.structure_tree.as_ref().map(StructureTree::from_rust),
+            blocks: p
+                .blocks
+                .as_ref()
+                .map(|blocks| blocks.iter().map(LayoutBlock::from_rust).collect()),
         })
-    }
+        .collect();
 
+    let images: Vec<ExtractedImage> = result
+        .images
+        .iter()
+        .map(|img| ExtractedImage {
+            id: img.id.clone(),
+            name: img.name.clone(),
+            path: img.path.clone(),
+            page: img.page,
+            bbox: ImageRect {
+                x: img.bbox.x,
+                y: img.bbox.y,
+                width: img.bbox.width,
+                height: img.bbox.height,
+            },
+            width: img.width,
+            height: img.height,
+            rotation: img.rotation,
+            format: img.format.clone(),
+            duplicate_of: img.duplicate_of.clone(),
+            bytes: img.bytes.as_slice().to_vec(),
+        })
+        .collect();
+
+    let screenshots: Vec<ScreenshotResult> = result
+        .screenshots
+        .iter()
+        .map(|shot| ScreenshotResult {
+            page_num: shot.page_num,
+            width: shot.width,
+            height: shot.height,
+            image_bytes: shot.image_bytes.clone(),
+            is_solid_fill: shot.is_solid_fill,
+            rects: shot
+                .rects
+                .iter()
+                .map(|rect| ScreenshotRect {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                    color: rect.color.clone(),
+                    is_line: rect.is_line,
+                })
+                .collect(),
+        })
+        .collect();
+
+    ParseResult {
+        total_pages: result.total_pages,
+        pages,
+        text: result.text.clone(),
+        images,
+        screenshots,
+        image_error_count: result.image_error_count,
+        page_errors: result
+            .page_errors
+            .iter()
+            .map(|error| PageError {
+                page_num: error.page_number,
+                message: error.message.clone(),
+            })
+            .collect(),
+        form_type: result.form_type,
+        creator: result.creator.clone(),
+        producer: result.producer.clone(),
+        doc_meta: result.doc_meta.as_ref().map(DocumentMetadata::from),
+        xfa_packets: result.xfa_packets.as_ref().map(|packets| {
+            packets
+                .iter()
+                .map(|packet| XfaPacket {
+                    index: packet.index,
+                    name: packet.name.clone(),
+                    content_length: packet.content_length,
+                    content: packet.content.clone(),
+                })
+                .collect()
+        }),
+    }
+}
+
+#[wasm_bindgen]
+impl LiteParse {
     /// Determine per-page complexity for the given PDF bytes. Returns
     /// `Promise<PageComplexityStats[]>` — a cheap pre-OCR check with per-page
     /// signals and a `needsOcr` verdict.
@@ -1082,6 +1334,88 @@ impl LiteParse {
             .map_err(|e| JsError::new(&format!("is_complex failed: {}", e)))?;
 
         Ok(stats.iter().map(PageComplexityStats::from_rust).collect())
+    }
+
+    /// Open PDF bytes for bounded-memory batch parsing. Returns
+    /// `Promise<ParseSession>`.
+    ///
+    /// Yields `batchSize` pages at a time (default 25), which bounds both the
+    /// Rust-side result and the JS objects built from it — the wasm heap has a
+    /// hard ceiling, so a large document parsed whole can exhaust it.
+    ///
+    /// Cross-page passes (repeated header/footer removal, image deduplication)
+    /// see only the pages in their own batch, so output can differ from a
+    /// whole-document `parse()`.
+    #[wasm_bindgen(js_name = openBatchSession)]
+    pub async fn open_batch_session(
+        &self,
+        data: Vec<u8>,
+        batch_size: Option<usize>,
+    ) -> Result<ParseSession, JsError> {
+        let batch_size = batch_size.unwrap_or(liteparse::DEFAULT_PAGE_BATCH_SIZE);
+        let session = self
+            .inner
+            .open_batch_session(PdfInput::Bytes(data), batch_size)
+            .await
+            .map_err(|e| JsError::new(&format!("open failed: {}", e)))?;
+
+        Ok(ParseSession {
+            extract_text_metadata: self.inner.config().extract_text_metadata,
+            inner: session,
+        })
+    }
+}
+
+/// One batch of pages from a [`ParseSession`].
+#[derive(Serialize, Tsify)]
+#[tsify(into_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct ParseBatch {
+    /// First source page in this batch, 1-indexed.
+    pub start_page: u32,
+    /// Last source page in this batch, 1-indexed and inclusive.
+    pub end_page: u32,
+    /// The pages in `startPage..=endPage`, as an ordinary parse result.
+    pub result: ParseResult,
+}
+
+/// A document opened once and parsed in bounded page batches.
+///
+/// Created by `LiteParse.openBatchSession()`. Call `nextBatch()` until it
+/// returns `undefined`, then `free()` the session to release its wasm-side
+/// memory promptly (wasm-bindgen objects are not garbage collected).
+#[wasm_bindgen]
+pub struct ParseSession {
+    inner: liteparse::ParseSession,
+    extract_text_metadata: bool,
+}
+
+#[wasm_bindgen]
+impl ParseSession {
+    /// Total pages in the source document, before `maxPages` or batching.
+    #[wasm_bindgen(getter, js_name = totalPages)]
+    pub fn total_pages(&self) -> u32 {
+        self.inner.total_pages()
+    }
+
+    /// Parse and return the next batch, or `undefined` once every page within
+    /// `maxPages` has been yielded.
+    ///
+    /// Batches are parsed one at a time: await each call before making the
+    /// next (a concurrent call throws wasm-bindgen's recursive-borrow error).
+    #[wasm_bindgen(js_name = nextBatch)]
+    pub async fn next_batch(&mut self) -> Result<Option<ParseBatch>, JsError> {
+        let batch = self
+            .inner
+            .next_batch()
+            .await
+            .map_err(|e| JsError::new(&format!("batch parse failed: {}", e)))?;
+
+        Ok(batch.map(|batch| ParseBatch {
+            start_page: batch.start_page,
+            end_page: batch.end_page,
+            result: to_js_result(&batch.result, self.extract_text_metadata),
+        }))
     }
 }
 

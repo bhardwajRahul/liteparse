@@ -33,6 +33,7 @@ mod tests {
             annotations: None,
             form_fields: None,
             structure_tree: None,
+            blocks: None,
         }
     }
 

@@ -44,6 +44,26 @@ pub fn escape_inline(s: &str) -> String {
     out
 }
 
+/// Escape `text` for use as the body of a span with `style`. Backslash escapes
+/// are inert inside code spans per CommonMark, so mono text is passed through
+/// verbatim.
+fn style_body(text: &str, style: SpanStyle) -> String {
+    if style.mono {
+        text.to_string()
+    } else {
+        escape_inline(text)
+    }
+}
+
+/// Render `text` as a single styled markdown span: style-aware escaping
+/// (`style_body`) plus marker wrapping (`apply_style`). Always use this pair
+/// through here — calling `escape_inline` + `apply_style` directly would
+/// backslash-escape the body of a code span, which CommonMark renders
+/// literally.
+fn render_span(text: &str, style: SpanStyle) -> String {
+    apply_style(&style_body(text, style), style)
+}
+
 /// Wrap `inner` in a markdown inline link to `url`. Uses the angle-bracket
 /// destination form when the URL contains characters that would otherwise
 /// terminate or break the `(url)` form (whitespace or parentheses).
@@ -60,12 +80,24 @@ pub fn apply_link(inner: &str, url: &str) -> String {
 /// a span is mono we drop the `**/*` wrap. Bold + italic → `***…***`.
 fn apply_style(inner: &str, style: SpanStyle) -> String {
     let styled = if style.mono {
-        // Use backticks; if inner already contains backticks, switch to a
-        // longer fence (pair of backticks plus a space buffer) per CommonMark.
-        if inner.contains('`') {
-            format!("`` {} ``", inner)
-        } else {
+        // The fence must be longer than the longest backtick run inside the
+        // content (a matching-length interior run would close the span early),
+        // with a space buffer so an edge backtick can't merge into the fence.
+        // CommonMark strips one space from each end, so the content round-trips.
+        let longest_run = {
+            let mut longest = 0usize;
+            let mut run = 0usize;
+            for c in inner.chars() {
+                run = if c == '`' { run + 1 } else { 0 };
+                longest = longest.max(run);
+            }
+            longest
+        };
+        if longest_run == 0 {
             format!("`{}`", inner)
+        } else {
+            let fence = "`".repeat(longest_run + 1);
+            format!("{fence} {inner} {fence}")
         }
     } else {
         match (style.bold, style.italic) {
@@ -129,11 +161,7 @@ pub(super) fn render_line_inline(line: &ProjectedLine) -> String {
         if joined.is_empty() {
             return joined;
         }
-        let escaped = escape_inline(&joined);
-        if styles[0].is_plain() {
-            return escaped;
-        }
-        return apply_style(&escaped, styles[0]);
+        return render_span(&joined, styles[0]);
     }
 
     // Group consecutive spans by style. Within a group, span texts join with
@@ -155,12 +183,7 @@ pub(super) fn render_line_inline(line: &ProjectedLine) -> String {
             group_text.push_str(span.text.trim());
         }
         let group_text = collapse_whitespace(&group_text);
-        let escaped = escape_inline(&group_text);
-        let mut rendered = if style.is_plain() {
-            escaped
-        } else {
-            apply_style(&escaped, style)
-        };
+        let mut rendered = render_span(&group_text, style);
         if let Some(url) = link {
             rendered = apply_link(&rendered, url);
         }
@@ -186,13 +209,7 @@ pub(super) fn render_line_inline(line: &ProjectedLine) -> String {
 /// around it). On any failure we fall back to plain escaped `rest`.
 pub(super) fn render_list_item_text(line: &ProjectedLine, marker: &str, rest: &str) -> String {
     if let Some(style) = line_uniform_style(line) {
-        let plain = collapse_whitespace(rest);
-        let escaped = escape_inline(&plain);
-        return if style.is_plain() {
-            escaped
-        } else {
-            apply_style(&escaped, style)
-        };
+        return render_span(&collapse_whitespace(rest), style);
     }
     let full = render_line_inline(line);
     if let Some(stripped) = strip_leading_marker_from_inline(&full, marker) {
@@ -421,5 +438,59 @@ mod tests {
         // Plain spans stay unwrapped.
         assert!(out.contains("call"));
         assert!(out.contains("on it"));
+    }
+
+    #[test]
+    fn render_line_inline_mono_span_is_not_escaped() {
+        let l = styled_line(
+            &[
+                ("call", 50.0, Some("Arial")),
+                ("get_user_id", 100.0, Some("Courier")),
+                ("now", 200.0, Some("Arial")),
+            ],
+            100.0,
+            10.0,
+        );
+        let out = render_line_inline(&l);
+        assert!(out.contains("`get_user_id`"), "got: {out}");
+        assert!(!out.contains('\\'), "got: {out}");
+    }
+
+    #[test]
+    fn render_line_inline_mono_span_keeps_backslashes() {
+        let l = styled_line(
+            &[
+                ("open", 50.0, Some("Arial")),
+                (r"C:\Program\bin", 100.0, Some("Courier")),
+                ("next", 200.0, Some("Arial")),
+            ],
+            100.0,
+            10.0,
+        );
+        let out = render_line_inline(&l);
+        assert!(out.contains(r"`C:\Program\bin`"), "got: {out}");
+    }
+
+    #[test]
+    fn render_line_inline_uniform_mono_line_is_not_escaped() {
+        let l = styled_line(&[("a_b*c", 50.0, Some("Courier"))], 100.0, 10.0);
+        let out = render_line_inline(&l);
+        assert_eq!(out, "`a_b*c`");
+    }
+
+    #[test]
+    fn mono_span_with_single_backtick_uses_double_fence() {
+        let l = styled_line(&[("a`b", 50.0, Some("Courier"))], 100.0, 10.0);
+        let out = render_line_inline(&l);
+        assert_eq!(out, "`` a`b ``");
+    }
+
+    #[test]
+    fn mono_span_with_double_backtick_run_uses_longer_fence() {
+        // A 2-backtick run inside the content would close a 2-backtick fence
+        // early; the fence must be one longer than the longest interior run.
+        let l = styled_line(&[("a``b", 50.0, Some("Courier"))], 100.0, 10.0);
+        let out = render_line_inline(&l);
+        assert_eq!(out, "``` a``b ```");
     }
 }

@@ -3,6 +3,7 @@ use crate::ffi;
 /// Wrapper around FPDF_FONT obtained from a text object.
 /// This is a borrowed handle — it does not own the font and must not outlive
 /// the page object it was obtained from.
+#[derive(Clone)]
 pub struct Font {
     handle: pdfium_sys::FPDF_FONT,
 }

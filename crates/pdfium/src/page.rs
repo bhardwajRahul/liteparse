@@ -227,20 +227,47 @@ pub struct PdfFormField {
 pub struct Page<'doc, 'lib: 'doc> {
     pub(crate) handle: pdfium_sys::FPDF_PAGE,
     pub(crate) doc_handle: pdfium_sys::FPDF_DOCUMENT,
+    /// `/UserUnit` multiplier (1.0 for normal pages). PDFium reports all
+    /// geometry in raw MediaBox units, so viewport-space output and render
+    /// pixel sizing multiply by this to recover the page's real scale (see
+    /// `crate::user_unit`).
+    pub(crate) user_unit: f32,
     pub(crate) _doc: PhantomData<&'doc Document<'lib>>,
 }
 
 impl<'doc, 'lib: 'doc> Page<'doc, 'lib> {
+    /// Page width in raw MediaBox units, exactly as PDFium reports it
+    /// (ignores `/UserUnit`; multiply by [`Self::user_unit`] for the real
+    /// size, or use [`Self::viewport_size`] which already does).
     pub fn width(&self) -> f32 {
         unsafe { ffi!(FPDF_GetPageWidthF(self.handle)) }
     }
 
+    /// Page height in raw MediaBox units (see [`Self::width`]).
     pub fn height(&self) -> f32 {
         unsafe { ffi!(FPDF_GetPageHeightF(self.handle)) }
     }
 
+    /// The page's `/UserUnit` multiplier, 1.0 when absent.
+    pub fn user_unit(&self) -> f32 {
+        self.user_unit
+    }
+
     pub fn rotation(&self) -> i32 {
         unsafe { ffi!(FPDFPage_GetRotation(self.handle)) }
+    }
+
+    /// Page dimensions in the same rotation-adjusted viewport coordinate
+    /// space returned by [`Self::page_to_viewport`]. Unlike [`Self::width`]/
+    /// [`Self::height`], this applies the `/UserUnit` multiplier, so the
+    /// result is in real points (1/72 inch).
+    pub fn viewport_size(&self, view_box: &RectF) -> (f32, f32) {
+        let mut width = (view_box.right - view_box.left).abs() * self.user_unit;
+        let mut height = (view_box.top - view_box.bottom).abs() * self.user_unit;
+        if matches!(self.rotation(), 1 | 3) {
+            std::mem::swap(&mut width, &mut height);
+        }
+        (width, height)
     }
 
     /// Get the page bounding box (CropBox, falls back to MediaBox).
@@ -268,17 +295,14 @@ impl<'doc, 'lib: 'doc> Page<'doc, 'lib> {
     /// Convert a point from PDF page space to viewport space (top-left origin, 72 DPI).
     /// Mirrors the platform's Parse_pageToViewport using FPDF_PageToDevice at 1000x scale.
     pub fn page_to_viewport(&self, view_box: &RectF, page_x: f32, page_y: f32) -> (f32, f32) {
-        let mut vw = view_box.right - view_box.left;
-        let mut vh = view_box.top - view_box.bottom;
+        let (vw, vh) = self.viewport_size(view_box);
 
-        let rotation = self.rotation();
-        if rotation == 1 || rotation == 3 {
-            // 90° or 270° — swap viewport dimensions
-            std::mem::swap(&mut vw, &mut vh);
-        }
-
-        let device_w = (vw * 1000.0).round() as i32;
-        let device_h = (vh * 1000.0).round() as i32;
+        // 1000x is the precision multiplier for the integer device space.
+        // `/UserUnit` pages can be hundreds of thousands of points tall, so
+        // cap the multiplier to keep the device box inside i32 range.
+        let mult = 1000.0f32.min((i32::MAX / 4) as f32 / vw.max(vh).max(1.0));
+        let device_w = (vw * mult).round() as i32;
+        let device_h = (vh * mult).round() as i32;
         let mut dx: i32 = 0;
         let mut dy: i32 = 0;
 
@@ -297,7 +321,7 @@ impl<'doc, 'lib: 'doc> Page<'doc, 'lib> {
             ));
         }
 
-        (dx as f32 / 1000.0, dy as f32 / 1000.0)
+        (dx as f32 / mult, dy as f32 / mult)
     }
 
     /// Convert bounds from PDF page space to viewport space (top-left origin).
@@ -370,7 +394,10 @@ impl<'doc, 'lib: 'doc> Page<'doc, 'lib> {
         dpi: f32,
         form: Option<&FormEnvironment>,
     ) -> Result<Bitmap<'lib>, PdfiumError> {
-        let scale = dpi / 72.0;
+        // `/UserUnit` scales the physical page, so honoring the requested
+        // DPI means scaling the pixel size by it too — otherwise a UserUnit
+        // page renders at dpi/user_unit and its text rasterizes microscopic.
+        let scale = dpi / 72.0 * self.user_unit;
         let width = (self.width() * scale).round() as i32;
         let height = (self.height() * scale).round() as i32;
 
@@ -911,28 +938,158 @@ impl<'doc, 'lib: 'doc> Page<'doc, 'lib> {
             let subtype = unsafe { ffi!(FPDFAnnot_GetSubtype(annot)) };
             let flags = unsafe { ffi!(FPDFAnnot_GetFlags(annot)) };
             let hidden = flags & pdfium_sys::FPDF_ANNOT_FLAG_HIDDEN as i32 != 0;
-            let mut found = false;
-            if !hidden && subtype != pdfium_sys::FPDF_ANNOT_POPUP as i32 {
-                let object_count = unsafe { ffi!(FPDFAnnot_GetObjectCount(annot)) };
-                for object_index in 0..object_count {
-                    let object = unsafe { ffi!(FPDFAnnot_GetObject(annot, object_index)) };
-                    if object.is_null() {
-                        continue;
-                    }
-                    if unsafe { ffi!(FPDFPageObj_GetType(object)) }
-                        == pdfium_sys::FPDF_PAGEOBJ_TEXT as i32
-                    {
-                        found = true;
-                        break;
-                    }
-                }
-            }
+            let found = !hidden
+                && subtype != pdfium_sys::FPDF_ANNOT_POPUP as i32
+                && annotation_paints_text_shallow(annot);
             unsafe { ffi!(FPDFPage_CloseAnnot(annot)) };
             if found {
                 return true;
             }
         }
         false
+    }
+
+    /// Viewport rects of the visible AcroForm widgets that paint text through
+    /// their appearance streams. Empty when the page has no such widget, which
+    /// is the signal not to flatten.
+    ///
+    /// PDFium's page text API omits these glyphs until the page is flattened,
+    /// so the rects double as the only regions where flattening can introduce
+    /// text — callers use them to scope duplicate detection instead of
+    /// rescanning the whole page.
+    pub fn form_widget_text_rects(&self, view_box: &RectF) -> Vec<RectF> {
+        let mut rects = Vec::new();
+        let count = unsafe { ffi!(FPDFPage_GetAnnotCount(self.handle)) };
+        for index in 0..count {
+            let annot = unsafe { ffi!(FPDFPage_GetAnnot(self.handle, index)) };
+            if annot.is_null() {
+                continue;
+            }
+            if unsafe { ffi!(FPDFAnnot_GetSubtype(annot)) } == pdfium_sys::FPDF_ANNOT_WIDGET as i32
+                && annotation_paints_text_deep(annot)
+            {
+                let mut rect = pdfium_sys::FS_RECTF::default();
+                if unsafe { ffi!(FPDFAnnot_GetRect(annot, &mut rect)) } != 0 {
+                    rects.push(self.bounds_to_viewport(
+                        view_box,
+                        &RectF {
+                            left: rect.left,
+                            top: rect.top,
+                            right: rect.right,
+                            bottom: rect.bottom,
+                        },
+                    ));
+                }
+            }
+            unsafe { ffi!(FPDFPage_CloseAnnot(annot)) };
+        }
+        rects
+    }
+
+    /// Whether any text object already in the page content stream overlaps one
+    /// of `rects`.
+    ///
+    /// Flattening replaces the page content under a widget's rect with that
+    /// widget's appearance, so text already drawn there is lost. This is the
+    /// cheap probe for that situation: it walks page-object bounding boxes
+    /// only — no text page, no glyph decoding — so the common form page (whose
+    /// widget rects sit over blank space) pays a bounds walk instead of a
+    /// second full text extraction.
+    pub fn text_objects_overlap(&self, view_box: &RectF, rects: &[RectF]) -> bool {
+        if rects.is_empty() {
+            return false;
+        }
+        let count = unsafe { ffi!(FPDFPage_CountObjects(self.handle)) };
+        for i in 0..count {
+            let obj = unsafe { ffi!(FPDFPage_GetObject(self.handle, i)) };
+            if obj.is_null()
+                || unsafe { ffi!(FPDFPageObj_GetType(obj)) } != pdfium_sys::FPDF_PAGEOBJ_TEXT as i32
+            {
+                continue;
+            }
+            let (mut left, mut bottom, mut right, mut top) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            if unsafe {
+                ffi!(FPDFPageObj_GetBounds(
+                    obj,
+                    &mut left,
+                    &mut bottom,
+                    &mut right,
+                    &mut top
+                ))
+            } == 0
+            {
+                continue;
+            }
+            let bounds = self.bounds_to_viewport(
+                view_box,
+                &RectF {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                },
+            );
+            if rects.iter().any(|rect| {
+                bounds.left < rect.right
+                    && bounds.right > rect.left
+                    && bounds.top < rect.bottom
+                    && bounds.bottom > rect.top
+            }) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Promote visible form-widget appearances into page content without
+    /// admitting comment, markup, stamp, or other annotation appearances into
+    /// the text layer.
+    ///
+    /// PDFium's flatten operation is page-wide and otherwise consumes every
+    /// visible annotation. Hide non-widget annotations in this disposable
+    /// extraction document first; callers snapshot annotation metadata and
+    /// reopen the pristine input for any later rendering work.
+    ///
+    /// Returns true only when PDFium changed the page. Returns false — leaving
+    /// extraction on the original page content — when the pdfium build omits
+    /// the flatten API, or when suppression or flattening fails, in which case
+    /// any changed flags are restored first.
+    pub fn flatten_form_widgets_for_display(&self) -> bool {
+        // `fpdf_flatten.h` is an optional pdfium API; trimmed builds omit it.
+        // Missing it costs form-value text, not the whole parse.
+        let Some(api) = FlattenApi::load() else {
+            return false;
+        };
+        let mut suppressed = Vec::new();
+        let count = unsafe { ffi!(FPDFPage_GetAnnotCount(self.handle)) };
+        for index in 0..count {
+            let annot = unsafe { ffi!(FPDFPage_GetAnnot(self.handle, index)) };
+            if annot.is_null() {
+                continue;
+            }
+            let subtype = unsafe { ffi!(FPDFAnnot_GetSubtype(annot)) };
+            if subtype != pdfium_sys::FPDF_ANNOT_WIDGET as i32 {
+                let flags = unsafe { ffi!(FPDFAnnot_GetFlags(annot)) };
+                if flags & pdfium_sys::FPDF_ANNOT_FLAG_HIDDEN as i32 == 0 {
+                    let hidden_flags = flags | pdfium_sys::FPDF_ANNOT_FLAG_HIDDEN as i32;
+                    let changed = unsafe { (api.set_flags)(annot, hidden_flags) } != 0;
+                    unsafe { ffi!(FPDFPage_CloseAnnot(annot)) };
+                    if !changed {
+                        restore_annotation_flags(&api, self.handle, &suppressed);
+                        return false;
+                    }
+                    suppressed.push((index, flags));
+                    continue;
+                }
+            }
+            unsafe { ffi!(FPDFPage_CloseAnnot(annot)) };
+        }
+
+        let result = unsafe { (api.flatten)(self.handle, pdfium_sys::FLAT_NORMALDISPLAY as i32) };
+        if result != pdfium_sys::FLATTEN_SUCCESS as i32 {
+            restore_annotation_flags(&api, self.handle, &suppressed);
+        }
+        result == pdfium_sys::FLATTEN_SUCCESS as i32
     }
 
     /// Enumerate AcroForm widget annotations and resolve their field values
@@ -1084,6 +1241,115 @@ impl<'doc, 'lib: 'doc> Page<'doc, 'lib> {
             widget_index += 1;
         }
         out
+    }
+}
+
+/// The optional page-flatten API, resolved together so a build missing either
+/// half degrades to "no flattening" rather than failing the whole pdfium load.
+struct FlattenApi {
+    flatten:
+        unsafe extern "C" fn(pdfium_sys::FPDF_PAGE, std::os::raw::c_int) -> std::os::raw::c_int,
+    set_flags: unsafe extern "C" fn(
+        pdfium_sys::FPDF_ANNOTATION,
+        std::os::raw::c_int,
+    ) -> pdfium_sys::FPDF_BOOL,
+}
+
+impl FlattenApi {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load() -> Option<Self> {
+        let bindings = pdfium_sys::dynamic::pdfium();
+        Some(Self {
+            flatten: bindings.FPDFPage_Flatten?,
+            set_flags: bindings.FPDFAnnot_SetFlags?,
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn load() -> Option<Self> {
+        Some(Self {
+            flatten: pdfium_sys::FPDFPage_Flatten,
+            set_flags: pdfium_sys::FPDFAnnot_SetFlags,
+        })
+    }
+}
+
+/// Whether the annotation's appearance paints text at its top level.
+///
+/// Deliberately shallow and HIDDEN-agnostic: this backs the long-standing
+/// `AnnotationText` complexity signal, and widening it would silently reroute
+/// pages to OCR. [`annotation_paints_text_deep`] is the form-widget variant.
+fn annotation_paints_text_shallow(annot: pdfium_sys::FPDF_ANNOTATION) -> bool {
+    let object_count = unsafe { ffi!(FPDFAnnot_GetObjectCount(annot)) };
+    (0..object_count).any(|object_index| {
+        let object = unsafe { ffi!(FPDFAnnot_GetObject(annot, object_index)) };
+        !object.is_null()
+            && unsafe { ffi!(FPDFPageObj_GetType(object)) } == pdfium_sys::FPDF_PAGEOBJ_TEXT as i32
+    })
+}
+
+/// Whether a widget's appearance paints text, descending into nested form
+/// XObjects.
+///
+/// PDFium parses an `/AP /N` stream into top-level objects, so a producer that
+/// wraps variable text in `/Tx BMC ... /Fm0 Do EMC` (Acrobat and several
+/// server-side fillers do) yields a form object, not a text object. Without the
+/// descent those filled fields look empty and never get flattened.
+fn annotation_paints_text_deep(annot: pdfium_sys::FPDF_ANNOTATION) -> bool {
+    // Invisible/hidden/noview widgets are not painted, so flattening them would
+    // introduce text the reader never sees.
+    let flags = unsafe { ffi!(FPDFAnnot_GetFlags(annot)) };
+    let suppressed = pdfium_sys::FPDF_ANNOT_FLAG_INVISIBLE
+        | pdfium_sys::FPDF_ANNOT_FLAG_HIDDEN
+        | pdfium_sys::FPDF_ANNOT_FLAG_NOVIEW;
+    if flags & suppressed as i32 != 0 {
+        return false;
+    }
+
+    let object_count = unsafe { ffi!(FPDFAnnot_GetObjectCount(annot)) };
+    (0..object_count).any(|object_index| {
+        let object = unsafe { ffi!(FPDFAnnot_GetObject(annot, object_index)) };
+        !object.is_null() && object_paints_text(object, 0)
+    })
+}
+
+/// Depth-bounded search for a text object, following form XObjects.
+fn object_paints_text(object: pdfium_sys::FPDF_PAGEOBJECT, depth: u32) -> bool {
+    // Appearance nesting is shallow in practice; the cap only guards against
+    // pathological or cyclic documents.
+    const MAX_DEPTH: u32 = 8;
+    match unsafe { ffi!(FPDFPageObj_GetType(object)) } as u32 {
+        pdfium_sys::FPDF_PAGEOBJ_TEXT => true,
+        pdfium_sys::FPDF_PAGEOBJ_FORM if depth < MAX_DEPTH => {
+            let count = unsafe { ffi!(FPDFFormObj_CountObjects(object)) };
+            (0..count).any(|index| {
+                let child = unsafe {
+                    ffi!(FPDFFormObj_GetObject(
+                        object,
+                        index as std::os::raw::c_ulong
+                    ))
+                };
+                !child.is_null() && object_paints_text(child, depth + 1)
+            })
+        }
+        _ => false,
+    }
+}
+
+fn restore_annotation_flags(
+    api: &FlattenApi,
+    page: pdfium_sys::FPDF_PAGE,
+    originals: &[(i32, i32)],
+) {
+    for &(index, flags) in originals {
+        let annot = unsafe { ffi!(FPDFPage_GetAnnot(page, index)) };
+        if annot.is_null() {
+            continue;
+        }
+        unsafe {
+            (api.set_flags)(annot, flags);
+            ffi!(FPDFPage_CloseAnnot(annot));
+        }
     }
 }
 

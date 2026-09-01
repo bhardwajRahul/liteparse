@@ -266,6 +266,9 @@ pub(super) struct ParaAccum {
     pub(super) inline: String,
     pub(super) last: ProjectedLine,
     pub(super) uniform: Option<(bool, bool)>,
+    /// Union of every line folded into this paragraph, so the emitted block
+    /// reports the whole band it covers rather than its last line.
+    pub(super) bbox: Option<crate::types::Rect>,
 }
 
 /// Append `next_line` to a paragraph accumulator. Maintains both the `raw` and
@@ -282,6 +285,8 @@ pub(super) fn append_to_paragraph(accum: &mut ParaAccum, next_line: &ProjectedLi
     // A struck line has no block-level flag, so it can't use the uniform
     // raw-text fast path — drop it to `None` to force the `inline` rendering.
     let next_uniform: Option<SpanStyle> = line_uniform_style(next_line).filter(|s| !s.strike);
+
+    crate::types::Rect::extend(&mut accum.bbox, &next_line.bbox);
 
     if accum.raw.is_empty() {
         accum.raw.push_str(&next_raw);

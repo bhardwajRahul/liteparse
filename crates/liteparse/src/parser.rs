@@ -11,18 +11,23 @@ use crate::ocr::tesseract::TesseractOcrEngine;
 use crate::ocr_merge;
 use crate::output::markdown;
 use crate::projection;
-#[cfg(not(target_arch = "wasm32"))]
 use crate::render;
 use crate::types::{
-    DocumentMetadata, ExtractedImage, OutlineTarget, Page, ParsedPage, PdfInput, ScreenshotRect,
-    XfaPacket,
+    DocumentMetadata, ExtractedImage, OutlineTarget, Page, PageError, ParsedPage, PdfInput,
+    ScreenshotRect, XfaPacket,
 };
 use pdfium::Library;
 
 /// Result of parsing a document.
 pub struct ParseResult {
+    /// Total number of pages in the source document, before `target_pages` or
+    /// `max_pages` limits are applied.
+    pub total_pages: u32,
     /// Parsed pages with projected text layout.
     pub pages: Vec<ParsedPage>,
+    /// Page-level PDFium extraction failures collected when
+    /// `continue_on_page_error` is enabled.
+    pub page_errors: Vec<PageError>,
     /// Full document text, concatenated from all pages.
     pub text: String,
     /// Document outline (bookmarks) when present. Used by the markdown
@@ -33,6 +38,9 @@ pub struct ParseResult {
     /// `id` and `format` the markdown emitter referenced, so the caller can
     /// match them up without parsing markdown.
     pub images: Vec<ExtractedImage>,
+    /// Page screenshots encoded as PNG. Empty unless `extract_screenshots`
+    /// is enabled.
+    pub screenshots: Vec<ScreenshotResult>,
     /// Number of embedded image objects that could not be extracted. A bad
     /// image does not fail the rest of the document parse.
     pub image_error_count: u32,
@@ -166,6 +174,33 @@ fn default_glyph_resolver() -> Option<std::sync::Arc<dyn crate::GlyphResolver>> 
     None
 }
 
+/// A document input already converted to PDF, if it needed converting.
+///
+/// Holds the [`conversion::PdfInputGuard`] so the temporary file produced for
+/// a DOCX/XLSX/PPTX/image source stays alive for as long as the resolved input
+/// is usable. Reusing one of these across several parses is what keeps batch
+/// parsing from re-running LibreOffice for every batch.
+pub(crate) struct ResolvedInput {
+    input: PdfInput,
+    #[cfg(not(target_arch = "wasm32"))]
+    guard: conversion::PdfInputGuard,
+}
+
+impl ResolvedInput {
+    /// True when `input` points at a temporary PDF we produced, so raw-file
+    /// provenance describes the intermediate rather than the caller's document.
+    fn is_converted(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.guard.is_converted()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    }
+}
+
 /// Main LiteParse orchestrator.
 ///
 /// ### Thread safety
@@ -181,6 +216,7 @@ fn default_glyph_resolver() -> Option<std::sync::Arc<dyn crate::GlyphResolver>> 
 /// safe but their PDFium portions run sequentially. The OCR pass and grid
 /// projection (which dominate runtime for OCR-heavy documents) run outside
 /// the lock and remain fully concurrent.
+#[derive(Clone)]
 pub struct LiteParse {
     config: LiteParseConfig,
     /// Optional caller-provided OCR engine. When set, this overrides the
@@ -193,6 +229,54 @@ pub struct LiteParse {
     /// built-in cmap/AGL recovery could not decode. The published package ships
     /// none; the platform build injects an outline → unicode font-DB resolver.
     glyph_resolver: Option<std::sync::Arc<dyn crate::GlyphResolver>>,
+}
+
+/// Run block classification once and fan the result out to everything that
+/// needs it: the rendered per-page markdown (when Markdown is the output
+/// format) and each page's `blocks` (when `extract_blocks` is on).
+///
+/// Classification is the expensive part of the markdown pipeline, so the two
+/// consumers share a single pass rather than each triggering their own. Returns
+/// the joined document markdown when that is the output format.
+fn apply_layout(
+    config: &crate::config::LiteParseConfig,
+    parsed_pages: &mut [ParsedPage],
+    outline: &[OutlineTarget],
+) -> Option<String> {
+    let wants_markdown = config.output_format == crate::config::OutputFormat::Markdown;
+    if !wants_markdown && !config.extract_blocks {
+        return None;
+    }
+    let classified = markdown::classify_document(
+        parsed_pages,
+        outline,
+        config.image_mode,
+        config.keep_headers_footers,
+    );
+    if config.extract_blocks {
+        for (page, blocks) in parsed_pages.iter_mut().zip(&classified) {
+            // A page with no structural decomposition reports an empty list,
+            // not `None` — extraction *was* enabled, there was just nothing to
+            // decompose.
+            page.blocks = Some(
+                blocks
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(crate::layout::LayoutBlock::from)
+                    .collect(),
+            );
+        }
+    }
+    if !wants_markdown {
+        return None;
+    }
+    let page_md = markdown::render_classified(parsed_pages, &classified);
+    let md = page_md.join("\n\n-----\n\n");
+    for (page, page_md) in parsed_pages.iter_mut().zip(page_md) {
+        page.markdown = page_md;
+    }
+    Some(md)
 }
 
 impl LiteParse {
@@ -283,14 +367,24 @@ impl LiteParse {
             let lib = Library::init();
             let document = extract::load_document_from_input(&lib, &validated_input, password)?;
 
-            let (pages, _, _) = extract::extract_pages_and_images(
+            // Complexity deliberately runs against the flattened document: once
+            // widget text lives in the content stream it is genuinely within
+            // PDFium's reach, so it should count toward the page's text budget
+            // instead of routing the page to OCR to recover text we already
+            // have. `AnnotationText` still fires for the non-widget appearance
+            // text it was introduced for.
+            let pages = extract::extract_pages_and_images(
                 &document,
                 target_pages.as_deref(),
                 self.config.max_pages,
                 false, // extract_links: irrelevant for complexity stats
                 self.glyph_resolver.as_deref(),
-                extract::ExtractionOutputOptions::default(),
-            )?;
+                extract::ExtractionOutputOptions {
+                    continue_on_page_error: self.config.continue_on_page_error,
+                    ..Default::default()
+                },
+            )?
+            .pages;
             let t_extract = web_time::Instant::now();
             log(&format!(
                 "[liteparse] extract: {:.1}ms ({} pages)",
@@ -298,13 +392,29 @@ impl LiteParse {
                 pages.len()
             ));
 
-            let page_complexities = pages
-                .iter()
-                .map(|page| {
-                    let page_obj = document.page((page.page_number - 1) as i32)?;
-                    ocr_merge::calculate_page_complexity(page, &page_obj)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            // In tolerant mode a page whose stats fail is dropped from both
+            // vectors (consumers match stats to pages by `page_number`), so
+            // the layout zip below stays aligned.
+            let mut kept_pages = Vec::with_capacity(pages.len());
+            let mut page_complexities = Vec::with_capacity(pages.len());
+            for page in pages {
+                let stats = document
+                    .page((page.page_number - 1) as i32)
+                    .map_err(LiteParseError::from)
+                    .and_then(|page_obj| ocr_merge::calculate_page_complexity(&page, &page_obj));
+                match stats {
+                    Ok(stats) => {
+                        page_complexities.push(stats);
+                        kept_pages.push(page);
+                    }
+                    Err(error) if self.config.continue_on_page_error => log(&format!(
+                        "[liteparse] complexity failed on page {}: {}",
+                        page.page_number, error
+                    )),
+                    Err(error) => return Err(error),
+                }
+            }
+            let pages = kept_pages;
             log(&format!(
                 "[liteparse] complexity: {:.1}ms",
                 web_time::Instant::now()
@@ -352,6 +462,54 @@ impl LiteParse {
     /// Use `PdfInput::Path` for files on disk or `PdfInput::Bytes` for
     /// in-memory PDF data (e.g. from a network response or Node.js Buffer).
     pub async fn parse_input(&self, input: PdfInput) -> Result<ParseResult, LiteParseError> {
+        self.validate_output_config()?;
+        let resolved = self.resolve_input(input).await?;
+        let target_pages = self.resolve_target_pages()?;
+        self.parse_resolved(
+            &resolved,
+            target_pages.as_deref(),
+            self.config.max_pages,
+            None,
+        )
+        .await
+    }
+
+    /// Convert a non-PDF input to PDF (if needed) and return it alongside the
+    /// guard that keeps any temporary file alive.
+    ///
+    /// Split out of [`LiteParse::parse_input`] so [`ParseSession`] can pay the
+    /// conversion cost once and reuse the result for every page batch.
+    async fn resolve_input(&self, input: PdfInput) -> Result<ResolvedInput, LiteParseError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (input, guard) =
+                conversion::resolve_pdf_input(input, self.config.password.as_deref(), false)
+                    .await?;
+            Ok(ResolvedInput { input, guard })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Ok(ResolvedInput { input })
+        }
+    }
+
+    /// Parse an already-resolved input over an explicit page selection.
+    ///
+    /// `target_pages` and `max_pages` are parameters rather than config reads
+    /// so batch parsing can narrow the selection per batch.
+    ///
+    /// `outline` lets a caller that already walked the bookmark tree supply it
+    /// instead of paying for it again. The walk resolves a page destination per
+    /// entry, which costs several times more than opening the document, so a
+    /// batch parse that recomputed it per batch would spend most of its
+    /// overhead there.
+    async fn parse_resolved(
+        &self,
+        resolved: &ResolvedInput,
+        target_pages: Option<&[u32]>,
+        max_pages: usize,
+        outline: Option<Vec<OutlineTarget>>,
+    ) -> Result<ParseResult, LiteParseError> {
         let log = |msg: &str| {
             if !self.config.quiet {
                 eprintln!("{}", msg);
@@ -360,24 +518,11 @@ impl LiteParse {
 
         let t0 = web_time::Instant::now();
 
-        self.validate_output_config()?;
-
-        #[cfg(not(target_arch = "wasm32"))]
-        let (validated_input, _guard) =
-            conversion::resolve_pdf_input(input, self.config.password.as_deref(), false).await?;
-
         // Provenance facts describe the file on disk, so they are meaningless
         // for a PDF we generated ourselves from a DOCX/XLSX/image.
-        #[cfg(not(target_arch = "wasm32"))]
-        let want_doc_meta = self.config.extract_document_metadata && !_guard.is_converted();
-        #[cfg(target_arch = "wasm32")]
-        let want_doc_meta = self.config.extract_document_metadata;
+        let want_doc_meta = self.config.extract_document_metadata && !resolved.is_converted();
 
-        #[cfg(target_arch = "wasm32")]
-        let validated_input = input;
-
-        // Determine which pages to extract
-        let target_pages = self.resolve_target_pages()?;
+        let validated_input = &resolved.input;
 
         // Extract text (and pre-render OCR pages in one PDF load when OCR is on).
         // The PDFium lock is acquired for this entire critical section and
@@ -434,9 +579,11 @@ impl LiteParse {
         #[allow(unused_mut)] // mutated only by the native image-output writer
         let (
             pages,
-            ocr_rendered,
+            page_errors,
+            total_pages,
             outline,
             mut images,
+            screenshots,
             image_error_count,
             complexity,
             form_type,
@@ -444,6 +591,9 @@ impl LiteParse {
             producer,
             doc_meta,
             xfa_packets,
+            flattened_form_widgets,
+            flattened_page_numbers,
+            repaired_input,
         ) = {
             let lib = Library::init();
             #[cfg(not(target_arch = "wasm32"))]
@@ -451,18 +601,15 @@ impl LiteParse {
                 .config
                 .extract_form_fields
                 .then(|| {
-                    crate::acroform_repair::repair_orphaned_widgets(
-                        &lib,
-                        &validated_input,
-                        password,
-                    )
+                    crate::acroform_repair::repair_orphaned_widgets(&lib, validated_input, password)
                 })
                 .flatten();
             #[cfg(not(target_arch = "wasm32"))]
-            let document_input = repaired_input.as_ref().unwrap_or(&validated_input);
+            let document_input = repaired_input.as_ref().unwrap_or(validated_input);
             #[cfg(target_arch = "wasm32")]
-            let document_input = &validated_input;
+            let document_input = validated_input;
             let document = extract::load_document_from_input(&lib, document_input, password)?;
+            let total_pages = document.page_count().max(0) as u32;
             let form_type = self
                 .config
                 .extract_form_fields
@@ -475,11 +622,11 @@ impl LiteParse {
                 #[cfg(not(target_arch = "wasm32"))]
                 if repaired_input.is_some()
                     && let Ok(source) =
-                        extract::load_document_from_input(&lib, &validated_input, password)
+                        extract::load_document_from_input(&lib, validated_input, password)
                 {
-                    return crate::document_metadata::extract(&validated_input, &source);
+                    return crate::document_metadata::extract(validated_input, &source);
                 }
-                crate::document_metadata::extract(&validated_input, &document)
+                crate::document_metadata::extract(validated_input, &document)
             });
             let xfa_packets = self.config.extract_xfa_packets.then(|| {
                 document
@@ -498,15 +645,16 @@ impl LiteParse {
                     })
                     .collect::<Vec<_>>()
             });
-            let outline = extract::extract_outline(&document);
-            let (pages, images, image_error_count) = extract::extract_pages_and_images(
+            let outline = outline.unwrap_or_else(|| extract::extract_outline(&document));
+            let extracted = extract::extract_pages_and_images(
                 &document,
-                target_pages.as_deref(),
-                self.config.max_pages,
+                target_pages,
+                max_pages,
                 self.config.extract_links
                     && self.config.output_format == crate::config::OutputFormat::Markdown,
                 self.glyph_resolver.as_deref(),
                 extract::ExtractionOutputOptions {
+                    continue_on_page_error: self.config.continue_on_page_error,
                     extract_content_bounds: self.config.extract_content_bounds,
                     extract_images: self.config.effective_extract_images(),
                     // The markdown table detector splits PDFium's merged
@@ -521,50 +669,98 @@ impl LiteParse {
                     extract_structure_tree: self.config.extract_structure_tree,
                 },
             )?;
+            let extract::ExtractedPages {
+                pages,
+                page_errors,
+                images,
+                image_error_count,
+                flattened_form_widgets,
+                flattened_page_numbers,
+            } = extracted;
+            // Reopening the input costs a full parse, so it is confined to the
+            // one consumer that genuinely needs live widget annotations: the
+            // opt-in form renderer, which initializes the form environment to
+            // run document actions and paint computed field appearances that
+            // have no appearance stream to flatten.
+            //
+            // Plain rendering (screenshots) does not need it — flattening
+            // promotes the widget appearances into page content, so the
+            // raster is the same either way. Complexity likewise runs on the
+            // flattened document by design (see `is_complex`). OCR rasters
+            // render in bounded rounds after this section, each against a
+            // freshly reopened (hence pristine) document.
+            let needs_pristine_document = flattened_form_widgets
+                && self.config.extract_screenshots
+                && self.config.render_form_fields;
+            let pristine_document = needs_pristine_document
+                .then(|| extract::load_document_from_input(&lib, document_input, password))
+                .transpose()?;
+            let analysis_document = pristine_document.as_ref().unwrap_or(&document);
             let t_extract = web_time::Instant::now();
             log(&format!(
                 "[liteparse] extract: {:.1}ms ({} pages)",
                 t_extract.duration_since(t0).as_secs_f64() * 1000.0,
                 pages.len()
             ));
-            let rendered = if self.config.ocr_enabled {
-                let r = ocr_merge::render_pages_for_ocr(
-                    &document,
-                    &pages,
-                    self.config.dpi,
-                    ocr_grayscale,
-                    self.config.render_form_fields,
-                )?;
-                log(&format!(
-                    "[liteparse] ocr render: {:.1}ms ({} pages)",
-                    web_time::Instant::now()
-                        .duration_since(t_extract)
-                        .as_secs_f64()
-                        * 1000.0,
-                    r.len()
-                ));
-                r
-            } else {
-                Vec::new()
-            };
-
             let complexity = if self.config.include_complexity {
-                pages
-                    .iter()
-                    .map(|page| {
-                        let page_obj = document.page((page.page_number - 1) as i32)?;
-                        ocr_merge::calculate_page_complexity(page, &page_obj)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
+                let mut complexity = Vec::with_capacity(pages.len());
+                for page in &pages {
+                    let stats = analysis_document
+                        .page((page.page_number - 1) as i32)
+                        .map_err(LiteParseError::from)
+                        .and_then(|page_obj| ocr_merge::calculate_page_complexity(page, &page_obj));
+                    match stats {
+                        Ok(stats) => complexity.push(stats),
+                        // The page's text is already extracted; a tolerant
+                        // parse keeps it and just leaves `complexity` unset
+                        // (stats attach by page number below).
+                        Err(error) if self.config.continue_on_page_error => log(&format!(
+                            "[liteparse] complexity failed on page {}: {}",
+                            page.page_number, error
+                        )),
+                        Err(error) => return Err(error),
+                    }
+                }
+                complexity
             } else {
                 Vec::new()
             };
+            let screenshots = if self.config.extract_screenshots {
+                let page_numbers = pages
+                    .iter()
+                    .map(|page| page.page_number as u32)
+                    .collect::<Vec<_>>();
+                render::render_document_pages(
+                    analysis_document,
+                    Some(&page_numbers),
+                    self.config.dpi,
+                    self.config.detect_screenshot_rects,
+                    self.config.render_form_fields,
+                    self.config.continue_on_page_error,
+                )?
+                .into_iter()
+                .map(|page| ScreenshotResult {
+                    page_num: page.page_num,
+                    width: page.width,
+                    height: page.height,
+                    image_bytes: page.png_bytes,
+                    is_solid_fill: page.is_solid_fill,
+                    rects: page.rects,
+                })
+                .collect()
+            } else {
+                Vec::new()
+            };
+            #[cfg(target_arch = "wasm32")]
+            let repaired_input: Option<crate::types::PdfInput> = None;
             // `lib` is dropped here, releasing the PDFium lock.
             (
                 pages,
-                rendered,
+                page_errors,
+                total_pages,
                 outline,
                 images,
+                screenshots,
                 image_error_count,
                 complexity,
                 form_type,
@@ -572,22 +768,65 @@ impl LiteParse {
                 producer,
                 doc_meta,
                 xfa_packets,
+                flattened_form_widgets,
+                flattened_page_numbers,
+                repaired_input,
             )
         };
         let mut pages = pages;
         let t1 = web_time::Instant::now();
 
-        // OCR pass (engine resolved before the render block above).
         if let Some(engine) = ocr_engine {
-            ocr_merge::ocr_and_merge_rendered(
-                &mut pages,
-                ocr_rendered,
-                engine,
-                &self.config.ocr_language,
-                self.config.num_workers,
-                self.config.ocr_failure_fatal,
-            )
-            .await?;
+            let round_rasters = self.config.num_workers.max(1);
+            // Extraction may have flattened SOME pages' form widgets into
+            // page content in its (now dropped) document instance; re-apply
+            // per round on exactly those pages so the rasters match what
+            // extraction saw. With `render_form_fields` the form environment
+            // paints the widgets instead, so no re-flatten is needed.
+            let reflatten_pages: std::collections::HashSet<u32> =
+                if flattened_form_widgets && !self.config.render_form_fields {
+                    flattened_page_numbers.iter().copied().collect()
+                } else {
+                    std::collections::HashSet::new()
+                };
+            let ocr_input = repaired_input.as_ref().unwrap_or(validated_input);
+            let mut round_start = 0usize;
+            while round_start < pages.len() {
+                let (rendered, next_start) = {
+                    let lib = Library::init();
+                    let document = extract::load_document_from_input(&lib, ocr_input, password)?;
+                    ocr_merge::render_pages_for_ocr(
+                        &document,
+                        &pages,
+                        round_start,
+                        round_rasters,
+                        self.config.dpi,
+                        ocr_grayscale,
+                        self.config.render_form_fields,
+                        self.config.continue_on_page_error,
+                        &reflatten_pages,
+                    )?
+                    // `lib` drops here, releasing the PDFium lock before the
+                    // engine's async recognition below.
+                };
+                round_start = next_start;
+                if rendered.is_empty() {
+                    // The scan reached the end without finding another page
+                    // that needs OCR.
+                    continue;
+                }
+                // `RenderedPage::idx` is absolute, so the whole slice is
+                // passed regardless of where this round started.
+                ocr_merge::ocr_and_merge_rendered(
+                    &mut pages,
+                    rendered,
+                    engine.clone(),
+                    &self.config.ocr_language,
+                    self.config.num_workers,
+                    self.config.ocr_failure_fatal,
+                )
+                .await?;
+            }
         }
         let t_ocr = web_time::Instant::now();
         log(&format!(
@@ -609,7 +848,14 @@ impl LiteParse {
 
         // Attach per-page complexity signals, including the layout signals
         // that need the projected page (same as `is_complex()` reports).
-        for (page, mut stats) in parsed_pages.iter_mut().zip(complexity) {
+        // Matched by page number, not position: a tolerant parse may have no
+        // stats for a page whose complexity pass failed.
+        let mut complexity = complexity.into_iter().peekable();
+        for page in parsed_pages.iter_mut() {
+            let Some(mut stats) = complexity.next_if(|stats| stats.page_number == page.page_number)
+            else {
+                continue;
+            };
             stats.layout = Some(ocr_merge::calculate_layout_complexity(page));
             page.complexity = Some(stats);
         }
@@ -619,17 +865,8 @@ impl LiteParse {
             t2.duration_since(t_ocr).as_secs_f64() * 1000.0
         ));
 
-        let mut full_text = if self.config.output_format == crate::config::OutputFormat::Markdown {
-            let page_md = markdown::format_markdown_pages(
-                &parsed_pages,
-                &outline,
-                self.config.image_mode,
-                self.config.keep_headers_footers,
-            );
-            let md = page_md.join("\n\n-----\n\n");
-            for (page, md) in parsed_pages.iter_mut().zip(page_md) {
-                page.markdown = md;
-            }
+        let laid_out = apply_layout(&self.config, &mut parsed_pages, &outline);
+        let mut full_text = if let Some(md) = laid_out {
             let t3 = web_time::Instant::now();
             log(&format!(
                 "[liteparse] markdown: {:.1}ms",
@@ -658,10 +895,13 @@ impl LiteParse {
         }
 
         Ok(ParseResult {
+            total_pages,
             pages: parsed_pages,
+            page_errors,
             text: full_text,
             outline,
             images,
+            screenshots,
             image_error_count,
             form_type,
             creator,
@@ -680,19 +920,10 @@ impl LiteParse {
     /// is fully synchronous. Used when an external extractor (e.g. with its
     /// own font-recovery pipeline) owns text extraction.
     pub fn parse_from_pages(&self, pages: Vec<Page>, outline: Vec<OutlineTarget>) -> ParseResult {
+        let total_pages = pages.len().min(u32::MAX as usize) as u32;
         let mut parsed_pages = projection::project_pages_to_grid(pages);
 
-        let full_text = if self.config.output_format == crate::config::OutputFormat::Markdown {
-            let page_md = markdown::format_markdown_pages(
-                &parsed_pages,
-                &outline,
-                self.config.image_mode,
-                self.config.keep_headers_footers,
-            );
-            let md = page_md.join("\n\n-----\n\n");
-            for (page, md) in parsed_pages.iter_mut().zip(page_md) {
-                page.markdown = md;
-            }
+        let full_text = if let Some(md) = apply_layout(&self.config, &mut parsed_pages, &outline) {
             md
         } else {
             parsed_pages
@@ -703,10 +934,13 @@ impl LiteParse {
         };
 
         ParseResult {
+            total_pages,
             pages: parsed_pages,
+            page_errors: Vec::new(),
             text: full_text,
             outline,
             images: Vec::new(),
+            screenshots: Vec::new(),
             image_error_count: 0,
             form_type: None,
             creator: None,
@@ -723,18 +957,18 @@ impl LiteParse {
     fn select_block_pages(
         &self,
         pages: Vec<Page>,
-        page_blocks: Vec<Vec<crate::markdown_layout::Block>>,
+        page_blocks: Vec<Vec<crate::markdown_layout::PositionedBlock>>,
         complexity: Vec<Option<crate::ocr_merge::PageComplexityStats>>,
     ) -> Result<
         (
             Vec<Page>,
-            Vec<Vec<crate::markdown_layout::Block>>,
+            Vec<Vec<crate::markdown_layout::PositionedBlock>>,
             Vec<Option<crate::ocr_merge::PageComplexityStats>>,
             bool,
         ),
         LiteParseError,
     > {
-        let mut selected: Vec<((Page, Vec<crate::markdown_layout::Block>), _)> =
+        let mut selected: Vec<((Page, Vec<crate::markdown_layout::PositionedBlock>), _)> =
             pages.into_iter().zip(page_blocks).zip(complexity).collect();
         let mut page_filtered = false;
         if let Some(targets) = self.resolve_target_pages()? {
@@ -767,6 +1001,11 @@ impl LiteParse {
     /// PDFium or OCR and is fully synchronous; text items arrive in viewport
     /// space (top-left origin, 72 DPI). `page_blocks` must align 1:1 with
     /// `pages`; `page_stats` carries per-page complexity (or `None`s).
+    /// Blocks arrive as [`PositionedBlock`](crate::markdown_layout::
+    /// PositionedBlock)s — a producer without per-block geometry wraps each
+    /// with `PositionedBlock::unlocated`. When `extract_blocks` is on, the
+    /// supplied blocks (and their boxes) also populate each page's `blocks`,
+    /// mirroring the classifier path.
     ///
     /// Doc-level markdown renders from `all_blocks` when given, NOT by
     /// joining the page renders: `render_blocks` is context-sensitive across
@@ -779,12 +1018,14 @@ impl LiteParse {
     pub fn parse_from_blocks(
         &self,
         pages: Vec<Page>,
-        page_blocks: Vec<Vec<crate::markdown_layout::Block>>,
-        all_blocks: Option<Vec<crate::markdown_layout::Block>>,
+        page_blocks: Vec<Vec<crate::markdown_layout::PositionedBlock>>,
+        all_blocks: Option<Vec<crate::markdown_layout::PositionedBlock>>,
         outline: Vec<OutlineTarget>,
         images: Vec<crate::types::ExtractedImage>,
         page_stats: Vec<Option<crate::ocr_merge::PageComplexityStats>>,
     ) -> Result<ParseResult, LiteParseError> {
+        // Reported before page filtering, matching every other path.
+        let total_pages = pages.len().min(u32::MAX as usize) as u32;
         let (pages, page_blocks, page_stats, page_filtered) =
             self.select_block_pages(pages, page_blocks, page_stats)?;
         let all_blocks = if page_filtered { None } else { all_blocks };
@@ -794,6 +1035,14 @@ impl LiteParse {
         for ((page, blocks), stats) in parsed_pages.iter_mut().zip(&page_blocks).zip(page_stats) {
             if markdown_out {
                 page.markdown = crate::markdown_layout::render_blocks(blocks);
+            }
+            if self.config.extract_blocks {
+                page.blocks = Some(
+                    blocks
+                        .iter()
+                        .map(crate::layout::LayoutBlock::from)
+                        .collect(),
+                );
             }
             page.complexity = stats;
             if !self.config.extract_content_bounds {
@@ -819,10 +1068,13 @@ impl LiteParse {
         };
 
         Ok(ParseResult {
+            total_pages,
             pages: parsed_pages,
+            page_errors: Vec::new(),
             text: full_text,
             outline,
             images,
+            screenshots: Vec::new(),
             image_error_count: 0,
             form_type: None,
             creator: None,
@@ -896,6 +1148,118 @@ impl LiteParse {
 
     pub fn config(&self) -> &LiteParseConfig {
         &self.config
+    }
+
+    /// Open a document for bounded-memory batch parsing.
+    ///
+    /// Returns an error if `target_pages` is configured — an explicit page
+    /// selection and generated batch ranges would be ambiguous together.
+    pub async fn open_batch_session(
+        &self,
+        input: PdfInput,
+        batch_size: usize,
+    ) -> Result<ParseSession, LiteParseError> {
+        self.validate_output_config()?;
+        if self.config.target_pages.is_some() {
+            return Err(LiteParseError::Config(
+                "batch parsing cannot be combined with target_pages".to_string(),
+            ));
+        }
+        if batch_size == 0 {
+            return Err(LiteParseError::Config(
+                "batch size must be at least 1".to_string(),
+            ));
+        }
+
+        let input = self.resolve_input(input).await?;
+        // One cheap open (a few ms even for a 100 MB file — PDFium maps the
+        // file and parses the xref rather than reading it) so the caller knows
+        // the page count before the first batch is parsed, and so the
+        // document-level bookmark walk is paid once instead of per batch.
+        let (total_pages, outline) = {
+            let lib = Library::init();
+            let document = extract::load_document_from_input(
+                &lib,
+                &input.input,
+                self.config.password.as_deref(),
+            )?;
+            (
+                document.page_count().max(0) as u32,
+                extract::extract_outline(&document),
+            )
+        };
+
+        Ok(ParseSession {
+            page_limit: total_pages.min(self.config.max_pages.min(u32::MAX as usize) as u32),
+            parser: self.clone(),
+            input,
+            total_pages,
+            outline,
+            next_page: 1,
+            batch_size,
+        })
+    }
+}
+
+/// A document opened once and parsed in bounded page batches.
+pub struct ParseSession {
+    parser: LiteParse,
+    input: ResolvedInput,
+    total_pages: u32,
+    /// Walked once at open. Document-level, so every batch reports the same
+    /// outline, and re-walking it per batch would dominate batching overhead.
+    outline: Vec<OutlineTarget>,
+    /// Last source page this session will parse: `min(total_pages, max_pages)`.
+    page_limit: u32,
+    /// Next source page to parse, 1-based.
+    next_page: u32,
+    batch_size: usize,
+}
+
+/// One batch of pages from a [`ParseSession`].
+pub struct ParseBatch {
+    /// First source page in this batch, 1-based.
+    pub start_page: u32,
+    /// Last source page in this batch, 1-based and inclusive.
+    pub end_page: u32,
+    /// The pages in `start_page..=end_page`, parsed as an ordinary result.
+    pub result: ParseResult,
+}
+
+impl ParseSession {
+    /// Total pages in the source document, before `max_pages` or batching.
+    pub fn total_pages(&self) -> u32 {
+        self.total_pages
+    }
+
+    /// Parse and return the next batch, or `None` once every page within
+    /// `max_pages` has been yielded.
+    pub async fn next_batch(&mut self) -> Result<Option<ParseBatch>, LiteParseError> {
+        if self.next_page > self.page_limit {
+            return Ok(None);
+        }
+        let start_page = self.next_page;
+        let end_page = start_page
+            .saturating_add(self.batch_size.min(u32::MAX as usize) as u32 - 1)
+            .min(self.page_limit);
+        let targets: Vec<u32> = (start_page..=end_page).collect();
+
+        let result = self
+            .parser
+            .parse_resolved(
+                &self.input,
+                Some(&targets),
+                targets.len(),
+                Some(self.outline.clone()),
+            )
+            .await?;
+
+        self.next_page = end_page.saturating_add(1);
+        Ok(Some(ParseBatch {
+            start_page,
+            end_page,
+            result,
+        }))
     }
 }
 
@@ -975,12 +1339,12 @@ mod tests {
     /// renders from `all_blocks` rather than a page join.
     #[test]
     fn parse_from_blocks_renders_blocks_and_projects_text() {
-        use crate::markdown_layout::Block;
+        use crate::markdown_layout::{Block, PositionedBlock};
 
-        let blocks = vec![Block::Heading {
+        let blocks = vec![PositionedBlock::unlocated(Block::Heading {
             level: 1,
             text: "hello".into(),
-        }];
+        })];
         let result = LiteParse::new(LiteParseConfig {
             output_format: crate::config::OutputFormat::Markdown,
             ..Default::default()
@@ -1006,19 +1370,19 @@ mod tests {
     /// filtered pages' content) and falls back to joining survivors.
     #[test]
     fn parse_from_blocks_page_filter_drops_all_blocks() {
-        use crate::markdown_layout::Block;
+        use crate::markdown_layout::{Block, PositionedBlock};
 
         let mut p2 = page_with_text_metadata();
         p2.page_number = 2;
         p2.text_items[0].text = "world".into();
-        let b1 = vec![Block::Heading {
+        let b1 = vec![PositionedBlock::unlocated(Block::Heading {
             level: 1,
             text: "hello".into(),
-        }];
-        let b2 = vec![Block::Heading {
+        })];
+        let b2 = vec![PositionedBlock::unlocated(Block::Heading {
             level: 1,
             text: "world".into(),
-        }];
+        })];
         let all = b1.iter().chain(&b2).cloned().collect::<Vec<_>>();
         let result = LiteParse::new(LiteParseConfig {
             output_format: crate::config::OutputFormat::Markdown,
@@ -1152,6 +1516,7 @@ mod tests {
             annotations: None,
             form_fields: None,
             structure_tree: None,
+            blocks: None,
         }];
         let mut full_text = pages[0].markdown.clone();
         let images = vec![
@@ -1165,5 +1530,52 @@ mod tests {
         // refs and surrounding text are untouched.
         assert_eq!(pages[0].markdown, "intro\n\n![](img_p1_1.jpg)\n\noutro");
         assert_eq!(full_text, pages[0].markdown);
+    }
+
+    /// A non-PDF source is converted exactly once, when the session opens:
+    /// the converted temporary PDF outlives every batch and is only removed
+    /// when the session is dropped. Lives here rather than in the integration
+    /// tests because it asserts against [`ResolvedInput`] internals.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_batch_session_owns_converted_source_for_its_lifetime() {
+        if std::env::var("SKIP_INTEGRATION_TESTS").as_deref() == Ok("yes") {
+            return;
+        }
+        let parser = LiteParse::new(LiteParseConfig {
+            ocr_enabled: false,
+            quiet: true,
+            ..LiteParseConfig::default()
+        });
+        let mut session = parser
+            .open_batch_session(
+                PdfInput::Path("../../integration_tests_data/sample3.doc".to_string()),
+                1,
+            )
+            .await
+            .expect("should convert and open a .doc");
+
+        assert!(session.input.is_converted());
+        let converted_path = match &session.input.input {
+            PdfInput::Path(p) => p.clone(),
+            PdfInput::Bytes(_) => panic!("a converted .doc should resolve to a temp file path"),
+        };
+
+        let mut pages = 0;
+        while let Some(batch) = session.next_batch().await.expect("batch should parse") {
+            pages += batch.result.pages.len();
+            assert!(
+                std::path::Path::new(&converted_path).exists(),
+                "converted temp PDF should outlive every batch — a missing file \
+                 would mean it was re-resolved or cleaned up per batch"
+            );
+        }
+        assert_eq!(pages, 2);
+
+        drop(session);
+        assert!(
+            !std::path::Path::new(&converted_path).exists(),
+            "dropping the session should clean up the converted temp PDF"
+        );
     }
 }

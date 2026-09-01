@@ -55,6 +55,7 @@ By default, JSON output contains only text, geometry, and page metadata. Each op
 | `--extract-annotations` | `pages[].annotations` | PDF annotations: subtype, contents, timestamps, rects, link URIs |
 | `--extract-form-fields` | `pages[].form_fields` | AcroForm widgets: type, name, value, flags, options, rect |
 | `--extract-structure-tree` | `pages[].structure_tree` | Tagged-PDF logical structure tree (`{ roots }`), including per-element attributes |
+| `--extract-blocks` | `pages[].blocks` | Classified layout blocks in reading order (headings, paragraphs, list items, tables with per-cell boxes, code, rules, figures), each with a bounding box |
 | `--extract-content-bounds` | `pages[].content_bounds` | Bounding box of actual content on the page, as a `Rect` |
 | `--extract-xfa-packets` | `xfa_packets[]` (document level) | Raw XFA packets from XFA-based forms |
 | `--extract-text-metadata` | extra keys on each `text_items[]` entry | Rich per-item typography: `font_height`, `font_ascent`, `font_descent`, `font_weight`, `text_width`, `font_is_buggy`, `mcid`, `fill_color`, `stroke_color`, plus `rotation` |
@@ -139,7 +140,7 @@ lit batch-parse [options] <input-dir> <output-dir>
 | `--password <password>` | Password for encrypted/protected documents (applied to all files) | — |
 | `-q, --quiet` | Suppress progress output | — |
 
-`batch-parse` accepts the same [extraction options](#extraction-options) as `lit parse`: `--extract-images`, `--extract-vector-graphics`, `--extract-annotations`, `--extract-form-fields`, `--extract-structure-tree`, `--extract-content-bounds`, `--extract-xfa-packets`, `--extract-text-metadata`, and `--complexity`.
+`batch-parse` accepts the same [extraction options](#extraction-options) as `lit parse`: `--extract-images`, `--extract-vector-graphics`, `--extract-annotations`, `--extract-form-fields`, `--extract-structure-tree`, `--extract-blocks`, `--extract-content-bounds`, `--extract-xfa-packets`, `--extract-text-metadata`, and `--complexity`.
 
 It does **not** accept `--target-pages`, `--preserve-small-text`, `--image-mode`, `--image-output-dir`, `--no-links`, or `--keep-headers-footers`. Use `lit parse` per file when you need those.
 

@@ -1,6 +1,6 @@
 ---
 title: Extraction Options
-description: Opt-in flags that add images, vector graphics, annotations, form fields, structure trees, and typography metadata to LiteParse output.
+description: Opt-in flags that add images, vector graphics, annotations, form fields, structure trees, layout blocks, and typography metadata to LiteParse output.
 sidebar:
   order: 3
 ---
@@ -20,6 +20,7 @@ This keeps the default output shape small, stable, and cheap to produce. It also
 | `extract_annotations` / `--extract-annotations` | `extractAnnotations` | `pages[].annotations` |
 | `extract_form_fields` / `--extract-form-fields` | `extractFormFields` | `pages[].form_fields` |
 | `extract_structure_tree` / `--extract-structure-tree` | `extractStructureTree` | `pages[].structure_tree` |
+| `extract_blocks` / `--extract-blocks` | `extractBlocks` | `pages[].blocks` |
 | `extract_content_bounds` / `--extract-content-bounds` | `extractContentBounds` | `pages[].content_bounds` |
 | `extract_xfa_packets` / `--extract-xfa-packets` | `extractXfaPackets` | `xfa_packets[]` |
 | `extract_text_metadata` / `--extract-text-metadata` | `extractTextMetadata` | extra keys on `text_items[]` |
@@ -255,6 +256,101 @@ Related: `render_form_fields` draws filled-in field appearances into rendered ra
 
 `marked_content_ids` join back to the `mcid` field on text items (available with `extract_text_metadata`), letting you map reconstructed text to its authored role.
 
+## Layout blocks
+
+`extract_blocks` returns the page decomposed into blocks — headings, paragraphs, list items, tables, code, rules, and figures — each with the region of the page it came from. This is the same classification the Markdown renderer runs on.
+
+```bash
+lit parse document.pdf --format json --extract-blocks
+```
+
+Only the fields that apply to a block's `kind` are present:
+
+```json
+{
+  "kind": "heading",
+  "text": "Quarterly Report",
+  "level": 1,
+  "bbox": { "x": 72.0, "y": 114.88, "width": 284.0, "height": 21.0 }
+}
+```
+
+| Field | Kinds | Meaning |
+|-------|-------|---------|
+| `kind` | all | `heading`, `paragraph`, `list_item`, `code`, `table`, `grid_fallback`, `rule`, `figure` |
+| `bbox` | all | Region occupied, in the same coordinate space as `text_items` |
+| `text` | `heading`, `paragraph`, `list_item` | Rendered text |
+| `level` | `heading`, `list_item` | Heading level 1–6, or list nesting depth |
+| `bold`, `italic` | `paragraph`, `list_item` | Set when the whole block is emphasized |
+| `ordered`, `marker` | `list_item` | Whether the list is ordered, and the marker as it appeared (`138.`, `iii)`, `•`) |
+| `lines`, `lang` | `code`, `grid_fallback` | Verbatim source lines, and a best-effort language hint |
+| `header`, `rows` | `table` | Cells, each with its own `text` and `bbox` |
+| `id`, `format` | `figure` | Matches the `img_{id}.{format}` target in Markdown output |
+
+`bbox` is the union of every source line that fed the block, so a wrapped heading or multi-line paragraph reports the whole band it occupies — not just its first line.
+
+### Tables
+
+Table cells are objects, not bare strings: each carries its own `bbox`, so a cell maps back to the region it was read from.
+
+```json
+{
+  "kind": "table",
+  "bbox": { "x": 67.9, "y": 511.1, "width": 458.4, "height": 111.0 },
+  "header": [
+    { "text": "Title of each class", "bbox": { "x": 132.7, "y": 511.1, "width": 64.0, "height": 8.0 } },
+    { "text": "Trading symbol(s)",   "bbox": { "x": 288.7, "y": 511.1, "width": 35.0, "height": 8.0 } }
+  ],
+  "rows": [
+    [
+      { "text": "Common Stock", "bbox": { "x": 67.9, "y": 522.4, "width": 193.0, "height": 9.5 } },
+      { "text": "AAPL",         "bbox": { "x": 293.8, "y": 522.4, "width": 24.0, "height": 9.5 } }
+    ]
+  ]
+}
+```
+
+For a ruled table, a cell's box is the drawn grid cell. For a borderless one, it is the extent of the spans the cell was built from. Cells that exist only to square off a ragged grid have no `bbox` — there is no ink behind them.
+
+Getting a table into a dataframe is then a two-line transform:
+
+<Tabs>
+<TabItem label="Python" value="python">
+
+```python
+import pandas as pd
+from liteparse import LiteParse
+
+result = LiteParse(extract_blocks=True).parse("10-k.pdf")
+
+for page in result.pages:
+    for block in page.blocks or []:
+        if block.kind == "table":
+            df = pd.DataFrame(
+                [[c.text for c in row] for row in block.rows],
+                columns=[c.text for c in block.header or []],
+            )
+```
+
+</TabItem>
+<TabItem label="TypeScript" value="typescript">
+
+```typescript
+import { LiteParse } from "@llamaindex/liteparse";
+
+const { pages } = await new LiteParse({ extractBlocks: true }).parse("10-k.pdf");
+
+for (const page of pages) {
+  for (const block of page.blocks ?? []) {
+    if (block.kind !== "table") continue;
+    const grid = [block.header ?? [], ...block.rows].map((r) => r.map((c) => c.text));
+  }
+}
+```
+
+</TabItem>
+</Tabs>
+
 ## Text metadata
 
 `extract_text_metadata` enriches every entry in `text_items[]` with typography detail. Without it, a text item carries only `text`, `x`, `y`, `width`, `height`, `font_name`, and `font_size`.
@@ -363,5 +459,6 @@ parser = LiteParse(crop_box=(0.1, 0.0, 0.05, 0.0))
 
 - [Document complexity](/liteparse/guides/complexity/): Route documents before you parse them.
 - [Markdown output](/liteparse/guides/markdown/): Images, links, and header/footer handling in markdown.
+- [Visual citations](/liteparse/guides/visual-citations/): Turn block and text-item boxes into highlights on the rendered page.
 - [CLI reference](/liteparse/cli-reference/): Every flag, per command.
 - [API reference](/liteparse/api/): Full `LiteParseConfig` field list.

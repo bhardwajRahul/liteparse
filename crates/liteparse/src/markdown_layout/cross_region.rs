@@ -10,9 +10,18 @@
 //! failed candidate leaves the page untouched, so the V-cut's wins on
 //! multi-column prose are preserved.
 
-use super::blocks::Block;
+use super::blocks::{Block, Cell};
 use super::tables::{TableRun, detect_tables};
-use crate::types::ProjectedLine;
+use crate::types::{ProjectedLine, Rect};
+
+/// Union of the boxes of every line in `lines`, or `None` when empty.
+fn union_line_rects(lines: &[&ProjectedLine]) -> Option<Rect> {
+    let mut out: Option<Rect> = None;
+    for l in lines {
+        Rect::extend(&mut out, &l.bbox);
+    }
+    out
+}
 
 /// Minimum fraction of the smaller side's y-band that must overlap the other
 /// side's. Side-by-side table halves overlap almost fully; a sidebar next to
@@ -290,7 +299,7 @@ fn validate_via_detectors(merged: &[ProjectedLine]) -> Option<Vec<TableRun>> {
                 let (mut cells, mut long) = (0usize, 0usize);
                 for row in rows {
                     for cell in row {
-                        let t = cell.trim();
+                        let t = cell.text.trim();
                         if t.is_empty() {
                             continue;
                         }
@@ -321,7 +330,10 @@ fn validate_via_detectors(merged: &[ProjectedLine]) -> Option<Vec<TableRun>> {
 /// continues the label cell, right-side lines append to the current row's
 /// description cell.
 fn try_two_col_direct(clusters: &[Cluster], merged_len: usize, tol: f32) -> Option<Vec<TableRun>> {
-    let mut rows: Vec<(String, String, bool)> = Vec::new(); // (left, right, bold)
+    // (left, right, bold). Each side's cell box is the union of the lines that
+    // fed it, so wrapped labels and multi-line descriptions report the full band
+    // they occupy rather than just their first line.
+    let mut rows: Vec<(Cell, Cell, bool)> = Vec::new();
     let mut last_label_bottom: Option<f32> = None;
 
     for cluster in clusters {
@@ -347,15 +359,26 @@ fn try_two_col_direct(clusters: &[Cluster], merged_len: usize, tol: f32) -> Opti
                 (Some(lb), Some(_)) => top - lb <= CR_LABEL_WRAP_GAP_FACTOR * h.min(tol * 2.0),
                 _ => false,
             };
+            let left_rect = union_line_rects(&cluster.left);
             if wraps {
                 let row = rows.last_mut().unwrap();
-                if !row.0.is_empty() {
-                    row.0.push(' ');
+                if !row.0.text.is_empty() {
+                    row.0.text.push(' ');
                 }
-                row.0.push_str(&text);
+                row.0.text.push_str(&text);
+                if let Some(r) = &left_rect {
+                    Rect::extend(&mut row.0.bbox, r);
+                }
             } else {
                 let bold = cluster.left.iter().all(|l| l.all_bold);
-                rows.push((text, String::new(), bold));
+                rows.push((
+                    Cell {
+                        text,
+                        bbox: left_rect,
+                    },
+                    Cell::default(),
+                    bold,
+                ));
             }
             last_label_bottom = Some(bottom);
         }
@@ -367,13 +390,16 @@ fn try_two_col_direct(clusters: &[Cluster], merged_len: usize, tol: f32) -> Opti
                 .collect::<Vec<_>>()
                 .join(" ");
             if rows.is_empty() {
-                rows.push((String::new(), String::new(), false));
+                rows.push((Cell::default(), Cell::default(), false));
             }
             let row = rows.last_mut().unwrap();
-            if !row.1.is_empty() {
-                row.1.push(' ');
+            if !row.1.text.is_empty() {
+                row.1.text.push(' ');
             }
-            row.1.push_str(&text);
+            row.1.text.push_str(&text);
+            if let Some(r) = &union_line_rects(&cluster.right) {
+                Rect::extend(&mut row.1.bbox, r);
+            }
         }
     }
 
@@ -384,13 +410,13 @@ fn try_two_col_direct(clusters: &[Cluster], merged_len: usize, tol: f32) -> Opti
     // sentences is prose the anti-prose gate missed.
     if rows
         .iter()
-        .any(|(l, _, _)| l.chars().count() > CR_LABEL_MAX_CHARS)
+        .any(|(l, _, _)| l.text.chars().count() > CR_LABEL_MAX_CHARS)
     {
         return None;
     }
     let both = rows
         .iter()
-        .filter(|(l, r, _)| !l.is_empty() && !r.is_empty())
+        .filter(|(l, r, _)| !l.text.is_empty() && !r.text.is_empty())
         .count();
     if both < 2 {
         return None;
@@ -400,16 +426,16 @@ fn try_two_col_direct(clusters: &[Cluster], merged_len: usize, tol: f32) -> Opti
     // header-ish words ("Area" / "Competence").
     let header = {
         let (l, r, bold) = &rows[0];
-        if !l.is_empty()
-            && !r.is_empty()
-            && (*bold || (l.chars().count() <= 20 && r.chars().count() <= 20))
+        if !l.text.is_empty()
+            && !r.text.is_empty()
+            && (*bold || (l.text.chars().count() <= 20 && r.text.chars().count() <= 20))
         {
             Some(vec![l.clone(), r.clone()])
         } else {
             None
         }
     };
-    let body: Vec<Vec<String>> = rows
+    let body: Vec<Vec<Cell>> = rows
         .iter()
         .skip(if header.is_some() { 1 } else { 0 })
         .map(|(l, r, _)| vec![l.clone(), r.clone()])
@@ -417,10 +443,20 @@ fn try_two_col_direct(clusters: &[Cluster], merged_len: usize, tol: f32) -> Opti
     if body.len() < 2 {
         return None;
     }
+    // The run's line indices address the synthetic fused rows, not the page, so
+    // its region comes from the clusters the rows were built from.
+    let bbox = clusters
+        .iter()
+        .flat_map(|c| c.members())
+        .fold(None, |mut acc: Option<Rect>, l| {
+            Rect::extend(&mut acc, &l.bbox);
+            acc
+        });
     Some(vec![TableRun {
         start: 0,
         end: merged_len,
         body_start: if header.is_some() { 1 } else { 0 },
+        bbox,
         block: Block::Table { header, rows: body },
     }])
 }
@@ -732,12 +768,15 @@ mod tests {
         assert_eq!(m.runs.len(), 1);
         match &m.runs[0].block {
             Block::Table { header, rows } => {
-                assert_eq!(
-                    header.as_deref(),
-                    Some(&["Area".to_string(), "Competence".to_string()][..])
-                );
+                let header_texts: Vec<&str> = header
+                    .as_ref()
+                    .expect("header should be present")
+                    .iter()
+                    .map(|c| c.as_str())
+                    .collect();
+                assert_eq!(header_texts, ["Area", "Competence"]);
                 assert_eq!(rows.len(), 3);
-                assert!(rows[0][1].contains("1.1 Valuing sustainability"));
+                assert!(rows[0][1].text.contains("1.1 Valuing sustainability"));
             }
             other => panic!("expected table, got {other:?}"),
         }

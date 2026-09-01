@@ -1,6 +1,6 @@
 use crate::types::{GraphicPrimitive, ProjectedLine, Rect, TextItem};
 
-use super::blocks::Block;
+use super::blocks::{Block, Cell};
 use super::paragraphs::collapse_whitespace;
 use crate::projection::is_bold_item;
 
@@ -272,6 +272,39 @@ pub(super) struct TableRun {
     /// re-extraction pass must not re-bin those header lines as body rows.
     pub(super) body_start: usize,
     pub(super) block: Block,
+    /// Region the whole table occupies. For ruled tables this is the drawn
+    /// grid; for the borderless detectors it is the union of the lines the run
+    /// consumed. `None` when the run was built without geometry (tests, and
+    /// synthetic merges with nothing to measure).
+    pub(super) bbox: Option<Rect>,
+}
+
+/// Union of the boxes of `lines[start..end]` — the region a table run covers
+/// when it has no drawn grid to fall back on.
+fn lines_bbox(lines: &[ProjectedLine], start: usize, end: usize) -> Option<Rect> {
+    let mut out: Option<Rect> = None;
+    for l in lines.get(start..end.min(lines.len()))? {
+        Rect::extend(&mut out, &l.bbox);
+    }
+    out
+}
+
+/// Region occupied by one borderless-table cell: its own x-extent (tracked by
+/// `split_cells` from the spans it absorbed) crossed with the vertical band of
+/// the line it sits on. A borderless table has no ruled boundaries, so a cell
+/// covers exactly the ink of its spans — not a full column track.
+fn cell_rect(cell: &TableCell, line: &ProjectedLine) -> Rect {
+    Rect {
+        x: cell.start_x,
+        y: line.bbox.y,
+        width: (cell.end_x - cell.start_x).max(0.0),
+        height: line.bbox.height,
+    }
+}
+
+/// Build a located `Cell` from a `TableCell` and its owning line.
+fn located_cell(cell: &TableCell, line: &ProjectedLine) -> Cell {
+    Cell::located(cell.text.clone(), cell_rect(cell, line))
 }
 
 /// Split a `ProjectedLine`'s spans into cells. A gap larger than
@@ -895,14 +928,19 @@ fn finalize_table_run(
         Some((hstart, header_texts)) => (hstart, Some(header_texts), 0),
         None if bold_header_qualifies => (
             start_idx,
-            Some(first_row.iter().map(|c| c.text.clone()).collect()),
+            Some(
+                first_row
+                    .iter()
+                    .map(|c| located_cell(c, rows[0].1))
+                    .collect(),
+            ),
             1,
         ),
         None => (start_idx, None, 0),
     };
-    let body_rows: Vec<Vec<String>> = rows[row_start..]
+    let body_rows: Vec<Vec<Cell>> = rows[row_start..]
         .iter()
-        .map(|(_, _, cells)| cells.iter().map(|c| c.text.clone()).collect())
+        .map(|(_, line, cells)| cells.iter().map(|c| located_cell(c, line)).collect())
         .collect();
     if header.is_none() && body_rows.len() < TABLE_MIN_ROWS {
         return None;
@@ -924,6 +962,7 @@ fn finalize_table_run(
         start: run_start,
         end,
         body_start: start_idx,
+        bbox: lines_bbox(lines, run_start, end),
         block: Block::Table {
             header,
             rows: body_rows,
@@ -1173,7 +1212,7 @@ fn two_row_run_plausible(lines: &[ProjectedLine], run: &TableRun) -> bool {
 
     let mut non_empty = 0;
     for cell in header {
-        let t = cell.trim();
+        let t = cell.text.trim();
         if t.is_empty() {
             continue;
         }
@@ -1320,7 +1359,20 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
                 .filter(|c| match_track_idx(c, &track_ranges).is_some())
                 .cloned()
                 .collect();
-            if kept.len() == column_count {
+            // Only cells sitting entirely outside the table's x-extent can be
+            // foreign page-column bleed. A cell that lands *between* two
+            // established tracks is in-table content, so discarding it would
+            // silently lose document text — break the run instead and let the
+            // wider row seed its own table.
+            let first_track_x = track_ranges
+                .first()
+                .map(|r| r.0)
+                .unwrap_or(f32::NEG_INFINITY);
+            let extras_all_outside = cells
+                .iter()
+                .filter(|c| match_track_idx(c, &track_ranges).is_none())
+                .all(|c| c.end_x < first_track_x || c.start_x > tracks_right_edge);
+            if kept.len() == column_count && extras_all_outside {
                 cells = kept;
             } else {
                 break;
@@ -1365,6 +1417,7 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
             start: start_idx,
             end,
             body_start: start_idx,
+            bbox: lines_bbox(lines, start_idx, end),
             block: Block::GridFallback { lines: raw },
         });
     }
@@ -1395,9 +1448,12 @@ fn absorb_header_lines(
     track_ranges: &[(f32, f32)],
     column_count: usize,
     floor: usize,
-) -> Option<(usize, Vec<String>)> {
+) -> Option<(usize, Vec<Cell>)> {
     let dbgt = *super::flags::DEBUG_TABLE;
-    let mut absorbed: Vec<Vec<TableCell>> = Vec::new();
+    // Line index is kept alongside the cells so the assembled header cells can
+    // report the band they were read from — a wrapped header spans every line
+    // that contributed to it, not just the last one.
+    let mut absorbed: Vec<(usize, Vec<TableCell>)> = Vec::new();
     let mut j = start_idx;
     while j > floor {
         let cand = j - 1;
@@ -1458,7 +1514,7 @@ fn absorb_header_lines(
         if !all_align {
             break;
         }
-        absorbed.push(cells);
+        absorbed.push((cand, cells));
         j = cand;
     }
     if absorbed.is_empty() {
@@ -1466,16 +1522,17 @@ fn absorb_header_lines(
     }
     // Collected bottom-up; reverse so text reads top-to-bottom per column.
     absorbed.reverse();
-    let mut header = vec![String::new(); column_count];
-    for cells in &absorbed {
+    let mut header = vec![Cell::default(); column_count];
+    for (line_idx, cells) in &absorbed {
         for c in cells {
             let Some(idx) = match_track_idx(c, track_ranges) else {
                 continue;
             };
-            if !header[idx].is_empty() && !c.text.is_empty() {
-                header[idx].push(' ');
+            if !header[idx].text.is_empty() && !c.text.is_empty() {
+                header[idx].text.push(' ');
             }
-            header[idx].push_str(&c.text);
+            header[idx].text.push_str(&c.text);
+            Rect::extend(&mut header[idx].bbox, &cell_rect(c, &lines[*line_idx]));
         }
     }
     Some((j, header))
@@ -1634,7 +1691,7 @@ pub(crate) fn validated_ruled_table_rects(
                 x1 = x1.max(b.x + b.width);
                 y1 = y1.max(b.y + b.height);
             }
-            (x1 > x0 && y1 > y0).then_some(Rect {
+            (x1 > x0 && y1 > y0).then(|| Rect {
                 x: x0,
                 y: y0,
                 width: x1 - x0,
@@ -1931,8 +1988,11 @@ fn try_detect_description_list(lines: &[ProjectedLine], start_idx: usize) -> Opt
         return None;
     }
 
-    let mut rows: Vec<(usize, String, String)> =
-        vec![(start_idx, first[0].text.clone(), first[1].text.clone())];
+    let mut rows: Vec<(usize, Cell, Cell)> = vec![(
+        start_idx,
+        located_cell(&first[0], &lines[start_idx]),
+        located_cell(&first[1], &lines[start_idx]),
+    )];
     // Track how many rows came from the *actual* 2-cell path (i.e. PDFium
     // emitted two distinct spans with a clear gap). The merged-span split path
     // is a recovery hack for tight-kerning cases — when it's the only thing
@@ -1977,7 +2037,11 @@ fn try_detect_description_list(lines: &[ProjectedLine], start_idx: usize) -> Opt
                 let c0_aligned = (cells[0].start_x - col0_x).abs() <= DESC_LIST_TRACK_TOL_PT;
                 let c1_aligned = (cells[1].start_x - col1_x).abs() <= DESC_LIST_TRACK_TOL_PT;
                 if c0_aligned && c1_aligned && is_label_like(&cells[0].text) {
-                    rows.push((j, cells[0].text.clone(), cells[1].text.clone()));
+                    rows.push((
+                        j,
+                        located_cell(&cells[0], &lines[j]),
+                        located_cell(&cells[1], &lines[j]),
+                    ));
                     real_two_cell_rows += 1;
                     j += 1;
                     continue;
@@ -1989,10 +2053,15 @@ fn try_detect_description_list(lines: &[ProjectedLine], start_idx: usize) -> Opt
                 let c0_aligned = (cell.start_x - col0_x).abs() <= DESC_LIST_TRACK_TOL_PT;
                 let c1_aligned = (cell.start_x - col1_x).abs() <= DESC_LIST_TRACK_TOL_PT;
                 if c1_aligned {
-                    if !rows.last().unwrap().2.is_empty() {
-                        rows.last_mut().unwrap().2.push(' ');
+                    let tail = &mut rows.last_mut().unwrap().2;
+                    if !tail.text.is_empty() {
+                        tail.text.push(' ');
                     }
-                    rows.last_mut().unwrap().2.push_str(&cell.text);
+                    tail.text.push_str(&cell.text);
+                    // The wrapped continuation is part of the same logical
+                    // cell, so it grows that cell's box rather than starting a
+                    // new one.
+                    Rect::extend(&mut tail.bbox, &cell_rect(cell, &lines[j]));
                     j += 1;
                     continue;
                 }
@@ -2004,7 +2073,10 @@ fn try_detect_description_list(lines: &[ProjectedLine], start_idx: usize) -> Opt
                         split_merged_at_anchor(&cell.text, cell.start_x, cell.end_x, col1_x)
                     && is_label_like(&left)
                 {
-                    rows.push((j, left, right));
+                    // Split position is a linear estimate inside one merged
+                    // span, not an observed boundary — the halves carry text
+                    // only rather than a fabricated rect.
+                    rows.push((j, left.into(), right.into()));
                     j += 1;
                     continue;
                 }
@@ -2031,7 +2103,7 @@ fn try_detect_description_list(lines: &[ProjectedLine], start_idx: usize) -> Opt
     // footnote lists (col 0 = footnote number). Real description-list tables
     // have at least one row of word-on-word.
     let has_alpha_pair = rows.iter().any(|(_, c0, c1)| {
-        c0.chars().any(|c| c.is_alphabetic()) && c1.chars().any(|c| c.is_alphabetic())
+        c0.text.chars().any(|c| c.is_alphabetic()) && c1.text.chars().any(|c| c.is_alphabetic())
     });
     if !has_alpha_pair {
         return None;
@@ -2040,7 +2112,7 @@ fn try_detect_description_list(lines: &[ProjectedLine], start_idx: usize) -> Opt
     // (digits or roman numerals), the run is a TOC. TOCs match the alpha
     // pair check only when one of the page refs happens to be a roman
     // numeral like "v" or "vi" alongside an alpha col 0.
-    let all_page_refs = rows.iter().all(|(_, _, c1)| is_page_ref(c1));
+    let all_page_refs = rows.iter().all(|(_, _, c1)| is_page_ref(&c1.text));
     if all_page_refs {
         return None;
     }
@@ -2049,14 +2121,14 @@ fn try_detect_description_list(lines: &[ProjectedLine], start_idx: usize) -> Opt
     //       repeat 3+ times are tabular),
     //   (b) one row's col 1 is substantially longer than col 0 (paragraph
     //       cell next to a label cell — the classic description-list shape).
-    let asymmetric = rows
-        .iter()
-        .any(|(_, c0, c1)| c1.chars().count() >= c0.chars().count().saturating_mul(2).max(20));
+    let asymmetric = rows.iter().any(|(_, c0, c1)| {
+        c1.text.chars().count() >= c0.text.chars().count().saturating_mul(2).max(20)
+    });
     if rows.len() < 3 && !asymmetric {
         return None;
     }
 
-    let body: Vec<Vec<String>> = rows
+    let body: Vec<Vec<Cell>> = rows
         .iter()
         .map(|(_, c0, c1)| vec![c0.clone(), c1.clone()])
         .collect();
@@ -2064,6 +2136,7 @@ fn try_detect_description_list(lines: &[ProjectedLine], start_idx: usize) -> Opt
         start: start_idx,
         end: j,
         body_start: start_idx,
+        bbox: lines_bbox(lines, start_idx, j),
         block: Block::Table {
             header: None,
             rows: body,
@@ -2355,7 +2428,7 @@ fn union_tracks_in_window(lines: &[ProjectedLine], start: usize, end: usize) -> 
 /// the body-detection paths this accepts 1-cell rows — inside a confirmed
 /// table cluster a lone label at a track is a sparse row (e.g. a row-label
 /// city with every value column empty), not prose.
-fn sparse_row_via_cells(line: &ProjectedLine, tracks: &[f32]) -> Option<Vec<String>> {
+fn sparse_row_via_cells(line: &ProjectedLine, tracks: &[f32]) -> Option<Vec<Cell>> {
     let cells = split_cells(line);
     if cells.is_empty() {
         return None;
@@ -2379,9 +2452,9 @@ fn sparse_row_via_cells(line: &ProjectedLine, tracks: &[f32]) -> Option<Vec<Stri
     if distinct.len() != mapping.len() {
         return None;
     }
-    let mut row = vec![String::new(); tracks.len()];
+    let mut row = vec![Cell::default(); tracks.len()];
     for (c, &idx) in cells.iter().zip(&mapping) {
-        row[idx] = c.text.clone();
+        row[idx] = located_cell(c, line);
     }
     Some(row)
 }
@@ -2397,7 +2470,7 @@ fn union_header_from_above(
     body_start: usize,
     floor: usize,
     tracks: &[f32],
-) -> Option<(usize, Vec<String>)> {
+) -> Option<(usize, Vec<Cell>)> {
     let tol = TABLE_TRACK_TOLERANCE_PT;
     // Fallback assignment for centered header cells whose extent doesn't
     // reach the track anchor: nearest track within half the local gap.
@@ -2420,7 +2493,7 @@ fn union_header_from_above(
             None
         }
     };
-    let mut layers: Vec<Vec<String>> = Vec::new();
+    let mut layers: Vec<Vec<Cell>> = Vec::new();
     let mut j = body_start;
     while j > floor && layers.len() < TABLE_CLUSTER_MAX_HEADER_LINES {
         let cand = j - 1;
@@ -2435,7 +2508,7 @@ fn union_header_from_above(
         if spans.len() < 2 {
             break;
         }
-        let mut layer = vec![String::new(); tracks.len()];
+        let mut layer = vec![Cell::default(); tracks.len()];
         let mut ok = true;
         for s in &spans {
             let x0 = s.x;
@@ -2454,15 +2527,24 @@ fn union_header_from_above(
                 ok = false;
                 break;
             };
+            // A span covering several tracks replicates into each of them, so
+            // every covered cell reports the span it was flattened from.
+            let span_rect = Rect {
+                x: s.x,
+                y: s.y,
+                width: s.width.max(0.0),
+                height: s.height.max(0.0),
+            };
             for idx in targets {
                 let dst = &mut layer[idx];
-                if !dst.is_empty() {
-                    dst.push(' ');
+                if !dst.text.is_empty() {
+                    dst.text.push(' ');
                 }
-                dst.push_str(s.text.trim());
+                dst.text.push_str(s.text.trim());
+                Rect::extend(&mut dst.bbox, &span_rect);
             }
         }
-        if !ok || layer.iter().filter(|t| !t.is_empty()).count() < 2 {
+        if !ok || layer.iter().filter(|t| !t.text.is_empty()).count() < 2 {
             break;
         }
         layers.push(layer);
@@ -2472,20 +2554,27 @@ fn union_header_from_above(
         return None;
     }
     layers.reverse();
-    let header: Vec<String> = (0..tracks.len())
+    let header: Vec<Cell> = (0..tracks.len())
         .map(|col| {
             let mut parts: Vec<&str> = Vec::new();
+            let mut bbox: Option<Rect> = None;
             for layer in &layers {
                 let s = layer[col].as_str();
+                if let Some(r) = &layer[col].bbox {
+                    Rect::extend(&mut bbox, r);
+                }
                 if s.is_empty() || parts.last() == Some(&s) {
                     continue;
                 }
                 parts.push(s);
             }
-            parts.join(" ")
+            Cell {
+                text: parts.join(" "),
+                bbox,
+            }
         })
         .collect();
-    if header.iter().all(|h| h.is_empty()) {
+    if header.iter().all(|h| h.text.is_empty()) {
         return None;
     }
     Some((j, header))
@@ -2572,12 +2661,12 @@ fn build_union_table(
     // (merge). Re-extracted clusters keep one row per line; multi-line-cell
     // recovery needs a stronger signal (ruled-grid row boundaries, or
     // label-column row anchoring).
-    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut rows: Vec<Vec<Cell>> = Vec::new();
     let mut failed_count = 0usize;
     for line in &lines[window_start..window_end] {
         if let Some(cells) = cells_from_raw_items_with_tracks(line, &tracks) {
             if cells.iter().any(|c| !c.text.is_empty()) {
-                rows.push(cells.into_iter().map(|c| c.text).collect());
+                rows.push(cells.iter().map(|c| located_cell(c, line)).collect());
             }
         } else if let Some(row) = sparse_row_via_cells(line, &tracks) {
             rows.push(row);
@@ -2588,8 +2677,10 @@ fn build_union_table(
             failed_count += 1;
             let text = line.text.trim();
             if !text.is_empty() {
-                let mut row = vec![String::new(); tracks.len()];
-                row[0] = collapse_whitespace(text);
+                // Unbinnable line kept whole in column 0; it occupies the
+                // entire line, so that is the cell's box.
+                let mut row = vec![Cell::default(); tracks.len()];
+                row[0] = Cell::located(collapse_whitespace(text), line.bbox.clone());
                 rows.push(row);
             }
         }
@@ -2614,6 +2705,7 @@ fn build_union_table(
         start,
         end: window_end,
         body_start: window_start,
+        bbox: lines_bbox(lines, start, window_end),
         block: Block::Table { header, rows },
     })
 }
@@ -2728,8 +2820,10 @@ fn subset_mapping(a: &[(f32, f32)], b: &[(f32, f32)]) -> Option<Vec<usize>> {
 
 /// Insert empty strings into `row` so that its content lands at the mapped
 /// columns in a `target_len`-wide row.
-fn pad_row_to_layout(row: &[String], mapping: &[usize], target_len: usize) -> Vec<String> {
-    let mut out: Vec<String> = vec![String::new(); target_len];
+fn pad_row_to_layout(row: &[Cell], mapping: &[usize], target_len: usize) -> Vec<Cell> {
+    // Padding cells are pure layout filler and stay geometry-less; the real
+    // cells carry their boxes across into the new column positions.
+    let mut out: Vec<Cell> = vec![Cell::default(); target_len];
     for (a_idx, &b_idx) in mapping.iter().enumerate() {
         if b_idx < target_len && a_idx < row.len() {
             out[b_idx] = row[a_idx].clone();
@@ -2775,14 +2869,19 @@ fn try_merge_pair(a: &TableRun, b: &TableRun, lines: &[ProjectedLine]) -> Option
     if interstitial > TABLE_MERGE_MAX_INTERSTITIAL {
         return None;
     }
-    let interstitial_texts: Vec<String> = if interstitial == 0 {
+    // Absorbed label lines become single-cell body rows; each keeps the box of
+    // the line it came from so the merged table's geometry stays complete.
+    let interstitial_texts: Vec<Cell> = if interstitial == 0 {
         Vec::new()
     } else {
         let slice = &lines[a.end..b.start];
         if !slice.iter().all(is_absorbable_interstitial) {
             return None;
         }
-        slice.iter().map(|l| l.text.trim().to_string()).collect()
+        slice
+            .iter()
+            .map(|l| Cell::located(l.text.trim().to_string(), l.bbox.clone()))
+            .collect()
     };
     let (a_header, a_rows) = match &a.block {
         Block::Table { header, rows } => (header.clone(), rows.clone()),
@@ -2823,7 +2922,7 @@ fn try_merge_pair(a: &TableRun, b: &TableRun, lines: &[ProjectedLine]) -> Option
         let mut rows = a_rows.clone();
         // Preserve interstitial label lines as body rows, content in col 0.
         for text in &interstitial_texts {
-            let mut row = vec![String::new(); b_cols];
+            let mut row = vec![Cell::default(); b_cols];
             row[0] = text.clone();
             rows.push(row);
         }
@@ -2840,6 +2939,9 @@ fn try_merge_pair(a: &TableRun, b: &TableRun, lines: &[ProjectedLine]) -> Option
             start: a.start,
             end: b.end,
             body_start: a.body_start,
+            // The merged run spans both source runs and anything absorbed
+            // between them.
+            bbox: lines_bbox(lines, a.start, b.end),
             block: Block::Table { header, rows },
         });
     }
@@ -2849,7 +2951,7 @@ fn try_merge_pair(a: &TableRun, b: &TableRun, lines: &[ProjectedLine]) -> Option
         let mapping = subset_mapping(&a_tracks, &b_tracks)?;
 
         // Compose header rows top-to-bottom: A.header -> A.rows -> B.header.
-        let mut header_layers: Vec<Vec<String>> = Vec::new();
+        let mut header_layers: Vec<Vec<Cell>> = Vec::new();
         if let Some(h) = &a_header {
             header_layers.push(pad_row_to_layout(h, &mapping, b_cols));
         }
@@ -2862,26 +2964,36 @@ fn try_merge_pair(a: &TableRun, b: &TableRun, lines: &[ProjectedLine]) -> Option
         if header_layers.is_empty() {
             return None;
         }
-        let merged_header: Vec<String> = (0..b_cols)
+        let merged_header: Vec<Cell> = (0..b_cols)
             .map(|col| {
                 let mut parts: Vec<String> = Vec::new();
+                let mut bbox: Option<Rect> = None;
                 for layer in &header_layers {
-                    let s = layer.get(col).map(|s| s.as_str()).unwrap_or("");
-                    if s.is_empty() {
+                    let Some(cell) = layer.get(col) else {
                         continue;
+                    };
+                    // Union every contributing layer's box, including ones
+                    // whose text de-duplicates away, so the merged header cell
+                    // still covers the full stacked band it was built from.
+                    if let Some(r) = &cell.bbox {
+                        Rect::extend(&mut bbox, r);
                     }
-                    if parts.last().map(|p| p.as_str()) == Some(s) {
+                    let s = cell.as_str();
+                    if s.is_empty() || parts.last().map(|p| p.as_str()) == Some(s) {
                         continue;
                     }
                     parts.push(s.to_string());
                 }
-                parts.join(" ")
+                Cell {
+                    text: parts.join(" "),
+                    bbox,
+                }
             })
             .collect();
         // Preserve interstitial label lines as body rows ahead of B's rows.
-        let mut merged_rows: Vec<Vec<String>> = Vec::new();
+        let mut merged_rows: Vec<Vec<Cell>> = Vec::new();
         for text in &interstitial_texts {
-            let mut row = vec![String::new(); b_cols];
+            let mut row = vec![Cell::default(); b_cols];
             row[0] = text.clone();
             merged_rows.push(row);
         }
@@ -2889,6 +3001,7 @@ fn try_merge_pair(a: &TableRun, b: &TableRun, lines: &[ProjectedLine]) -> Option
         return Some(TableRun {
             start: a.start,
             end: b.end,
+            bbox: lines_bbox(lines, a.start, b.end),
             // A was folded into B's header, so the merged table's body
             // begins where B's body did.
             body_start: b.body_start,
@@ -3230,8 +3343,8 @@ fn filter_by<T>(items: Vec<T>, keep: &[bool]) -> Vec<T> {
 /// array" bug class.
 struct CellGrid {
     /// Rendered cell text (each multi-column span whitespace-split at the
-    /// crossed column boundaries).
-    text: Vec<Vec<String>>,
+    /// crossed column boundaries), each carrying the ruled cell it occupies.
+    text: Vec<Vec<Cell>>,
     /// Per-cell bold flag — starts `true`, cleared when any non-bold span
     /// lands in the cell.
     is_bold: Vec<Vec<bool>>,
@@ -3258,9 +3371,30 @@ struct CellGrid {
 }
 
 impl CellGrid {
-    fn new(n_rows: usize, n_cols: usize) -> Self {
+    /// `xs`/`ys` are the column/row boundaries (lengths `n_cols + 1` /
+    /// `n_rows + 1`). Unlike the borderless detectors, a ruled table has real
+    /// drawn boundaries, so every cell's box is known up front — before any
+    /// text lands in it — and the collapse/merge passes below carry those boxes
+    /// with the text they reshape instead of re-deriving them from indices that
+    /// no longer line up.
+    fn new(n_rows: usize, n_cols: usize, xs: &[f32], ys: &[f32]) -> Self {
+        let text = (0..n_rows)
+            .map(|r| {
+                (0..n_cols)
+                    .map(|c| Cell {
+                        text: String::new(),
+                        bbox: Some(Rect {
+                            x: xs[c],
+                            y: ys[r],
+                            width: xs[c + 1] - xs[c],
+                            height: ys[r + 1] - ys[r],
+                        }),
+                    })
+                    .collect()
+            })
+            .collect();
         CellGrid {
-            text: vec![vec![String::new(); n_cols]; n_rows],
+            text,
             is_bold: vec![vec![true; n_cols]; n_rows],
             has_text: vec![vec![false; n_cols]; n_rows],
             repl: vec![vec![String::new(); n_cols]; n_rows],
@@ -3285,10 +3419,10 @@ impl CellGrid {
         if txt.is_empty() {
             return;
         }
-        if !self.text[row][col].is_empty() {
-            self.text[row][col].push(' ');
+        if !self.text[row][col].text.is_empty() {
+            self.text[row][col].text.push(' ');
         }
-        self.text[row][col].push_str(txt);
+        self.text[row][col].text.push_str(txt);
         self.has_text[row][col] = true;
     }
 
@@ -3430,7 +3564,7 @@ fn assign_cells(
 ) -> Option<(CellGrid, Vec<usize>)> {
     let n_rows = ys.len() - 1;
     let n_cols = xs.len() - 1;
-    let mut grid = CellGrid::new(n_rows, n_cols);
+    let mut grid = CellGrid::new(n_rows, n_cols, xs, ys);
     let mut consumed_indices: Vec<usize> = Vec::new();
     const GRID_X_SLACK_PT: f32 = 6.0;
     // Straddle census: spans that cross an interior column boundary by a
@@ -3609,14 +3743,14 @@ fn assign_cells(
 /// America Revenue") — that chain is what header-keyed consumers (and readers)
 /// need. Returns `(header_row, body_start)` or `None`.
 fn flatten_header_band(
-    cells: &[Vec<String>],
+    cells: &[Vec<Cell>],
     cell_has_text: &[Vec<bool>],
     cells_repl: &[Vec<String>],
     row_alpha_spanner: &[bool],
     n_rows: usize,
     n_cols: usize,
     dbg: bool,
-) -> Option<(Vec<String>, usize)> {
+) -> Option<(Vec<Cell>, usize)> {
     let row_fill =
         |r: usize| cell_has_text[r].iter().filter(|t| **t).count() as f32 / n_cols as f32;
     (0..n_rows)
@@ -3624,7 +3758,7 @@ fn flatten_header_band(
         .and_then(|b| {
             let nonempty = cell_has_text[b].iter().filter(|t| **t).count();
             let alpha_cells = (0..n_cols)
-                .filter(|c| cell_has_text[b][*c] && is_alpha_dominant(&cells[b][*c]))
+                .filter(|c| cell_has_text[b][*c] && is_alpha_dominant(cells[b][*c].as_str()))
                 .count();
             // The bottom header layer may carry digit labels (years like
             // "2024") but never measurement values. A decimal / % / $ /
@@ -3633,7 +3767,7 @@ fn flatten_header_band(
             // missed the 0.9-fill anchor (colspan header covering <90% of
             // columns) — folding it would eat a data row (DS5795A_page4).
             let has_value_cell =
-                (0..n_cols).any(|c| cell_has_text[b][c] && is_value_like(&cells[b][c]));
+                (0..n_cols).any(|c| cell_has_text[b][c] && is_value_like(cells[b][c].as_str()));
             let qualifies = (1..=3).contains(&b)
                 && b + 1 < n_rows
                 && (0..b).any(|r| row_alpha_spanner[r])
@@ -3642,7 +3776,10 @@ fn flatten_header_band(
             if !qualifies {
                 return None;
             }
-            let header: Vec<String> = (0..n_cols)
+            // Text comes from the colspan-replicated grid, but geometry comes
+            // from the real cell grid: the flattened header cell covers every
+            // band row 0..=b it was folded from.
+            let header: Vec<Cell> = (0..n_cols)
                 .map(|c| {
                     let mut parts: Vec<&str> = Vec::new();
                     for row in cells_repl.iter().take(b + 1) {
@@ -3652,14 +3789,24 @@ fn flatten_header_band(
                         }
                         parts.push(s);
                     }
-                    parts.join(" ")
+                    let mut bbox: Option<Rect> = None;
+                    for row in cells.iter().take(b + 1) {
+                        if let Some(r) = &row[c].bbox {
+                            Rect::extend(&mut bbox, r);
+                        }
+                    }
+                    Cell {
+                        text: parts.join(" "),
+                        bbox,
+                    }
                 })
                 .collect();
-            if header.iter().all(|h| h.is_empty()) {
+            if header.iter().all(|h| h.text.is_empty()) {
                 return None;
             }
             if dbg {
-                eprintln!("[ruled]   colspan header flatten: rows 0..={b} -> {header:?}");
+                let texts: Vec<&str> = header.iter().map(|h| h.as_str()).collect();
+                eprintln!("[ruled]   colspan header flatten: rows 0..={b} -> {texts:?}");
             }
             Some((header, b + 1))
         })
@@ -3675,7 +3822,7 @@ fn flatten_header_band(
 /// plus a flag for whether the merge happened.
 #[allow(clippy::type_complexity)]
 fn merge_stacked_header(
-    cells: Vec<Vec<String>>,
+    cells: Vec<Vec<Cell>>,
     cell_has_text: Vec<Vec<bool>>,
     cell_is_bold: Vec<Vec<bool>>,
     n_rows: usize,
@@ -3683,13 +3830,7 @@ fn merge_stacked_header(
     kept_row_heights: &[f32],
     flattened: bool,
     dbg: bool,
-) -> (
-    Vec<Vec<String>>,
-    Vec<Vec<bool>>,
-    Vec<Vec<bool>>,
-    usize,
-    bool,
-) {
+) -> (Vec<Vec<Cell>>, Vec<Vec<bool>>, Vec<Vec<bool>>, usize, bool) {
     let row_fill =
         |r: usize, has: &[Vec<bool>]| has[r].iter().filter(|t| **t).count() as f32 / n_cols as f32;
     // Anchor on the first fully-dense row (the first real data row).
@@ -3720,16 +3861,22 @@ fn merge_stacked_header(
     if dbg {
         eprintln!("[ruled]   stacked-header merge: top {k} rows → 1");
     }
-    let mut merged_row = vec![String::new(); n_cols];
+    let mut merged_row = vec![Cell::default(); n_cols];
     let mut merged_has = vec![false; n_cols];
     let mut merged_bold = vec![true; n_cols];
     for r in 0..k {
         for c in 0..n_cols {
+            // Every folded band row grows the merged cell's box, including the
+            // text-less ones: the logical header cell spans the whole band the
+            // generator sliced it into, not just the rows that carried glyphs.
+            if let Some(rect) = &cells[r][c].bbox {
+                Rect::extend(&mut merged_row[c].bbox, rect);
+            }
             if cell_has_text[r][c] {
-                if !merged_row[c].is_empty() {
-                    merged_row[c].push(' ');
+                if !merged_row[c].text.is_empty() {
+                    merged_row[c].text.push(' ');
                 }
-                merged_row[c].push_str(&cells[r][c]);
+                merged_row[c].text.push_str(cells[r][c].as_str());
                 merged_has[c] = true;
                 if !cell_is_bold[r][c] {
                     merged_bold[c] = false;
@@ -3820,7 +3967,7 @@ fn rowspan_mask(
 }
 
 fn passes_density_gate(
-    cells: &[Vec<String>],
+    cells: &[Vec<Cell>],
     cell_has_text: &[Vec<bool>],
     cell_is_bold: &[Vec<bool>],
     n_rows: usize,
@@ -3853,7 +4000,7 @@ fn passes_density_gate(
     let col0_fill = (0..n_rows).filter(|r| cell_has_text[*r][0]).count() as f32 / n_rows as f32;
     let col0_max_chars = (0..n_rows)
         .filter(|r| cell_has_text[*r][0])
-        .map(|r| cells[r][0].len())
+        .map(|r| cells[r][0].text.len())
         .max()
         .unwrap_or(0);
     let col0_spine =
@@ -4364,7 +4511,7 @@ fn build_ruled_table_from(
         None if header_qualifies => (Some(cells[0].clone()), 1),
         None => (None, 0),
     };
-    let body_rows: Vec<Vec<String>> = cells[body_start..].to_vec();
+    let body_rows: Vec<Vec<Cell>> = cells[body_start..].to_vec();
     if body_rows.is_empty() {
         return None;
     }
@@ -4378,6 +4525,8 @@ fn build_ruled_table_from(
             start,
             end,
             body_start: start,
+            // A ruled table's region is the grid the generator actually drew.
+            bbox: Some(bbox),
             block: Block::Table {
                 header,
                 rows: body_rows,
@@ -4719,12 +4868,12 @@ fn run_filled_cells(run: &TableRun) -> usize {
         Block::Table { header, rows } => {
             let header_filled = header
                 .as_ref()
-                .map(|h| h.iter().filter(|c| !c.trim().is_empty()).count())
+                .map(|h| h.iter().filter(|c| !c.text.trim().is_empty()).count())
                 .unwrap_or(0);
             let body_filled: usize = rows
                 .iter()
                 .flat_map(|r| r.iter())
-                .filter(|c| !c.trim().is_empty())
+                .filter(|c| !c.text.trim().is_empty())
                 .count();
             header_filled + body_filled
         }
@@ -4816,7 +4965,7 @@ pub(super) fn merge_table_runs(
 ///   blank-label row holding one is a real data row (typically a `Total`);
 /// - at least one extended cell reads as a soft wrap rather than a fresh
 ///   sentence after a completed one.
-fn merge_continuation_rows(rows: &mut Vec<Vec<String>>) {
+fn merge_continuation_rows(rows: &mut Vec<Vec<Cell>>) {
     if rows.len() < 2 {
         return;
     }
@@ -4829,49 +4978,54 @@ fn merge_continuation_rows(rows: &mut Vec<Vec<String>>) {
     // two.
     let first_col_filled = rows
         .iter()
-        .filter(|r| r.first().is_some_and(|c| !c.trim().is_empty()))
+        .filter(|r| r.first().is_some_and(|c| !c.text.trim().is_empty()))
         .count();
     if first_col_filled * 2 < rows.len() {
         return;
     }
-    let mut out: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+    let mut out: Vec<Vec<Cell>> = Vec::with_capacity(rows.len());
     for row in rows.drain(..) {
-        if let Some(prev) = out.last_mut()
-            && is_continuation_row(prev, &row)
-        {
-            for (i, cell) in row.iter().enumerate() {
-                let t = cell.trim();
-                if t.is_empty() {
-                    continue;
+        if let Some(prev) = out.last_mut() {
+            if is_continuation_row(prev, &row) {
+                for (i, cell) in row.iter().enumerate() {
+                    let t = cell.text.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    // `prev[i]` is non-empty for every filled column of `row`;
+                    // that is the subset rule `is_continuation_row` enforces.
+                    prev[i].text.push(' ');
+                    prev[i].text.push_str(t);
+                    // The wrapped line is part of the same logical cell, so it
+                    // grows that cell's box down to cover the continuation.
+                    if let Some(r) = &cell.bbox {
+                        Rect::extend(&mut prev[i].bbox, r);
+                    }
                 }
-                // `prev[i]` is non-empty for every filled column of `row`;
-                // that is the subset rule `is_continuation_row` enforces.
-                prev[i].push(' ');
-                prev[i].push_str(t);
+                continue;
             }
-            continue;
         }
         out.push(row);
     }
     *rows = out;
 }
 
-fn is_continuation_row(prev: &[String], cur: &[String]) -> bool {
+fn is_continuation_row(prev: &[Cell], cur: &[Cell]) -> bool {
     if cur.len() != prev.len() || cur.len() < 2 {
         return false;
     }
     // The row label is never repeated on a wrapped line.
-    if !cur[0].trim().is_empty() || prev[0].trim().is_empty() {
+    if !cur[0].text.trim().is_empty() || prev[0].text.trim().is_empty() {
         return false;
     }
     let filled: Vec<usize> = (0..cur.len())
-        .filter(|&i| !cur[i].trim().is_empty())
+        .filter(|&i| !cur[i].text.trim().is_empty())
         .collect();
     if filled.is_empty() {
         return false;
     }
     // A continuation extends existing text; it cannot introduce a new column.
-    if filled.iter().any(|&i| prev[i].trim().is_empty()) {
+    if filled.iter().any(|&i| prev[i].text.trim().is_empty()) {
         return false;
     }
     // Numbers never soft-wrap. A blank-label row carrying any value-like cell is
@@ -4879,12 +5033,12 @@ fn is_continuation_row(prev: &[String], cur: &[String]) -> bool {
     // precisely because it isn't the row's own label. Vetoing on *any* value
     // (not all of them) is what separates it from a genuine wrap, since such
     // rows pair a short summary word with the figures.
-    if filled.iter().any(|&i| is_value_like(cur[i].trim())) {
+    if filled.iter().any(|&i| is_value_like(cur[i].text.trim())) {
         return false;
     }
     filled
         .iter()
-        .any(|&i| cell_continues(prev[i].trim_end(), cur[i].trim_start()))
+        .any(|&i| cell_continues(prev[i].text.trim_end(), cur[i].text.trim_start()))
 }
 
 /// Whether `cur` reads as the tail of `prev` rather than a new statement. The
@@ -5007,9 +5161,9 @@ mod tests {
         assert_eq!(piece_texts(&span), ["Added Relative"]);
     }
 
-    fn rows(v: &[&[&str]]) -> Vec<Vec<String>> {
+    fn rows(v: &[&[&str]]) -> Vec<Vec<Cell>> {
         v.iter()
-            .map(|r| r.iter().map(|s| s.to_string()).collect())
+            .map(|r| r.iter().map(|s| Cell::from(*s)).collect())
             .collect()
     }
 
@@ -5581,6 +5735,88 @@ mod tests {
     }
 
     #[test]
+    fn ruled_table_cells_carry_their_grid_rect() {
+        // Same 2×2 grid as above: column boundaries at x=50/150/250, row
+        // boundaries at y=100/140/180. A ruled table's cell geometry is the
+        // drawn cell itself, so each cell's box must be exactly one grid
+        // rectangle — independent of where the glyphs sit inside it.
+        let mut graphics = Vec::new();
+        for y in [100.0_f32, 140.0, 180.0] {
+            graphics.push(stroke(50.0, y, 250.0, y, 0.5));
+        }
+        for x in [50.0_f32, 150.0, 250.0] {
+            graphics.push(stroke(x, 100.0, x, 180.0, 0.5));
+        }
+        let lines = vec![
+            line("a", 90.0, 115.0, 10.0, 10.0),
+            line("b", 190.0, 115.0, 10.0, 10.0),
+            line("c", 90.0, 155.0, 10.0, 10.0),
+            line("d", 190.0, 155.0, 10.0, 10.0),
+        ];
+
+        let runs = detect_ruled_tables(&lines, &extract_rule_segments(&graphics), 612.0, 792.0);
+        let Block::Table { rows, .. } = &runs[0].block else {
+            panic!("expected Block::Table");
+        };
+        let rect = |r: usize, c: usize| {
+            let b = rows[r][c].bbox.clone().expect("ruled cell must be located");
+            (b.x, b.y, b.width, b.height)
+        };
+        assert_eq!(rows[0][0].text, "a");
+        assert_eq!(rect(0, 0), (50.0, 100.0, 100.0, 40.0));
+        assert_eq!(rect(0, 1), (150.0, 100.0, 100.0, 40.0));
+        assert_eq!(rect(1, 0), (50.0, 140.0, 100.0, 40.0));
+        assert_eq!(rect(1, 1), (150.0, 140.0, 100.0, 40.0));
+    }
+
+    #[test]
+    fn borderless_table_cells_carry_span_extents() {
+        // A borderless table has no drawn boundaries, so a cell covers the ink
+        // of its own spans on that row — not a full column track. Each cell's
+        // box must therefore start at its span's x and sit in its line's band.
+        let lines = vec![
+            line_with_spans(
+                &[("Name", 50.0), ("Qty", 150.0), ("Cost", 250.0)],
+                100.0,
+                10.0,
+            ),
+            line_with_spans(
+                &[("Bolt", 50.0), ("12", 150.0), ("3.50", 250.0)],
+                115.0,
+                10.0,
+            ),
+            line_with_spans(
+                &[("Nut", 50.0), ("40", 150.0), ("1.25", 250.0)],
+                130.0,
+                10.0,
+            ),
+        ];
+        let runs = detect_tables(&lines);
+        assert_eq!(runs.len(), 1, "expected 1 borderless table, got {runs:?}");
+        let Block::Table { rows, .. } = &runs[0].block else {
+            panic!("expected Block::Table");
+        };
+        // Every detected cell knows where it came from.
+        for row in rows {
+            for cell in row {
+                assert!(cell.bbox.is_some(), "cell {:?} lost its box", cell.text);
+            }
+        }
+        let first = rows[0][0].bbox.clone().unwrap();
+        assert_eq!(first.x, 50.0, "cell starts at its span's x");
+        // The row's own band, not the whole table's.
+        let row0_y = rows[0][0].bbox.clone().unwrap().y;
+        let row1_y = rows[1][0].bbox.clone().unwrap().y;
+        assert!(
+            row1_y > row0_y,
+            "rows must occupy distinct bands ({row0_y} then {row1_y})"
+        );
+        // Columns stay separated horizontally.
+        assert_eq!(rows[0][1].bbox.clone().unwrap().x, 150.0);
+        assert_eq!(rows[0][2].bbox.clone().unwrap().x, 250.0);
+    }
+
+    #[test]
     fn ruled_table_rect_borders_detected() {
         // Same 2×2 table but drawn as 4 individual cell rects (each cell is a
         // stroked rectangle). Each rect contributes 4 strokes via
@@ -5670,6 +5906,7 @@ mod tests {
             start: 5,
             end: 10,
             body_start: 5,
+            bbox: None,
             block: Block::Table {
                 header: None,
                 rows: vec![vec!["ruled".into()]],
@@ -5679,6 +5916,7 @@ mod tests {
             start: 6,
             end: 11,
             body_start: 6,
+            bbox: None,
             block: Block::GridFallback {
                 lines: vec!["bl".into()],
             },
@@ -5730,6 +5968,7 @@ mod tests {
             start: 0,
             end: 2,
             body_start: 0,
+            bbox: None,
             block: Block::Table {
                 header: Some(vec!["A".into(), "B".into(), "C".into()]),
                 rows: vec![vec!["1".into(), "2".into(), "3".into()]],
@@ -5739,6 +5978,7 @@ mod tests {
             start: 2,
             end: 5,
             body_start: 2,
+            bbox: None,
             block: Block::Table {
                 header: None,
                 rows: vec![
@@ -5778,6 +6018,7 @@ mod tests {
             start: 0,
             end: 2,
             body_start: 0,
+            bbox: None,
             block: Block::Table {
                 header: None,
                 rows: vec![
@@ -5790,6 +6031,7 @@ mod tests {
             start: 2,
             end: 5,
             body_start: 2,
+            bbox: None,
             block: Block::Table {
                 header: None,
                 rows: vec![
@@ -5830,6 +6072,7 @@ mod tests {
             start: 0,
             end: 2,
             body_start: 0,
+            bbox: None,
             block: Block::Table {
                 header: Some(vec!["A".into(), "B".into(), "C".into()]),
                 rows: vec![vec!["1".into(), "2".into(), "3".into()]],
@@ -5839,6 +6082,7 @@ mod tests {
             start: 2,
             end: 4,
             body_start: 2,
+            bbox: None,
             block: Block::Table {
                 header: None,
                 rows: vec![
@@ -5863,6 +6107,7 @@ mod tests {
             start: 0,
             end: 10,
             body_start: 0,
+            bbox: None,
             block: Block::Table {
                 header: None,
                 rows: (0..10)
@@ -5874,6 +6119,7 @@ mod tests {
             start: 10,
             end: 13,
             body_start: 10,
+            bbox: None,
             block: Block::Table {
                 header: None,
                 rows: (0..3)
@@ -5919,6 +6165,7 @@ mod tests {
             start: 0,
             end: 2,
             body_start: 0,
+            bbox: None,
             block: Block::Table {
                 header: None,
                 rows: vec![
@@ -5931,6 +6178,7 @@ mod tests {
             start: 2,
             end: 4,
             body_start: 2,
+            bbox: None,
             block: Block::Table {
                 header: None,
                 rows: vec![
@@ -5954,6 +6202,7 @@ mod tests {
             start: 0,
             end: 2,
             body_start: 0,
+            bbox: None,
             block: Block::Table {
                 header: None,
                 rows: vec![
@@ -5966,6 +6215,7 @@ mod tests {
             start: 2,
             end: 3,
             body_start: 2,
+            bbox: None,
             block: Block::GridFallback {
                 lines: vec!["fallback".into()],
             },
@@ -5998,6 +6248,7 @@ mod tests {
             start: 0,
             end: 2,
             body_start: 0,
+            bbox: None,
             block: Block::Table {
                 header: Some(vec!["A".into(), "B".into(), "C".into()]),
                 rows: vec![vec!["1".into(), "2".into(), "3".into()]],
@@ -6007,6 +6258,7 @@ mod tests {
             start: 3,
             end: 5,
             body_start: 3,
+            bbox: None,
             block: Block::Table {
                 header: None,
                 rows: vec![
@@ -6036,6 +6288,7 @@ mod tests {
             start: 0,
             end: 2,
             body_start: 0,
+            bbox: None,
             block: Block::Table {
                 header: None,
                 rows: vec![
@@ -6048,6 +6301,7 @@ mod tests {
             start: 3,
             end: 6,
             body_start: 3,
+            bbox: None,
             block: Block::Table {
                 header: None,
                 rows: vec![

@@ -73,6 +73,10 @@ program
   .option("--extract-form-fields", "Include AcroForm widget fields and values")
   .option("--extract-structure-tree", "Include the tagged-PDF logical structure tree")
   .option(
+    "--extract-blocks",
+    "Include each page's classified layout blocks with bounding boxes",
+  )
+  .option(
     "--extract-xfa-packets",
     "Include raw XFA packets (name + XML content) in JSON output",
   )
@@ -92,6 +96,10 @@ program
   .option(
     "--target-pages <pages>",
     'Pages to parse (e.g., "1-5,10,15-20")',
+  )
+  .option(
+    "--continue-on-page-error",
+    "Continue after page-level extraction errors and report them in JSON",
   )
   .option("--dpi <dpi>", "Rendering DPI", parseFloat)
   .option("--preserve-small-text", "Keep very small text")
@@ -135,6 +143,7 @@ program
       if (opts.extractAnnotations) config.extractAnnotations = true;
       if (opts.extractFormFields) config.extractFormFields = true;
       if (opts.extractStructureTree) config.extractStructureTree = true;
+      if (opts.extractBlocks) config.extractBlocks = true;
       if (opts.extractXfaPackets) config.extractXfaPackets = true;
       if (opts.extractContentBounds) config.extractContentBounds = true;
       if (opts.ocrServerUrl)
@@ -145,6 +154,7 @@ program
       if (opts.ocrLanguage) config.ocrLanguage = opts.ocrLanguage as string;
       if (opts.maxPages) config.maxPages = opts.maxPages as number;
       if (opts.targetPages) config.targetPages = opts.targetPages as string;
+      if (opts.continueOnPageError) config.continueOnPageError = true;
       if (opts.dpi) config.dpi = opts.dpi as number;
       if (opts.preserveSmallText) config.preserveVerySmallText = true;
       if (opts.extractTextMetadata) config.extractTextMetadata = true;
@@ -159,6 +169,14 @@ program
 
       const parser = new LiteParse(config);
       const result = await parser.parse(await resolveInput(file));
+
+      // JSON output carries pageErrors itself; text/markdown would silently
+      // omit the failed pages, so always surface them on stderr.
+      for (const error of result.pageErrors) {
+        console.error(
+          `[liteparse] page ${error.pageNum} failed to extract and was skipped: ${error.message}`,
+        );
+      }
 
       const output =
         config.outputFormat === "json"
@@ -340,6 +358,10 @@ program
   .option("--extract-form-fields", "Include AcroForm widget fields and values")
   .option("--extract-structure-tree", "Include the tagged-PDF logical structure tree")
   .option(
+    "--extract-blocks",
+    "Include each page's classified layout blocks with bounding boxes",
+  )
+  .option(
     "--extract-xfa-packets",
     "Include raw XFA packets (name + XML content) in JSON output",
   )
@@ -377,6 +399,7 @@ program
         if (opts.extractAnnotations) config.extractAnnotations = true;
         if (opts.extractFormFields) config.extractFormFields = true;
         if (opts.extractStructureTree) config.extractStructureTree = true;
+        if (opts.extractBlocks) config.extractBlocks = true;
         if (opts.extractXfaPackets) config.extractXfaPackets = true;
         if (opts.extractContentBounds) config.extractContentBounds = true;
       if (opts.extractContentBounds) config.extractContentBounds = true;

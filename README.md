@@ -43,6 +43,7 @@ hard stuff so your models see clean, structured data and markdown.
 - **Markdown Output**: Structured Markdown with headings, tables, lists, images, and links — great for feeding LLMs and RAG pipelines
 - **Bounding Boxes**: Precise text positioning information
 - **Multi-language**: Use from Rust, Node.js/TypeScript, Python, or the browser (WASM)
+- **Worker Pool Mode** (Python & Node.js): Parse in persistent worker processes for true parallelism (PDFium otherwise serializes concurrent parses) and hard per-parse timeouts — rogue documents are killed, identified by name, and never stall the pipeline
 - **Multi-platform**: Linux, macOS (Intel/ARM), Windows
 
 ```mermaid
@@ -202,6 +203,9 @@ lit parse document.pdf --format markdown --no-links
 
 # Include tagged-PDF logical structure in JSON
 lit parse document.pdf --format json --extract-structure-tree
+
+# Include the classified layout blocks (with bounding boxes) in JSON
+lit parse document.pdf --format json --extract-blocks
 ```
 
 Image handling is controlled by `--image-mode`:
@@ -254,6 +258,49 @@ It preserves every root and recursively exposes element type, ID, actual/alterna
 text, title, typed scalar attributes, marked-content IDs, children, and referenced
 link annotations. The field is absent by default; enabled untagged pages contain
 `roots: []`.
+
+### Layout blocks
+
+The Markdown renderer works by classifying each page into blocks — headings,
+paragraphs, list items, tables, code, rules, figures — and then rendering them.
+Enable `--extract-blocks` (Rust/Python `extract_blocks`, JavaScript/WASM
+`extractBlocks`) to get that decomposition as data instead of only as rendered
+text, with the coordinates the classifier used.
+
+Each page gains a `blocks` array in reading order — the same order, and the same
+blocks, the Markdown output is built from. Every block carries:
+
+- `kind`: one of `heading`, `paragraph`, `list_item`, `code`, `table`,
+  `grid_fallback`, `rule`, `figure`.
+- `bbox`: the region it occupies, in the same top-left 72-DPI viewport space as
+  `text_items`. This is the union of every source line that fed the block, so a
+  wrapped heading or a multi-line paragraph reports its whole band.
+- Kind-specific fields, omitted when they don't apply: `text` and `level` for
+  headings; `ordered` / `marker` for list items; `lines` and `lang` for code;
+  `header` and `rows` for tables; `id` / `format` for figures.
+
+Table cells are objects, not bare strings — each has `text` and its own `bbox`,
+so a cell can be mapped back to the region of the page it was read from. For
+ruled tables that box is the drawn grid cell; for borderless tables it is the
+extent of the spans the cell was built from. Cells that exist only to square off
+a ragged grid carry no `bbox`, since they have no ink behind them.
+
+```json
+{
+  "kind": "table",
+  "bbox": { "x": 72.0, "y": 310.5, "width": 468.0, "height": 96.0 },
+  "header": [
+    { "text": "Territory Code", "bbox": { "x": 72.0, "y": 310.5, "width": 120.0, "height": 24.0 } },
+    { "text": "Factor",         "bbox": { "x": 192.0, "y": 310.5, "width": 96.0, "height": 24.0 } }
+  ],
+  "rows": [
+    [
+      { "text": "001", "bbox": { "x": 72.0, "y": 334.5, "width": 120.0, "height": 24.0 } },
+      { "text": "1.25", "bbox": { "x": 192.0, "y": 334.5, "width": 96.0, "height": 24.0 } }
+    ]
+  ]
+}
+```
 
 ### Document metadata, content bounds, and XFA packets
 

@@ -1,7 +1,7 @@
 """LiteParse Python wrapper - native Rust bindings via PyO3."""
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 from liteparse._liteparse import LiteParse as _NativeLiteParse
 from liteparse._liteparse import search_items as _native_search_items
@@ -9,6 +9,8 @@ from liteparse._liteparse import search_items as _native_search_items
 from .types import (
     AnnotationRect,
     DocumentAnnotation,
+    LayoutBlock,
+    LayoutCell,
     FormField,
     StructureTree,
     StructureTreeElement,
@@ -18,7 +20,9 @@ from .types import (
     LiteParseConfig,
     PageComplexityStats,
     ParsedPage,
+    ParseBatch,
     ParseError,
+    PageError,
     ParseResult,
     DocumentMetadata,
     ScreenshotRect,
@@ -30,6 +34,45 @@ from .types import (
     VectorLine,
     VectorShape,
 )
+
+
+def _convert_rect(rect: Any) -> Optional[AnnotationRect]:
+    if rect is None:
+        return None
+    return AnnotationRect(
+        x=rect.x, y=rect.y, width=rect.width, height=rect.height
+    )
+
+
+def _convert_cell(cell: Any) -> LayoutCell:
+    return LayoutCell(text=cell.text, bbox=_convert_rect(cell.bbox))
+
+
+def _convert_block(block: Any) -> LayoutBlock:
+    return LayoutBlock(
+        kind=block.kind,
+        text=block.text,
+        level=block.level,
+        bold=block.bold,
+        italic=block.italic,
+        ordered=block.ordered,
+        marker=block.marker,
+        lines=list(block.lines) if block.lines is not None else None,
+        lang=block.lang,
+        header=(
+            [_convert_cell(c) for c in block.header]
+            if block.header is not None
+            else None
+        ),
+        rows=(
+            [[_convert_cell(c) for c in row] for row in block.rows]
+            if block.rows is not None
+            else None
+        ),
+        id=block.id,
+        format=block.format,
+        bbox=_convert_rect(block.bbox),
+    )
 
 
 def _convert_annotation(annotation: Any) -> DocumentAnnotation:
@@ -156,6 +199,7 @@ def _convert_native_result(native_result: Any) -> ParseResult:
         native_annotations = getattr(native_page, "annotations", None)
         native_form_fields = getattr(native_page, "form_fields", None)
         native_structure_tree = getattr(native_page, "structure_tree", None)
+        native_blocks = getattr(native_page, "blocks", None)
         pages.append(
             ParsedPage(
                 page_num=native_page.page_num,
@@ -285,6 +329,11 @@ def _convert_native_result(native_result: Any) -> ParseResult:
                     if native_structure_tree is not None
                     else None
                 ),
+                blocks=(
+                    [_convert_block(block) for block in native_blocks]
+                    if native_blocks is not None
+                    else None
+                ),
             )
         )
     images = [
@@ -339,8 +388,34 @@ def _convert_native_result(native_result: Any) -> ParseResult:
     return ParseResult(
         pages=pages,
         text=native_result.text,
+        total_pages=getattr(native_result, "total_pages", len(pages)),
         images=images,
+        screenshots=[
+            ScreenshotResult(
+                page_num=screenshot.page_num,
+                width=screenshot.width,
+                height=screenshot.height,
+                image_bytes=screenshot.image_bytes,
+                is_solid_fill=getattr(screenshot, "is_solid_fill", False),
+                rects=[
+                    ScreenshotRect(
+                        x=rect.x,
+                        y=rect.y,
+                        width=rect.width,
+                        height=rect.height,
+                        color=rect.color,
+                        is_line=rect.is_line,
+                    )
+                    for rect in getattr(screenshot, "rects", [])
+                ],
+            )
+            for screenshot in getattr(native_result, "screenshots", [])
+        ],
         image_error_count=getattr(native_result, "image_error_count", 0),
+        page_errors=[
+            PageError(page_num=error.page_num, message=error.message)
+            for error in getattr(native_result, "page_errors", [])
+        ],
         form_type=getattr(native_result, "form_type", None),
         creator=getattr(native_result, "creator", None),
         producer=getattr(native_result, "producer", None),
@@ -384,6 +459,8 @@ class LiteParse:
         tessdata_path: Optional[str] = None,
         max_pages: Optional[int] = None,
         target_pages: Optional[str] = None,
+        extract_screenshots: Optional[bool] = None,
+        continue_on_page_error: Optional[bool] = None,
         dpi: Optional[float] = None,
         output_format: Optional[str] = None,
         preserve_very_small_text: Optional[bool] = None,
@@ -398,6 +475,7 @@ class LiteParse:
         extract_annotations: Optional[bool] = None,
         extract_form_fields: Optional[bool] = None,
         extract_structure_tree: Optional[bool] = None,
+        extract_blocks: Optional[bool] = None,
         extract_xfa_packets: Optional[bool] = None,
         extract_document_metadata: Optional[bool] = None,
         extract_content_bounds: Optional[bool] = None,
@@ -411,6 +489,8 @@ class LiteParse:
         skip_diagonal_text: Optional[bool] = None,
         include_complexity: Optional[bool] = None,
         extract_vector_graphics: Optional[bool] = None,
+        pool_size: Optional[int] = None,
+        parse_timeout: Optional[float] = None,
     ):
         """
         Initialize LiteParse parser.
@@ -424,6 +504,11 @@ class LiteParse:
             tessdata_path: Path to tessdata directory for Tesseract
             max_pages: Maximum number of pages to parse
             target_pages: Specific pages to parse (e.g., "1-5,10,15-20")
+            extract_screenshots: Render parsed pages to PNG and return them in
+                ``ParseResult.screenshots``. Default False; PNG payloads can be large.
+            continue_on_page_error: Skip page-level PDF extraction failures and
+                return them in ``ParseResult.page_errors``. Document-level
+                failures remain fatal. Default False.
             dpi: DPI for rendering (affects OCR quality)
             output_format: Output format: "json", "text", or "markdown" (default: "json")
             preserve_very_small_text: Whether to preserve very small text
@@ -445,6 +530,10 @@ class LiteParse:
                 structured data (default: False).
             extract_form_fields: Include AcroForm widget fields and values as
                 page-scoped structured data (default: False).
+            extract_blocks: Emit each page's classified layout blocks with
+                bounding boxes. This is the same decomposition the Markdown
+                renderer consumes, exposed as data; enabling it never changes
+                the rendered Markdown.
             extract_structure_tree: Include the tagged-PDF logical structure
                 tree as page-scoped structured data (default: False).
             ocr_failure_fatal: Whether a systemic OCR failure (every OCR task
@@ -481,6 +570,12 @@ class LiteParse:
                 pass.
             extract_vector_graphics: Expose page-scoped vector shapes and
                 merged horizontal/vertical line segments. Default False.
+            pool_size: Route :meth:`parse` through a pool of this many
+                persistent worker processes instead of parsing in-process.
+                Call :meth:`close` (or use ``with``) to shut workers down.
+            parse_timeout: Hard per-parse deadline in seconds. Requires
+                ``pool_size``: On expiry the parse raises :class:`ParseTimeoutError`
+                (naming the document) and a fresh worker replaces the killed one.
         """
         kwargs = {}
         if ocr_enabled is not None:
@@ -497,6 +592,10 @@ class LiteParse:
             kwargs["max_pages"] = max_pages
         if target_pages is not None:
             kwargs["target_pages"] = target_pages
+        if extract_screenshots is not None:
+            kwargs["extract_screenshots"] = extract_screenshots
+        if continue_on_page_error is not None:
+            kwargs["continue_on_page_error"] = continue_on_page_error
         if dpi is not None:
             kwargs["dpi"] = dpi
         if output_format is not None:
@@ -525,6 +624,8 @@ class LiteParse:
             kwargs["extract_form_fields"] = extract_form_fields
         if extract_structure_tree is not None:
             kwargs["extract_structure_tree"] = extract_structure_tree
+        if extract_blocks is not None:
+            kwargs["extract_blocks"] = extract_blocks
         if extract_xfa_packets is not None:
             kwargs["extract_xfa_packets"] = extract_xfa_packets
         if extract_document_metadata is not None:
@@ -554,6 +655,48 @@ class LiteParse:
 
         self._native = _NativeLiteParse(**kwargs)
 
+        if parse_timeout is not None and pool_size is None:
+            raise ValueError(
+                "parse_timeout requires pool_size"
+            )
+        self._pool = None
+        if pool_size is not None:
+            from ._pool import WorkerPool
+
+            self._pool = WorkerPool(kwargs, pool_size, parse_timeout)
+
+    def close(self) -> None:
+        """Shut down pool workers, if pool mode is enabled. Idempotent.
+
+        Without ``pool_size`` this is a no-op. Workers also exit on their own
+        when the parent process does, so forgetting to call this leaks
+        nothing past interpreter exit.
+        """
+        if self._pool is not None:
+            self._pool.close()
+
+    def warm_up(self) -> None:
+        """Block until all pool workers are initialized (no-op without pool).
+
+        Optional: the first parse on each worker waits for its init anyway.
+        Call this before latency-sensitive traffic to avoid paying worker
+        startup on the first request.
+        """
+        if self._pool is not None:
+            self._pool.warm_up()
+
+    def __enter__(self) -> "LiteParse":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def parse(
         self,
         file_data: Union[str, Path, bytes],
@@ -569,21 +712,103 @@ class LiteParse:
 
         Raises:
             ParseError: If parsing fails.
+            ParseTimeoutError: In pool mode, if the parse exceeded
+                ``parse_timeout`` (the worker process is killed and replaced).
             FileNotFoundError: If the file doesn't exist.
         """
+        if isinstance(file_data, bytes):
+            payload: Union[str, bytes] = file_data
+            source = f"<{len(file_data)} bytes>"
+        else:
+            file_path = Path(file_data)
+            if not file_path.exists():
+                raise FileNotFoundError(f"File not found: {file_path}")
+            payload = str(file_path.absolute())
+            source = payload
+
+        if self._pool is not None:
+            return self._pool.parse(payload, source)
+
+        try:
+            if isinstance(payload, bytes):
+                native_result = self._native.parse_bytes(payload)
+            else:
+                native_result = self._native.parse(payload)
+            return _convert_native_result(native_result)
+        except Exception as e:
+            raise ParseError(str(e)) from e
+
+    def parse_batches(
+        self,
+        file_data: Union[str, Path, bytes],
+        batch_size: Optional[int] = None,
+    ) -> Iterator[ParseBatch]:
+        """
+        Parse a document in bounded-memory page batches.
+
+        Each yielded batch is an ordinary :class:`ParseResult` covering
+        ``batch.start_page`` through ``batch.end_page``, and becomes
+        collectible as soon as you advance the iterator — so a loop that does
+        not retain batches never holds more than one batch of pages in memory.
+        A non-PDF source is converted once, not once per batch.
+
+        Cross-page passes see only the pages in their own batch, so repeated
+        header/footer removal and image deduplication are batch-local and the
+        output can differ from :meth:`parse`. Prefer :meth:`parse` unless the
+        size of the materialized result is the problem.
+
+        Args:
+            file_data: Path to the document file, or raw PDF bytes.
+            batch_size: Pages materialized per batch (default 25).
+
+        Yields:
+            ParseBatch for each page range, in document order.
+
+        Raises:
+            ParseError: If parsing fails, or if the parser was constructed
+                with ``target_pages`` (ambiguous with generated batch ranges).
+                Open errors are raised here, when ``parse_batches`` is called;
+                per-batch parse errors are raised from the iterator.
+            FileNotFoundError: If the file doesn't exist.
+        """
+        # Validate and open eagerly — this is not a generator function, so a
+        # missing file or a target_pages conflict raises here rather than on
+        # the first iteration of the returned iterator.
         try:
             if isinstance(file_data, bytes):
-                native_result = self._native.parse_bytes(file_data)
+                session = self._native.open_batch_session_bytes(
+                    file_data, batch_size
+                )
             else:
                 file_path = Path(file_data)
                 if not file_path.exists():
                     raise FileNotFoundError(f"File not found: {file_path}")
-                native_result = self._native.parse(str(file_path.absolute()))
-            return _convert_native_result(native_result)
+                session = self._native.open_batch_session(
+                    str(file_path.absolute()), batch_size
+                )
         except FileNotFoundError:
             raise
         except Exception as e:
             raise ParseError(str(e)) from e
+
+        return self._iter_batches(session)
+
+    @staticmethod
+    def _iter_batches(session: Any) -> Iterator[ParseBatch]:
+        total_pages = session.total_pages
+        while True:
+            try:
+                batch = session.next_batch()
+            except Exception as e:
+                raise ParseError(str(e)) from e
+            if batch is None:
+                return
+            yield ParseBatch(
+                start_page=batch.start_page,
+                end_page=batch.end_page,
+                total_pages=total_pages,
+                result=_convert_native_result(batch.result),
+            )
 
     def is_complex(
         self,
@@ -689,6 +914,8 @@ class LiteParse:
             tessdata_path=cfg.tessdata_path,
             max_pages=cfg.max_pages,
             target_pages=cfg.target_pages,
+            extract_screenshots=cfg.extract_screenshots,
+            continue_on_page_error=cfg.continue_on_page_error,
             dpi=cfg.dpi,
             output_format=cfg.output_format,
             preserve_very_small_text=cfg.preserve_very_small_text,
@@ -702,6 +929,7 @@ class LiteParse:
             extract_annotations=cfg.extract_annotations,
             extract_form_fields=cfg.extract_form_fields,
             extract_structure_tree=cfg.extract_structure_tree,
+            extract_blocks=cfg.extract_blocks,
             ocr_failure_fatal=cfg.ocr_failure_fatal,
             ocr_hedge_delays_ms=list(cfg.ocr_hedge_delays_ms),
             emit_word_boxes=cfg.emit_word_boxes,

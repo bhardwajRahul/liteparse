@@ -18,6 +18,7 @@ from liteparse import LiteParse
 parser = LiteParse()
 result = parser.parse("document.pdf")
 print(result.text)
+print(f"Source document pages: {result.total_pages}")
 
 # Access structured data
 for page in result.pages:
@@ -54,6 +55,8 @@ parser = LiteParse(
     tessdata_path=None,            # Path to tessdata directory (optional)
     max_pages=1000,                # Max pages to parse
     target_pages="1-5,10",         # Specific pages (optional)
+    extract_screenshots=False,      # Return parsed pages as PNG bytes
+    continue_on_page_error=False,   # Skip broken pages and return page_errors
     dpi=150,                       # Rendering DPI
     output_format="json",          # "json" | "text" | "markdown"
     image_mode="placeholder",      # Markdown image handling: "placeholder" | "off" | "embed"
@@ -109,6 +112,26 @@ Pass raw PDF bytes directly — useful for web uploads or downloaded files:
 with open("document.pdf", "rb") as f:
     result = parser.parse(f.read())
 print(result.text)
+```
+
+## Worker Pool and Hard Timeouts
+
+PDFium is not thread-safe, so in-process parses serialize on a process-global
+lock. For high-throughput services, or cases where you need to enforce a timeout,
+run parses in a pool of persistent worker processes instead:
+
+```python
+from liteparse import LiteParse, ParseTimeoutError
+
+parser = LiteParse(pool_size=4, parse_timeout=15)
+parser.warm_up()  # optional: pre-initialize workers (~60ms total)
+
+try:
+    result = parser.parse("document.pdf")
+except ParseTimeoutError as e:
+    print(f"killed rogue document: {e.source} (deadline {e.timeout}s)")
+
+parser.close()  # or use `with LiteParse(...) as parser:`
 ```
 
 ## Screenshots

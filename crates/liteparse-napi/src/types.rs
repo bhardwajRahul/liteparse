@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use napi_derive::napi;
 
 use liteparse::config::{CropBox, ImageMode, LiteParseConfig, OutputFormat};
+use liteparse::layout::{LayoutBlock, LayoutCell};
 use liteparse::parser::ParseResult;
 use liteparse::types::{
     DocumentAnnotation, FormField, GraphicPrimitive, Page, ParsedPage, Rect, ScreenshotRect,
@@ -32,6 +33,12 @@ pub struct JsLiteParseConfig {
     pub max_pages: Option<u32>,
     /// Specific pages to parse (e.g., "1-5,10,15-20").
     pub target_pages: Option<String>,
+    /// Render parsed pages to PNG and return them in `ParseResult.screenshots`.
+    /// Default false; PNG payloads can be large.
+    pub extract_screenshots: Option<bool>,
+    /// Continue after page-level extraction failures and return them in
+    /// `ParseResult.pageErrors`. Default false.
+    pub continue_on_page_error: Option<bool>,
     /// DPI for rendering pages (used for OCR and screenshots).
     pub dpi: Option<f64>,
     /// Output format: "json", "text", or "markdown".
@@ -61,6 +68,10 @@ pub struct JsLiteParseConfig {
     pub keep_headers_footers: Option<bool>,
     /// Extract all PDF annotations as page-scoped structured data.
     pub extract_annotations: Option<bool>,
+    /// Emit each page's classified layout blocks (headings, paragraphs, list
+    /// items, tables with per-cell boxes, code, rules, figures) with bounding
+    /// boxes as `ParsedPage.blocks`. Default false.
+    pub extract_blocks: Option<bool>,
     /// Extract AcroForm widget fields and values.
     pub extract_form_fields: Option<bool>,
     /// Extract the tagged-PDF logical structure tree.
@@ -145,6 +156,12 @@ impl JsLiteParseConfig {
         if let Some(v) = self.target_pages {
             cfg.target_pages = Some(v);
         }
+        if let Some(v) = self.extract_screenshots {
+            cfg.extract_screenshots = v;
+        }
+        if let Some(v) = self.continue_on_page_error {
+            cfg.continue_on_page_error = v;
+        }
         if let Some(v) = self.dpi {
             cfg.dpi = v as f32;
         }
@@ -188,6 +205,9 @@ impl JsLiteParseConfig {
         }
         if let Some(v) = self.extract_annotations {
             cfg.extract_annotations = v;
+        }
+        if let Some(v) = self.extract_blocks {
+            cfg.extract_blocks = v;
         }
         if let Some(v) = self.extract_form_fields {
             cfg.extract_form_fields = v;
@@ -255,6 +275,8 @@ impl JsLiteParseConfig {
             tessdata_path: cfg.tessdata_path.clone(),
             max_pages: Some(cfg.max_pages as u32),
             target_pages: cfg.target_pages.clone(),
+            extract_screenshots: Some(cfg.extract_screenshots),
+            continue_on_page_error: Some(cfg.continue_on_page_error),
             dpi: Some(cfg.dpi as f64),
             output_format: Some(match cfg.output_format {
                 OutputFormat::Json => "json".to_string(),
@@ -275,6 +297,7 @@ impl JsLiteParseConfig {
             extract_links: Some(cfg.extract_links),
             keep_headers_footers: Some(cfg.keep_headers_footers),
             extract_annotations: Some(cfg.extract_annotations),
+            extract_blocks: Some(cfg.extract_blocks),
             extract_form_fields: Some(cfg.extract_form_fields),
             extract_structure_tree: Some(cfg.extract_structure_tree),
             extract_xfa_packets: Some(cfg.extract_xfa_packets),
@@ -571,6 +594,9 @@ pub struct JsParsedPage {
     pub complexity: Option<JsPageComplexityStats>,
     pub vector_graphics: Option<JsVectorGraphics>,
     pub annotations: Option<Vec<JsDocumentAnnotation>>,
+    /// Classified layout blocks in reading order; present only when
+    /// `extractBlocks` is enabled.
+    pub blocks: Option<Vec<JsLayoutBlock>>,
     pub form_fields: Option<Vec<JsFormField>>,
     pub structure_tree: Option<JsStructureTree>,
 }
@@ -832,6 +858,90 @@ impl JsDocumentAnnotation {
     }
 }
 
+/// One table cell: its rendered text and the region it occupied. `bbox` is
+/// absent for cells with no ink behind them (padding for a ragged grid, or a
+/// merged run split at an estimated boundary).
+#[napi(object)]
+#[derive(Clone)]
+pub struct JsLayoutCell {
+    pub text: String,
+    pub bbox: Option<JsAnnotationRect>,
+}
+
+/// A classified block plus where it sits on the page. Flat by design — `kind`
+/// discriminates the block and every field that doesn't apply to that kind is
+/// absent.
+#[napi(object)]
+#[derive(Clone)]
+pub struct JsLayoutBlock {
+    /// One of `heading`, `paragraph`, `list_item`, `code`, `table`,
+    /// `grid_fallback`, `rule`, `figure`.
+    pub kind: String,
+    /// Rendered text for the text-bearing kinds (`heading`, `paragraph`,
+    /// `list_item`). Table text lives in `header`/`rows`; code and grid text in
+    /// `lines`.
+    pub text: Option<String>,
+    /// Heading level (1–6), or list nesting depth for `list_item`.
+    pub level: Option<u8>,
+    /// Whether the block's text is uniformly bold / italic. `paragraph` and
+    /// `list_item` only; false otherwise.
+    pub bold: bool,
+    pub italic: bool,
+    /// `list_item`: whether the list is ordered, and the original marker as it
+    /// appeared on the page (`138.`, `iii)`, `•`).
+    pub ordered: Option<bool>,
+    pub marker: Option<String>,
+    /// Verbatim source lines for `code` and `grid_fallback`.
+    pub lines: Option<Vec<String>>,
+    /// Best-effort language hint for `code`.
+    pub lang: Option<String>,
+    /// `table`: the header row, when one was detected.
+    pub header: Option<Vec<JsLayoutCell>>,
+    /// `table`: the body rows.
+    pub rows: Option<Vec<Vec<JsLayoutCell>>>,
+    /// `figure`: the image's page-scoped id and encoded format, matching the
+    /// `img_{id}.{format}` target the markdown renderer emits.
+    pub id: Option<String>,
+    pub format: Option<String>,
+    /// Region of the page this block occupies, in the same viewport space as
+    /// `textItems`. Absent when the block has no page geometry behind it.
+    pub bbox: Option<JsAnnotationRect>,
+}
+
+impl JsLayoutCell {
+    fn from_rust(cell: &LayoutCell) -> Self {
+        Self {
+            text: cell.text.clone(),
+            bbox: cell.bbox.as_ref().map(JsAnnotationRect::from_rust),
+        }
+    }
+}
+
+impl JsLayoutBlock {
+    fn from_rust(block: &LayoutBlock) -> Self {
+        let cells = |row: &Vec<LayoutCell>| row.iter().map(JsLayoutCell::from_rust).collect();
+        Self {
+            kind: block.kind.to_string(),
+            text: block.text.clone(),
+            level: block.level,
+            bold: block.bold,
+            italic: block.italic,
+            ordered: block.ordered,
+            marker: block.marker.clone(),
+            lines: block.lines.clone(),
+            lang: block.lang.clone(),
+            header: block.header.as_ref().map(&cells),
+            rows: block
+                .rows
+                .as_ref()
+                .map(|rows| rows.iter().map(&cells).collect()),
+            id: block.id.clone(),
+            format: block.format.clone(),
+            bbox: block.bbox.as_ref().map(JsAnnotationRect::from_rust),
+        }
+    }
+}
+
 impl JsParsedPage {
     pub fn from_rust(page: &ParsedPage, extract_text_metadata: bool) -> Self {
         Self {
@@ -865,6 +975,10 @@ impl JsParsedPage {
                     .map(JsDocumentAnnotation::from_rust)
                     .collect()
             }),
+            blocks: page
+                .blocks
+                .as_ref()
+                .map(|blocks| blocks.iter().map(JsLayoutBlock::from_rust).collect()),
             form_fields: page
                 .form_fields
                 .as_ref()
@@ -881,9 +995,13 @@ impl JsParsedPage {
 #[napi(object)]
 #[derive(Clone)]
 pub struct JsParseResult {
+    /// Total source-document pages before target/max-page filtering.
+    pub total_pages: u32,
     pub pages: Vec<JsParsedPage>,
+    pub page_errors: Vec<JsPageError>,
     pub text: String,
     pub images: Vec<JsExtractedImage>,
+    pub screenshots: Vec<JsScreenshotResult>,
     pub image_error_count: u32,
     pub form_type: Option<i32>,
     /// The document's `/Info` `Creator` entry, when present.
@@ -895,6 +1013,24 @@ pub struct JsParseResult {
     pub doc_meta: Option<JsDocumentMetadata>,
     /// Raw XFA packets; present only when `extractXfaPackets` is enabled.
     pub xfa_packets: Option<Vec<JsXfaPacket>>,
+}
+
+/// One batch of pages from a `ParseSession`.
+#[napi(object)]
+pub struct JsParseBatch {
+    /// First source page in this batch, 1-indexed.
+    pub start_page: u32,
+    /// Last source page in this batch, 1-indexed and inclusive.
+    pub end_page: u32,
+    /// The pages in `startPage..=endPage`, as an ordinary parse result.
+    pub result: JsParseResult,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct JsPageError {
+    pub page_num: u32,
+    pub message: String,
 }
 
 #[napi(object)]
@@ -1031,6 +1167,23 @@ impl JsScreenshotRect {
     }
 }
 
+impl JsScreenshotResult {
+    pub fn from_rust(result: &liteparse::parser::ScreenshotResult) -> Self {
+        Self {
+            page_num: result.page_num,
+            width: result.width,
+            height: result.height,
+            image_buffer: result.image_bytes.clone().into(),
+            is_solid_fill: result.is_solid_fill,
+            rects: result
+                .rects
+                .iter()
+                .map(JsScreenshotRect::from_rust)
+                .collect(),
+        }
+    }
+}
+
 #[napi(object)]
 #[derive(Clone)]
 pub struct JsLayoutComplexityStats {
@@ -1125,10 +1278,19 @@ impl JsPageComplexityStats {
 impl JsParseResult {
     pub fn from_rust(result: &ParseResult, config: &LiteParseConfig) -> Self {
         Self {
+            total_pages: result.total_pages,
             pages: result
                 .pages
                 .iter()
                 .map(|page| JsParsedPage::from_rust(page, config.extract_text_metadata))
+                .collect(),
+            page_errors: result
+                .page_errors
+                .iter()
+                .map(|error| JsPageError {
+                    page_num: error.page_number,
+                    message: error.message.clone(),
+                })
                 .collect(),
             text: result.text.clone(),
             image_error_count: result.image_error_count,
@@ -1161,6 +1323,11 @@ impl JsParseResult {
                     duplicate_of: img.duplicate_of.clone(),
                     bytes: img.bytes.as_slice().to_vec().into(),
                 })
+                .collect(),
+            screenshots: result
+                .screenshots
+                .iter()
+                .map(JsScreenshotResult::from_rust)
                 .collect(),
         }
     }

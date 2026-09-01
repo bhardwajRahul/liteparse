@@ -60,6 +60,51 @@ class AnnotationRect:
 
 
 @dataclass
+class LayoutCell:
+    """One table cell: its text and the region of the page it was read from.
+
+    ``bbox`` is ``None`` for cells with no ink behind them -- padding inserted
+    to square off a ragged grid, or halves of a merged run split at an
+    estimated position rather than an observed boundary.
+    """
+    text: str
+    bbox: Optional[AnnotationRect] = None
+
+
+@dataclass
+class LayoutBlock:
+    """A classified block of page content, discriminated by ``kind``.
+
+    ``kind`` is one of ``heading``, ``paragraph``, ``list_item``, ``code``,
+    ``table``, ``grid_fallback``, ``rule``, ``figure``. Fields that do not
+    apply to a block's kind are ``None``.
+    """
+    kind: str
+    #: Rendered text for ``heading``, ``paragraph`` and ``list_item``.
+    text: Optional[str] = None
+    #: Heading level (1-6), or list nesting depth for ``list_item``.
+    level: Optional[int] = None
+    bold: bool = False
+    italic: bool = False
+    #: ``list_item`` only; ``marker`` is the marker as it appeared on the page.
+    ordered: Optional[bool] = None
+    marker: Optional[str] = None
+    #: Verbatim source lines for ``code`` and ``grid_fallback``.
+    lines: Optional[List[str]] = None
+    #: Best-effort language hint for ``code``.
+    lang: Optional[str] = None
+    #: ``table`` only.
+    header: Optional[List[LayoutCell]] = None
+    rows: Optional[List[List[LayoutCell]]] = None
+    #: ``figure`` only, matching the ``img_{id}.{format}`` Markdown target.
+    id: Optional[str] = None
+    format: Optional[str] = None
+    #: Region this block occupies, in the same top-left 72-DPI viewport space
+    #: as ``text_items``. The union of every source line that fed the block.
+    bbox: Optional[AnnotationRect] = None
+
+
+@dataclass
 class DocumentAnnotation:
     """One PDF annotation extracted from a page."""
     subtype: str
@@ -142,6 +187,10 @@ class ParsedPage:
     form_fields: Optional[List[FormField]] = None
     #: Present only when parsing with ``extract_structure_tree=True``.
     structure_tree: Optional[StructureTree] = None
+    #: Classified layout blocks in reading order -- the same blocks, in the
+    #: same order, the page's Markdown is built from. Present only when
+    #: parsing with ``extract_blocks=True``.
+    blocks: Optional[List[LayoutBlock]] = None
     #: Union bbox ``(x, y, width, height)`` of the page's top-level content
     #: objects in viewport coords (visible content extent). Present only when
     #: parsing with ``extract_content_bounds=True``; ``None`` otherwise (and
@@ -244,12 +293,23 @@ class DocumentMetadata:
 
 
 @dataclass
+class PageError:
+    """A page-level extraction failure skipped during a tolerant parse."""
+    page_num: int
+    message: str
+
+
+@dataclass
 class ParseResult:
     """Result of parsing a document."""
     pages: List[ParsedPage]
     text: str
+    #: Total source-document pages before target/max-page filtering.
+    total_pages: int = 0
     images: List[ExtractedImage] = field(default_factory=list)
+    screenshots: List["ScreenshotResult"] = field(default_factory=list)
     image_error_count: int = 0
+    page_errors: List[PageError] = field(default_factory=list)
     #: PDFium form type, present only when ``extract_form_fields=True``.
     form_type: Optional[int] = None
     #: The document's ``/Info`` ``Creator`` entry, when present.
@@ -273,6 +333,19 @@ class ParseResult:
             if page.page_num == page_num:
                 return page
         return None
+
+
+@dataclass
+class ParseBatch:
+    """One batch of pages from :meth:`LiteParse.parse_batches`."""
+    #: First source page in this batch (1-indexed).
+    start_page: int
+    #: Last source page in this batch (1-indexed, inclusive).
+    end_page: int
+    #: Total source-document pages, before the parser's ``max_pages`` cap.
+    total_pages: int
+    #: The pages in ``start_page..end_page``, as an ordinary parse result.
+    result: ParseResult
 
 
 @dataclass
@@ -382,6 +455,8 @@ class LiteParseConfig:
     tessdata_path: Optional[str]
     max_pages: int
     target_pages: Optional[str]
+    extract_screenshots: bool
+    continue_on_page_error: bool
     dpi: float
     output_format: str
     preserve_very_small_text: bool
@@ -394,6 +469,7 @@ class LiteParseConfig:
     extract_annotations: bool
     extract_form_fields: bool
     extract_structure_tree: bool
+    extract_blocks: bool
     ocr_failure_fatal: bool
     ocr_hedge_delays_ms: List[int]
     emit_word_boxes: bool
@@ -417,3 +493,23 @@ class LiteParseConfig:
 class ParseError(Exception):
     """Exception raised when parsing fails."""
     pass
+
+
+class ParseTimeoutError(ParseError):
+    """A pooled parse exceeded ``parse_timeout`` and its worker was killed.
+
+    Only raised in pool mode (``LiteParse(pool_size=...)``), where the
+    deadline is enforced by killing the worker process — the timed-out parse
+    is guaranteed dead, not still running in the background.
+
+    Attributes:
+        source: The document that timed out — the file path, or
+            ``"<N bytes>"`` for byte inputs. Log this to identify the
+            documents that stall your pipeline.
+        timeout: The deadline that was exceeded, in seconds.
+    """
+
+    def __init__(self, message: str, *, source: str, timeout: float):
+        super().__init__(message)
+        self.source = source
+        self.timeout = timeout

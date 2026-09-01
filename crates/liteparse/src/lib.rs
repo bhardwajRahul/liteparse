@@ -5,12 +5,12 @@
 //!
 
 // ── Public API re-exports ──────────────────────────────────────────────
-pub use config::{LiteParseConfig, OutputFormat};
+pub use config::{DEFAULT_PAGE_BATCH_SIZE, LiteParseConfig, OutputFormat};
 pub use error::LiteParseError;
 #[cfg(not(target_arch = "wasm32"))]
 pub use font_db_resolver::FontDbResolver;
 pub use glyph_resolver::{GLYPH_RESOLVER_FONT_SIZE, GlyphResolver};
-pub use parser::{LiteParse, ParseResult, ScreenshotResult};
+pub use parser::{LiteParse, ParseBatch, ParseResult, ParseSession, ScreenshotResult};
 pub use search::{SearchOptions, search_items};
 pub use types::{DocumentMetadata, ParsedPage, TextItem, WordBox};
 
@@ -18,6 +18,7 @@ pub use types::{DocumentMetadata, ParsedPage, TextItem, WordBox};
 pub mod config;
 pub mod error;
 pub mod glyph_resolver;
+pub mod layout;
 pub mod parser;
 pub mod search;
 pub mod types;
@@ -52,6 +53,5 @@ pub mod ocr_merge;
 pub mod output;
 #[doc(hidden)]
 pub mod projection;
-#[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub mod render;

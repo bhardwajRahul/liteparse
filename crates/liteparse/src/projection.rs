@@ -820,100 +820,101 @@ fn form_lines(
         *line = merged_line;
     }
 
-    // Merge overlapping lines when there is no horizontal bbox overlap.
-    let mut i = 1usize;
-    while i < lines.len() {
-        let (previous_min_y, previous_max_y) = {
-            let previous = &lines[i - 1];
-            let min_y = previous
-                .iter()
-                .map(|v| v.item.y)
-                .fold(f32::INFINITY, |a, b| a.min(b));
-            let max_y = previous
-                .iter()
-                .map(|v| v.item.y + v.item.height)
-                .fold(f32::NEG_INFINITY, |a, b| a.max(b));
-            (min_y, max_y)
-        };
+    // Merge overlapping lines when there is no horizontal bbox overlap,
+    // folding into an accumulator whose last line keeps absorbing successors.
+    // Ribbon pages reach 10⁵+ lines, so this must stay linear: the x-sort of
+    // a merged line is deferred until it stops absorbing (no check here
+    // depends on item order) and its y-range is maintained incrementally.
+    let y_range = |line: &[ProjectedTextItem]| -> (f32, f32) {
+        line.iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |acc, v| {
+                (acc.0.min(v.item.y), acc.1.max(v.item.y + v.item.height))
+            })
+    };
+    let mut merged: Vec<Vec<ProjectedTextItem>> = Vec::with_capacity(lines.len());
+    let mut prev_range = (f32::INFINITY, f32::NEG_INFINITY);
+    let mut prev_absorbed = false;
+    for mut current in lines {
+        let (current_min_y, current_max_y) = y_range(&current);
+        if let Some(previous) = merged.last_mut() {
+            let (previous_min_y, previous_max_y) = prev_range;
 
-        let (current_min_y, current_max_y) = {
-            let current = &lines[i];
-            let min_y = current
-                .iter()
-                .map(|v| v.item.y)
-                .fold(f32::INFINITY, |a, b| a.min(b));
-            let max_y = current
-                .iter()
-                .map(|v| v.item.y + v.item.height)
-                .fold(f32::NEG_INFINITY, |a, b| a.max(b));
-            (min_y, max_y)
-        };
+            // Do the two lines overlap vertically?
+            let lines_overlap = previous_max_y > current_min_y && previous_min_y < current_max_y;
 
-        // Do the two lines overlap vertically?
-        let lines_overlap = previous_max_y > current_min_y && previous_min_y < current_max_y;
-
-        if lines_overlap {
-            let bbox_overlap = {
-                let previous = &lines[i - 1];
-                let current = &lines[i];
-                current.iter().any(|bbox| {
+            if lines_overlap {
+                let bbox_overlap = current.iter().any(|bbox| {
                     previous.iter().any(|prev_bbox| {
                         (bbox.item.x >= prev_bbox.item.x
                             && bbox.item.x <= prev_bbox.item.x + prev_bbox.item.width)
                             || (prev_bbox.item.x >= bbox.item.x
                                 && prev_bbox.item.x <= bbox.item.x + bbox.item.width)
                     })
-                })
-            };
+                });
 
-            if !bbox_overlap {
-                if dbg_lines {
-                    let pj: String = lines[i - 1]
-                        .iter()
-                        .map(|x| x.item.text.trim())
-                        .collect::<Vec<_>>()
-                        .join("|");
-                    let cj: String = lines[i]
-                        .iter()
-                        .map(|x| x.item.text.trim())
-                        .collect::<Vec<_>>()
-                        .join("|");
-                    eprintln!(
-                        "[form_lines:overlap-merge] py={previous_min_y:.1}..{previous_max_y:.1} cy={current_min_y:.1}..{current_max_y:.1}\n    prev={pj:.60}\n    cur ={cj:.60}"
+                if !bbox_overlap {
+                    if dbg_lines {
+                        let pj: String = previous
+                            .iter()
+                            .map(|x| x.item.text.trim())
+                            .collect::<Vec<_>>()
+                            .join("|");
+                        let cj: String = current
+                            .iter()
+                            .map(|x| x.item.text.trim())
+                            .collect::<Vec<_>>()
+                            .join("|");
+                        eprintln!(
+                            "[form_lines:overlap-merge] py={previous_min_y:.1}..{previous_max_y:.1} cy={current_min_y:.1}..{current_max_y:.1}\n    prev={pj:.60}\n    cur ={cj:.60}"
+                        );
+                    }
+                    previous.append(&mut current);
+                    prev_range = (
+                        previous_min_y.min(current_min_y),
+                        previous_max_y.max(current_max_y),
                     );
+                    prev_absorbed = true;
+                    continue;
                 }
-                let mut current = lines.remove(i);
-                lines[i - 1].append(&mut current);
-                lines[i - 1].sort_by(|a, b| a.item.x.total_cmp(&b.item.x));
-                continue;
+            }
+            if prev_absorbed {
+                previous.sort_by(|a, b| a.item.x.total_cmp(&b.item.x));
             }
         }
-
-        i += 1;
+        merged.push(current);
+        prev_range = (current_min_y, current_max_y);
+        prev_absorbed = false;
     }
+    if prev_absorbed && let Some(previous) = merged.last_mut() {
+        previous.sort_by(|a, b| a.item.x.total_cmp(&b.item.x));
+    }
+    let lines = merged;
 
     dump_lines("after_overlap_merge", &lines);
 
-    // Insert blank lines for vertical gaps between lines.
-    let mut i = 1;
-    while i < lines.len() {
-        let prev_metrics = representative_line_metrics(&lines[i - 1], median_height);
-        let cur_metrics = representative_line_metrics(&lines[i], median_height);
-        let y_delta = cur_metrics.0 - prev_metrics.1; // cur_top - prev_bottom
-        let reference_height = median_height.max(prev_metrics.2.min(cur_metrics.2));
+    // Insert blank lines for vertical gaps between lines. Gaps are measured
+    // between consecutive content lines only; inserted blanks never
+    // participate.
+    let mut with_blanks: Vec<Vec<ProjectedTextItem>> = Vec::with_capacity(lines.len());
+    let mut prev_metrics: Option<(f32, f32, f32)> = None;
+    for line in lines {
+        let cur_metrics = representative_line_metrics(&line, median_height);
+        if let Some(prev_metrics) = prev_metrics {
+            let y_delta = cur_metrics.0 - prev_metrics.1; // cur_top - prev_bottom
+            let reference_height = median_height.max(prev_metrics.2.min(cur_metrics.2));
 
-        if y_delta > reference_height {
-            let num_blank = ((y_delta / reference_height).round() as usize).saturating_sub(1);
-            let to_insert = num_blank.clamp(1, 10);
-            for _ in 0..to_insert {
-                lines.insert(i, Vec::new());
-                i += 1;
+            if y_delta > reference_height {
+                let num_blank = ((y_delta / reference_height).round() as usize).saturating_sub(1);
+                for _ in 0..num_blank.clamp(1, 10) {
+                    with_blanks.push(Vec::new());
+                }
             }
         }
-        i += 1;
+        prev_metrics = Some(cur_metrics);
+        with_blanks.push(line);
     }
 
-    lines
+    with_blanks
 }
 
 /// Returns (top, bottom, height) for representative items in a line,
@@ -2919,6 +2920,9 @@ pub fn project_pages_to_grid(pages: Vec<Page>) -> Vec<ParsedPage> {
                 annotations: page.annotations,
                 form_fields: page.form_fields,
                 structure_tree: page.structure_tree,
+                // Filled in after classification, which needs the finished
+                // page (and whole-document signals) to run.
+                blocks: None,
             }
         })
         .collect()

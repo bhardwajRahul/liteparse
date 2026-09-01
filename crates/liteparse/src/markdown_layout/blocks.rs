@@ -1,6 +1,119 @@
 use super::inline::escape_inline;
 use super::paragraphs::{ParaAccum, is_soft_hyphen_break};
 use super::tables::escape_table_cell;
+use crate::types::Rect;
+
+/// One table cell: rendered text plus, when the cell came from real page
+/// content, the region it occupied. `bbox` is `None` for cells that exist only
+/// to square off a ragged grid (padding inserted when rows disagree on column
+/// count) — those occupy no ink on the page, and reporting a rect for them
+/// would invent geometry the classifier never saw.
+#[derive(Debug, Clone, Default)]
+pub struct Cell {
+    pub text: String,
+    pub bbox: Option<Rect>,
+}
+
+impl Cell {
+    /// Cell carrying text and the region it was read from.
+    pub fn located(text: impl Into<String>, bbox: Rect) -> Self {
+        Cell {
+            text: text.into(),
+            bbox: Some(bbox),
+        }
+    }
+
+    /// Borrow the cell's text. Lets call sites that only care about content
+    /// read a `Cell` about as tersely as the `String` it replaced.
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+}
+
+// Text-only construction (`"a".into()`, `s.to_string().into()`)
+impl From<&str> for Cell {
+    fn from(text: &str) -> Self {
+        Cell {
+            text: text.to_string(),
+            bbox: None,
+        }
+    }
+}
+
+impl From<String> for Cell {
+    fn from(text: String) -> Self {
+        Cell { text, bbox: None }
+    }
+}
+
+// Cells compare by content alone. A cell's box is derived metadata describing
+// where the text was read from, not part of its identity — two cells holding
+// the same text are the same table content whether or not either one knows its
+// coordinates. This is also what lets assertions compare a detected grid
+// against a plain literal of expected strings.
+impl PartialEq for Cell {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+}
+
+impl Eq for Cell {}
+
+impl PartialEq<str> for Cell {
+    fn eq(&self, other: &str) -> bool {
+        self.text == other
+    }
+}
+
+impl PartialEq<&str> for Cell {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+impl PartialEq<String> for Cell {
+    fn eq(&self, other: &String) -> bool {
+        self.text == *other
+    }
+}
+
+/// One cell of a [`Block::MergedTable`]. `colspan`/`rowspan` are 1 for an
+/// ordinary cell; the cells they cover are absent from `rows` rather than
+/// present-and-empty, matching HTML's occupancy model. Distinct from [`Cell`]:
+/// that type carries the page geometry a cell was *read from*, this one the
+/// merge structure a producer *declared*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanCell {
+    pub text: String,
+    pub colspan: u16,
+    pub rowspan: u16,
+}
+
+impl SpanCell {
+    /// A plain 1x1 cell.
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            colspan: 1,
+            rowspan: 1,
+        }
+    }
+
+    /// A cell spanning `colspan` columns and `rowspan` rows. Zero is coerced to
+    /// 1 — a zero span is meaningless in HTML and `rowspan="0"` means "to the
+    /// end of the section", which is not what any producer here intends.
+    pub fn spanning(text: impl Into<String>, colspan: u16, rowspan: u16) -> Self {
+        Self {
+            text: text.into(),
+            colspan: colspan.max(1),
+            rowspan: rowspan.max(1),
+        }
+    }
+
+    fn is_plain(&self) -> bool {
+        self.colspan <= 1 && self.rowspan <= 1
+    }
+}
 
 /// Coarse block representation: the output of page classification, consumed by
 /// `render_blocks` to produce the final markdown string.
@@ -36,8 +149,8 @@ pub enum Block {
     /// when the first row didn't qualify (e.g. wasn't bold and the table mode
     /// can't otherwise distinguish it).
     Table {
-        header: Option<Vec<String>>,
-        rows: Vec<Vec<String>>,
+        header: Option<Vec<Cell>>,
+        rows: Vec<Vec<Cell>>,
     },
     /// Table whose cells carry explicit spans. Emitted by producers that know
     /// the merge structure outright (e.g. a structural reader with access to
@@ -50,7 +163,7 @@ pub enum Block {
     /// Renders as a GFM pipe table when it degenerates to a plain grid, and as
     /// HTML `<table>` otherwise — pipe tables cannot express spans at all.
     MergedTable {
-        rows: Vec<Vec<Cell>>,
+        rows: Vec<Vec<SpanCell>>,
         header_rows: usize,
     },
     /// Tabular-looking region we couldn't classify confidently — rendered
@@ -68,42 +181,6 @@ pub enum Block {
         id: String,
         format: String,
     },
-}
-
-/// One cell of a [`Block::MergedTable`]. `colspan`/`rowspan` are 1 for an
-/// ordinary cell; the cells they cover are absent from `rows` rather than
-/// present-and-empty, matching HTML's occupancy model.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Cell {
-    pub text: String,
-    pub colspan: u16,
-    pub rowspan: u16,
-}
-
-impl Cell {
-    /// A plain 1x1 cell.
-    pub fn new(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            colspan: 1,
-            rowspan: 1,
-        }
-    }
-
-    /// A cell spanning `colspan` columns and `rowspan` rows. Zero is coerced to
-    /// 1 — a zero span is meaningless in HTML and `rowspan="0"` means "to the
-    /// end of the section", which is not what any producer here intends.
-    pub fn spanning(text: impl Into<String>, colspan: u16, rowspan: u16) -> Self {
-        Self {
-            text: text.into(),
-            colspan: colspan.max(1),
-            rowspan: rowspan.max(1),
-        }
-    }
-
-    fn is_plain(&self) -> bool {
-        self.colspan <= 1 && self.rowspan <= 1
-    }
 }
 
 /// Resolve a `ParaAccum` to a `Block::Paragraph`. When the paragraph was
@@ -146,9 +223,87 @@ fn wrap_emphasis(text: &str, bold: bool, italic: bool) -> String {
     }
 }
 
+/// A classified block plus the region of the page it was read from.
+///
+/// `bbox` is the union of the boxes of every source line that fed the block, so
+/// a wrapped heading or a multi-line paragraph reports the whole band it
+/// occupies. It is `None` only for blocks with no page geometry behind them —
+/// synthesized content, or sources that never carried coordinates.
+#[derive(Debug, Clone)]
+pub struct PositionedBlock {
+    pub block: Block,
+    pub bbox: Option<Rect>,
+}
+
+impl PositionedBlock {
+    pub fn new(block: Block, bbox: Option<Rect>) -> Self {
+        PositionedBlock { block, bbox }
+    }
+
+    /// A block with no known geometry.
+    pub fn unlocated(block: Block) -> Self {
+        PositionedBlock { block, bbox: None }
+    }
+
+    /// Grow this block's box to also cover `other`.
+    fn absorb(&mut self, other: &Option<Rect>) {
+        if let Some(r) = other {
+            Rect::extend(&mut self.bbox, r);
+        }
+    }
+}
+
+/// Heal words hyphenated across a soft line wrap that the classifier split into
+/// two *separate* paragraph blocks: `…they dis-` ‖ `lodged…`. When a plain
+/// paragraph ends with `<letter>-` and the next is a plain paragraph starting
+/// lowercase, fuse them — dropping the hyphen and joining with no separator —
+/// and union their boxes, since the result spans both source regions.
+///
+/// This runs as a pass over the block list rather than inside the renderer so
+/// that the blocks callers receive are the same ones that produced the
+/// markdown. The lowercase and plain-text gates keep real compounds (`well-`
+/// then a capitalized `Known`) and emphasised/heading/table starts intact.
+pub fn splice_soft_hyphens(blocks: Vec<PositionedBlock>) -> Vec<PositionedBlock> {
+    let mut out: Vec<PositionedBlock> = Vec::with_capacity(blocks.len());
+    for pb in blocks {
+        // Both sides must be unemphasised: an emphasised predecessor renders
+        // with a trailing `**`/`*`, so its final character was never the
+        // hyphen this splice keys off.
+        let joinable = match (out.last().map(|p| &p.block), &pb.block) {
+            (
+                Some(Block::Paragraph {
+                    text: prev,
+                    bold: false,
+                    italic: false,
+                }),
+                Block::Paragraph {
+                    text,
+                    bold: false,
+                    italic: false,
+                },
+            ) => is_soft_hyphen_break(prev, text).then(|| text.clone()),
+            _ => None,
+        };
+        if let Some(tail) = joinable {
+            let prev = out.last_mut().expect("gate matched on a previous block");
+            if let Block::Paragraph { text, .. } = &mut prev.block {
+                while text.ends_with(|c: char| c.is_whitespace()) {
+                    text.pop();
+                }
+                text.pop(); // the soft hyphen
+                text.push_str(&tail);
+            }
+            prev.absorb(&pb.bbox);
+            continue;
+        }
+        out.push(pb);
+    }
+    out
+}
+
 /// Render a GFM pipe table. `head` is the header row (already chosen by the
 /// caller); `body` the remaining rows. No-ops when there are no columns.
-fn render_pipe_table(head: Option<&[String]>, body: &[Vec<String>], out: &mut String) {
+fn render_pipe_table(head: Option<&[Cell]>, body: &[Vec<Cell>], out: &mut String) {
     let column_count = head.map(|h| h.len()).unwrap_or(0);
     if column_count == 0 {
         return;
@@ -158,7 +313,7 @@ fn render_pipe_table(head: Option<&[String]>, body: &[Vec<String>], out: &mut St
         if i > 0 {
             out.push_str(" | ");
         }
-        out.push_str(&escape_table_cell(cell));
+        out.push_str(&escape_table_cell(&cell.text));
     }
     out.push_str(" |\n");
     out.push('|');
@@ -171,7 +326,7 @@ fn render_pipe_table(head: Option<&[String]>, body: &[Vec<String>], out: &mut St
             if i > 0 {
                 out.push_str(" | ");
             }
-            out.push_str(&escape_table_cell(cell));
+            out.push_str(&escape_table_cell(&cell.text));
         }
         out.push_str(" |");
     }
@@ -196,12 +351,12 @@ fn escape_html_cell(s: &str) -> String {
 
 /// True when a merged table degenerates to a plain rectangular grid, in which
 /// case the pipe rendering is both valid and nicer to read.
-fn is_plain_grid(rows: &[Vec<Cell>], header_rows: usize) -> bool {
+fn is_plain_grid(rows: &[Vec<SpanCell>], header_rows: usize) -> bool {
     // GFM has exactly one header row, or none.
     if header_rows > 1 {
         return false;
     }
-    if !rows.iter().all(|r| r.iter().all(Cell::is_plain)) {
+    if !rows.iter().all(|r| r.iter().all(SpanCell::is_plain)) {
         return false;
     }
     // Ragged rows can only have come from spans we've just ruled out, but check
@@ -212,7 +367,7 @@ fn is_plain_grid(rows: &[Vec<Cell>], header_rows: usize) -> bool {
 
 /// Render a merged table as HTML. Cells covered by a neighbour's span are
 /// simply absent from `rows`, so this is a direct transcription.
-fn render_html_table(rows: &[Vec<Cell>], header_rows: usize, out: &mut String) {
+fn render_html_table(rows: &[Vec<SpanCell>], header_rows: usize, out: &mut String) {
     out.push_str("<table>");
     for (r, row) in rows.iter().enumerate() {
         out.push_str("\n<tr>");
@@ -238,39 +393,15 @@ fn render_html_table(rows: &[Vec<Cell>], header_rows: usize, out: &mut String) {
 }
 
 /// Render a list of blocks to a markdown string.
-pub fn render_blocks(blocks: &[Block]) -> String {
+pub fn render_blocks(blocks: &[PositionedBlock]) -> String {
     let mut out = String::new();
-    for (i, block) in blocks.iter().enumerate() {
+    for (i, positioned) in blocks.iter().enumerate() {
+        let block = &positioned.block;
         if i > 0 {
-            // A word hyphenated across a soft line wrap sometimes lands in two
-            // *separate* paragraph blocks (the classifier mis-split mid-word):
-            // `…they dis-` ‖ `lodged…`. When the previous block ends with
-            // `<letter>-` and this block is a plain paragraph beginning with a
-            // lowercase letter, splice them: drop the hyphen and join with no
-            // separator, healing both the word and the spurious break. The
-            // lowercase + plain-text gates keep real compounds (`well-` then a
-            // capitalized `Known`) and emphasised/heading/table starts intact.
-            if let (
-                Block::Paragraph { .. },
-                Block::Paragraph {
-                    text,
-                    bold: false,
-                    italic: false,
-                },
-            ) = (&blocks[i - 1], block)
-                && is_soft_hyphen_break(&out, text)
-            {
-                while out.ends_with(|c: char| c.is_whitespace()) {
-                    out.pop();
-                }
-                out.pop(); // the soft hyphen
-                out.push_str(text);
-                continue;
-            }
             // Consecutive list items render as a tight list (single newline).
             // Everything else gets a blank line between blocks.
             let tight = matches!(block, Block::ListItem { .. })
-                && matches!(blocks[i - 1], Block::ListItem { .. });
+                && matches!(blocks[i - 1].block, Block::ListItem { .. });
             if tight {
                 out.push('\n');
             } else {
@@ -315,7 +446,7 @@ pub fn render_blocks(blocks: &[Block]) -> String {
                 // detector found no header, promote the first body row instead
                 // of synthesizing a blank `|   |   |` header — a visible empty
                 // row reads as sloppy output and carries no information.
-                let (head, body): (Option<&[String]>, &[Vec<String>]) = match header {
+                let (head, body): (Option<&[Cell]>, &[Vec<Cell>]) = match header {
                     Some(h) => (Some(h.as_slice()), rows.as_slice()),
                     None => match rows.split_first() {
                         Some((first, rest)) => (Some(first.as_slice()), rest),
@@ -330,11 +461,12 @@ pub fn render_blocks(blocks: &[Block]) -> String {
                 }
                 if is_plain_grid(rows, *header_rows) {
                     // Degenerate case — no merges, so pipes are expressive
-                    // enough. Reuse the exact same rendering the PDF path gets,
-                    // including the promote-first-row-when-headerless rule.
-                    let plain: Vec<Vec<String>> = rows
+                    // enough. Reuse the exact same rendering `Block::Table`
+                    // gets, including the promote-first-row-when-headerless
+                    // rule.
+                    let plain: Vec<Vec<Cell>> = rows
                         .iter()
-                        .map(|r| r.iter().map(|c| c.text.clone()).collect())
+                        .map(|r| r.iter().map(|c| Cell::from(c.text.clone())).collect())
                         .collect();
                     // `header_rows` is 0 or 1 here (>1 forces HTML). Either way
                     // the first row leads: as the real header, or promoted into
@@ -395,6 +527,14 @@ pub fn render_blocks(blocks: &[Block]) -> String {
 mod tests {
     use super::*;
 
+    /// Render content blocks that carry no geometry — the shape almost every
+    /// rendering assertion below cares about.
+    fn render(blocks: Vec<Block>) -> String {
+        let positioned: Vec<PositionedBlock> =
+            blocks.into_iter().map(PositionedBlock::unlocated).collect();
+        render_blocks(&positioned)
+    }
+
     #[test]
     fn render_blocks_formats_markdown() {
         let blocks = vec![
@@ -412,14 +552,14 @@ mod tests {
                 text: "Sub".into(),
             },
         ];
-        let s = render_blocks(&blocks);
+        let s = render(blocks);
         assert_eq!(s, "# Title\n\nA paragraph.\n\n## Sub");
     }
 
     #[test]
     fn render_figure_uses_extracted_format() {
         assert_eq!(
-            render_blocks(&[Block::Figure {
+            render(vec![Block::Figure {
                 id: "p1_1".into(),
                 format: "jpg".into(),
             }]),
@@ -457,11 +597,11 @@ mod tests {
                 italic: false,
             },
         ];
-        let s = render_blocks(&blocks);
+        let s = render(blocks);
         assert_eq!(s, "Intro.\n\n- a\n- b\n\nOutro.");
 
         // Ordered: original marker preserved
-        let s = render_blocks(&[
+        let s = render(vec![
             Block::ListItem {
                 ordered: true,
                 marker: "138.".into(),
@@ -496,7 +636,7 @@ mod tests {
             lines: vec!["body containing ``` backticks".into()],
             lang: None,
         }];
-        let s = render_blocks(&blocks);
+        let s = render(blocks);
         assert!(s.starts_with("~~~\n"));
         assert!(s.ends_with("~~~"));
     }
@@ -507,7 +647,7 @@ mod tests {
             header: Some(vec!["a".into(), "b".into()]),
             rows: vec![vec!["1".into(), "2".into()], vec!["3".into(), "4".into()]],
         }];
-        let s = render_blocks(&blocks);
+        let s = render(blocks);
         assert_eq!(s, "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |");
     }
 
@@ -518,15 +658,40 @@ mod tests {
             bold: false,
             italic: false,
         };
+        let spliced = |a: &str, b: &str| {
+            splice_soft_hyphens(vec![
+                PositionedBlock::unlocated(p(a)),
+                PositionedBlock::unlocated(p(b)),
+            ])
+        };
+        let rendered = |a: &str, b: &str| render_blocks(&spliced(a, b));
         // Mid-word hyphen split into two paragraphs heals into one.
-        let s = render_blocks(&[p("they dis-"), p("lodged the part")]);
-        assert_eq!(s, "they dislodged the part");
+        assert_eq!(
+            rendered("they dis-", "lodged the part"),
+            "they dislodged the part"
+        );
         // Capitalized continuation is a real compound break — left intact.
-        let s = render_blocks(&[p("the well-"), p("Known fact")]);
-        assert_eq!(s, "the well-\n\nKnown fact");
+        assert_eq!(
+            rendered("the well-", "Known fact"),
+            "the well-\n\nKnown fact"
+        );
         // Trailing dash not preceded by a letter doesn't splice.
-        let s = render_blocks(&[p("a -"), p("dash line")]);
-        assert_eq!(s, "a -\n\ndash line");
+        assert_eq!(rendered("a -", "dash line"), "a -\n\ndash line");
+        // A spliced block covers both source regions; an unspliced pair stays
+        // as two blocks with their own boxes.
+        let r = |y: f32| Rect {
+            x: 10.0,
+            y,
+            width: 100.0,
+            height: 12.0,
+        };
+        let joined = splice_soft_hyphens(vec![
+            PositionedBlock::new(p("they dis-"), Some(r(50.0))),
+            PositionedBlock::new(p("lodged the part"), Some(r(70.0))),
+        ]);
+        assert_eq!(joined.len(), 1);
+        let bbox = joined[0].bbox.clone().expect("merged block keeps geometry");
+        assert_eq!((bbox.y, bbox.height), (50.0, 32.0));
     }
 
     #[test]
@@ -541,22 +706,22 @@ mod tests {
         let merged = Block::MergedTable {
             header_rows: 1,
             rows: vec![
-                vec![Cell::new("a"), Cell::new("b")],
-                vec![Cell::new("1"), Cell::new("2")],
+                vec![SpanCell::new("a"), SpanCell::new("b")],
+                vec![SpanCell::new("1"), SpanCell::new("2")],
             ],
         };
-        assert_eq!(render_blocks(&[plain]), render_blocks(&[merged]));
+        assert_eq!(render(vec![plain]), render(vec![merged]));
     }
 
     #[test]
     fn merged_table_with_spans_renders_as_html() {
         // Cells covered by a span are absent, not empty — row 1 has one cell.
-        let s = render_blocks(&[Block::MergedTable {
+        let s = render(vec![Block::MergedTable {
             header_rows: 1,
             rows: vec![
-                vec![Cell::spanning("wide", 2, 1)],
-                vec![Cell::spanning("tall", 1, 2), Cell::new("x")],
-                vec![Cell::new("y")],
+                vec![SpanCell::spanning("wide", 2, 1)],
+                vec![SpanCell::spanning("tall", 1, 2), SpanCell::new("x")],
+                vec![SpanCell::new("y")],
             ],
         }]);
         assert_eq!(
@@ -570,9 +735,12 @@ mod tests {
     #[test]
     fn merged_table_escapes_html_not_markdown() {
         // Inside an HTML block, markdown specials are literal; `<` is not.
-        let s = render_blocks(&[Block::MergedTable {
+        let s = render(vec![Block::MergedTable {
             header_rows: 0,
-            rows: vec![vec![Cell::new("a|b *c* <d> &e"), Cell::spanning("f", 2, 1)]],
+            rows: vec![vec![
+                SpanCell::new("a|b *c* <d> &e"),
+                SpanCell::spanning("f", 2, 1),
+            ]],
         }]);
         assert!(s.contains("<td>a|b *c* &lt;d&gt; &amp;e</td>"), "{s}");
     }
@@ -580,12 +748,12 @@ mod tests {
     #[test]
     fn merged_table_multiple_header_rows_force_html() {
         // Two header rows have no pipe-table representation even with no spans.
-        let s = render_blocks(&[Block::MergedTable {
+        let s = render(vec![Block::MergedTable {
             header_rows: 2,
             rows: vec![
-                vec![Cell::new("a"), Cell::new("b")],
-                vec![Cell::new("c"), Cell::new("d")],
-                vec![Cell::new("1"), Cell::new("2")],
+                vec![SpanCell::new("a"), SpanCell::new("b")],
+                vec![SpanCell::new("c"), SpanCell::new("d")],
+                vec![SpanCell::new("1"), SpanCell::new("2")],
             ],
         }]);
         assert!(s.starts_with("<table>"), "{s}");
@@ -597,9 +765,12 @@ mod tests {
     fn merged_table_ragged_rows_force_html() {
         // Uneven row widths with no declared spans would render as a broken
         // pipe table; HTML at least preserves the cells.
-        let s = render_blocks(&[Block::MergedTable {
+        let s = render(vec![Block::MergedTable {
             header_rows: 1,
-            rows: vec![vec![Cell::new("a"), Cell::new("b")], vec![Cell::new("1")]],
+            rows: vec![
+                vec![SpanCell::new("a"), SpanCell::new("b")],
+                vec![SpanCell::new("1")],
+            ],
         }]);
         assert!(s.starts_with("<table>"), "{s}");
     }
@@ -608,7 +779,7 @@ mod tests {
     fn zero_span_is_coerced_to_one() {
         // `rowspan="0"` means "to the end of the section" in HTML — never what
         // a producer means here, so it must not survive into the output.
-        let c = Cell::spanning("x", 0, 0);
+        let c = SpanCell::spanning("x", 0, 0);
         assert_eq!((c.colspan, c.rowspan), (1, 1));
         assert!(c.is_plain());
     }
@@ -619,7 +790,7 @@ mod tests {
             header: None,
             rows: vec![vec!["h1".into(), "h2".into()], vec!["1".into(), "2".into()]],
         }];
-        let s = render_blocks(&blocks);
+        let s = render(blocks);
         // No blank `|   |   |` header: the first row becomes the header.
         assert_eq!(s, "| h1 | h2 |\n|---|---|\n| 1 | 2 |");
     }

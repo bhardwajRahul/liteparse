@@ -180,7 +180,7 @@ jobs:
 
       - name: Build TypeScript
         working-directory: packages/node
-        run: npx tsc
+        run: npm run build:ts
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -233,18 +233,11 @@ jobs:
 
       - name: Build TypeScript
         working-directory: packages/node
-        run: npx tsc
+        run: npm run build:ts
 
-      - name: Smoke test
+      - name: Test ESM + CJS entry points
         working-directory: packages/node
-        run: |
-          node -e "
-            import('./dist/lib.js').then(async ({ LiteParse }) => {
-              const p = new LiteParse({ ocrEnabled: false, quiet: true });
-              console.log('Config:', JSON.stringify(p.getConfig()));
-              console.log('Native module loaded successfully');
-            });
-          "
+        run: npm test
 
   build-cli:
     needs: validate
@@ -343,7 +336,7 @@ jobs:
 
       - name: Build TypeScript
         working-directory: packages/node
-        run: npx tsc
+        run: npm run build:ts
 
       - name: Download all binding artifacts
         uses: actions/download-artifact@v4

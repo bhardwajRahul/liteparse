@@ -19,6 +19,16 @@ pub struct LiteParseConfig {
     pub max_pages: usize,
     /// Specific pages to parse (e.g., "1-5,10,15-20"). None means all pages.
     pub target_pages: Option<String>,
+    /// Render parsed pages to PNG and return them in `ParseResult.screenshots`.
+    /// Default `false`; PNG payloads can be large.
+    #[serde(default)]
+    pub extract_screenshots: bool,
+    /// Continue parsing after a page-level PDFium extraction failure and
+    /// report it in `ParseResult.page_errors`. Default `false` preserves the
+    /// fail-fast behavior. Document-open and document-level failures remain
+    /// fatal regardless of this setting.
+    #[serde(default)]
+    pub continue_on_page_error: bool,
     /// DPI for rendering pages (used for OCR and screenshots).
     pub dpi: f32,
     /// Output format.
@@ -63,6 +73,16 @@ pub struct LiteParseConfig {
     /// Extract the tagged-PDF logical structure tree. Default `false`.
     #[serde(default)]
     pub extract_structure_tree: bool,
+    /// Emit each page's classified layout blocks (headings, paragraphs, list
+    /// items, tables with per-cell boxes, code, rules, figures) with bounding
+    /// boxes. Default `false`.
+    ///
+    /// This is the same decomposition the Markdown renderer consumes, exposed
+    /// as data. It is independent of `output_format`: blocks are available in
+    /// JSON and text modes too, and enabling it never changes the rendered
+    /// Markdown.
+    #[serde(default)]
+    pub extract_blocks: bool,
     /// Emit each page's `content_bounds`: the union bbox of its top-level
     /// content objects in viewport coords (visible content extent). Default
     /// `false` to keep the default output shape unchanged. Content bounds are
@@ -213,6 +233,8 @@ impl Default for LiteParseConfig {
             tessdata_path: None,
             max_pages: 1000,
             target_pages: None,
+            extract_screenshots: false,
+            continue_on_page_error: false,
             dpi: 150.0,
             output_format: OutputFormat::Json,
             preserve_very_small_text: false,
@@ -227,6 +249,7 @@ impl Default for LiteParseConfig {
             extract_annotations: false,
             extract_form_fields: false,
             extract_structure_tree: false,
+            extract_blocks: false,
             extract_content_bounds: false,
             extract_xfa_packets: false,
             extract_document_metadata: false,
@@ -258,6 +281,13 @@ fn default_num_workers() -> usize {
 /// document approaches this many pages, so the cap only ever rejects nonsense
 /// input.
 const MAX_TARGET_PAGES: u64 = 100_000;
+
+/// Pages per batch when a caller of
+/// [`crate::parser::LiteParse::open_batch_session`] does
+/// not pick a size. Small enough to keep the materialized result bounded;
+/// large enough that the per-batch document reopen stays modest (it costs
+/// roughly 13% at this size on a 457-page document, ~4% at 50).
+pub const DEFAULT_PAGE_BATCH_SIZE: usize = 25;
 
 #[doc(hidden)]
 pub fn parse_target_pages(s: &str) -> Result<Vec<u32>, String> {
@@ -353,6 +383,8 @@ mod tests {
         // OCR defaults on only when a built-in engine is compiled in.
         assert_eq!(c.ocr_enabled, cfg!(feature = "tesseract"));
         assert_eq!(c.max_pages, 1000);
+        assert!(!c.extract_screenshots);
+        assert!(!c.continue_on_page_error);
         assert_eq!(c.dpi, 150.0);
         assert_eq!(c.output_format, OutputFormat::Json);
         assert!(!c.preserve_very_small_text);

@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const PDFIUM_RELEASE_TAG: &str = "chromium/7897";
+const PDFIUM_RELEASE_TAG: &str = "chromium/8028";
 const PDFIUM_RELEASE_URL: &str = "https://github.com/run-llama/pdfium-binaries/releases/download";
 
 fn main() {
@@ -277,6 +277,7 @@ fn run_bindgen(include_dir: &Path) {
             .allowlist_type("FPDF.*")
             .allowlist_type("FS_.*")
             .allowlist_var("FPDF.*")
+            .allowlist_var("FLAT.*")
             .derive_debug(true)
             .derive_default(true)
             .layout_tests(false)
