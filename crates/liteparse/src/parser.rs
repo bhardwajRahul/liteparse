@@ -992,29 +992,11 @@ impl LiteParse {
         Ok((pages, page_blocks, page_stats, page_filtered))
     }
 
-    /// `parse_from_pages`'s structural sibling: the caller owns block-level
+    /// Build the output directly from blocks: the caller owns block-level
     /// structure (headings, lists, tables, merged cells) alongside the text
     /// items, so per-page markdown renders from the block model with
     /// `render_blocks` while page `.text` still comes from grid projection
-    /// over the supplied text items — the same spatial text layout every
-    /// other path produces. Like `parse_from_pages` this never touches
-    /// PDFium or OCR and is fully synchronous; text items arrive in viewport
-    /// space (top-left origin, 72 DPI). `page_blocks` must align 1:1 with
-    /// `pages`; `page_stats` carries per-page complexity (or `None`s).
-    /// Blocks arrive as [`PositionedBlock`](crate::markdown_layout::
-    /// PositionedBlock)s — a producer without per-block geometry wraps each
-    /// with `PositionedBlock::unlocated`. When `extract_blocks` is on, the
-    /// supplied blocks (and their boxes) also populate each page's `blocks`,
-    /// mirroring the classifier path.
-    ///
-    /// Doc-level markdown renders from `all_blocks` when given, NOT by
-    /// joining the page renders: `render_blocks` is context-sensitive across
-    /// block boundaries (tight lists join with `\n`, soft-hyphen paragraph
-    /// splices join with nothing), so a page-boundary join would perturb
-    /// whitespace wherever a page break falls inside a list. The per-page
-    /// markdown is the paged *view* of the same blocks. `target_pages` /
-    /// `max_pages` filtering drops `all_blocks` and falls back to joining
-    /// the surviving pages.
+    /// over the supplied text items.
     pub fn parse_from_blocks(
         &self,
         pages: Vec<Page>,

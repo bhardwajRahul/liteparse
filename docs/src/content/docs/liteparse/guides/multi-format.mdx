@@ -47,45 +47,6 @@ choco install libreoffice-fresh
 
 > On Windows, you may need to add the LibreOffice CLI directory (typically `C:\Program Files\LibreOffice\program`) to your PATH and restart.
 
-### Fonts (optional, affects DOCX geometry)
-
-DOCX files carry no coordinates — not for a page, a line, or a character. LiteParse
-lays the document out itself, measuring the actual glyphs to decide where every word
-lands. So a bounding box is only as accurate as the font behind it.
-
-When a document asks for a font you don't have, LiteParse falls back to a generic
-sans. Text and structure are unaffected — headings, lists, tables and reading order
-are read from the file, not from the layout — but bounding-box coordinates shift, and
-they shift differently on different machines. That matters if you use
-[visual citations](/liteparse/guides/visual-citations), highlight regions on a
-screenshot, or compare geometry across hosts.
-
-```bash
-./scripts/install-fonts.sh              # metric clones + common open fonts
-./scripts/install-fonts.sh --metric     # metric clones only
-./scripts/install-fonts.sh --dry-run    # print the commands, install nothing
-```
-
-The script installs only freely-redistributable fonts, of two kinds:
-
-- **Metric-compatible clones** of the Microsoft fonts — Carlito for Calibri, Caladea
-  for Cambria, Liberation/Croscore for Arial, Times New Roman and Courier New. These
-  have the original's advance widths glyph for glyph, so text measured against them
-  lands where the real font would have put it. This is the half that makes geometry
-  *reproducible*, not merely plausible.
-- **Common open fonts** that real documents use — Open Sans, Lato, Roboto, Montserrat
-  and similar. Matched exactly, no substitution involved.
-
-It does **not** install Calibri, Aptos, Corbel or Franklin Gothic themselves — those
-are licensed by Microsoft and aren't ours to distribute. For Calibri and Cambria that
-costs nothing, since the clones above stand in exactly. For Aptos, Corbel and Franklin
-Gothic no free metric clone exists, so documents using them stay approximate unless
-you have Microsoft Office installed.
-
-On a 45-document corpus, running the script took the share of text measured against a
-generic fallback from **64% to 14%**, with the remainder dominated by those
-Microsoft-only faces.
-
 ## Usage
 
 Once the dependencies are installed, just pass any supported file to `lit parse`:

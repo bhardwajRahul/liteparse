@@ -181,12 +181,8 @@ pub enum Block {
     /// the merge structure outright (e.g. a structural reader with access to
     /// `gridSpan` / `vMerge`) rather than inferring it from coordinates.
     ///
-    /// `rows` is *not* rectangular: a cell absorbed by a neighbour's
-    /// `colspan`/`rowspan` is omitted entirely, exactly as in HTML. `header_rows`
-    /// is the count of leading rows that are header rows (`<th>`); 0 means none.
-    ///
     /// Renders as a GFM pipe table when it degenerates to a plain grid, and as
-    /// HTML `<table>` otherwise — pipe tables cannot express spans at all.
+    /// HTML `<table>` otherwise.
     MergedTable {
         rows: Vec<Vec<SpanCell>>,
         header_rows: usize,
