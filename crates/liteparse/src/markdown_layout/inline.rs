@@ -30,7 +30,7 @@ impl SpanStyle {
 /// Escape characters that would otherwise be interpreted as markdown emphasis.
 /// Deliberately narrow: only `*`, `_`, and backslash. Aggressive escaping
 /// (`#`, `[`, backticks, etc.) breaks more output than it saves in practice.
-pub(super) fn escape_inline(s: &str) -> String {
+pub fn escape_inline(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -67,7 +67,7 @@ fn render_span(text: &str, style: SpanStyle) -> String {
 /// Wrap `inner` in a markdown inline link to `url`. Uses the angle-bracket
 /// destination form when the URL contains characters that would otherwise
 /// terminate or break the `(url)` form (whitespace or parentheses).
-fn apply_link(inner: &str, url: &str) -> String {
+pub fn apply_link(inner: &str, url: &str) -> String {
     if url.contains([' ', '\t', '(', ')']) {
         format!("[{}](<{}>)", inner, url)
     } else {

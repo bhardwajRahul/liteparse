@@ -950,6 +950,125 @@ impl LiteParse {
         }
     }
 
+    /// Page selection for `parse_from_blocks`: `target_pages` filters by
+    /// 1-based page number, then `max_pages` truncates. Returns the aligned
+    /// `(pages, page_blocks, page_stats)` triple plus whether any filtering
+    /// occurred — the caller drops the doc-level `all_blocks` when it did.
+    fn select_block_pages(
+        &self,
+        pages: Vec<Page>,
+        page_blocks: Vec<Vec<crate::markdown_layout::PositionedBlock>>,
+        complexity: Vec<Option<crate::ocr_merge::PageComplexityStats>>,
+    ) -> Result<
+        (
+            Vec<Page>,
+            Vec<Vec<crate::markdown_layout::PositionedBlock>>,
+            Vec<Option<crate::ocr_merge::PageComplexityStats>>,
+            bool,
+        ),
+        LiteParseError,
+    > {
+        let mut selected: Vec<((Page, Vec<crate::markdown_layout::PositionedBlock>), _)> =
+            pages.into_iter().zip(page_blocks).zip(complexity).collect();
+        let mut page_filtered = false;
+        if let Some(targets) = self.resolve_target_pages()? {
+            let keep: std::collections::HashSet<usize> =
+                targets.iter().map(|p| *p as usize).collect();
+            selected.retain(|((p, _), _)| keep.contains(&p.page_number));
+            page_filtered = true;
+        }
+        if selected.len() > self.config.max_pages {
+            selected.truncate(self.config.max_pages);
+            page_filtered = true;
+        }
+        let mut pages = Vec::with_capacity(selected.len());
+        let mut page_blocks = Vec::with_capacity(selected.len());
+        let mut page_stats = Vec::with_capacity(selected.len());
+        for ((p, b), s) in selected {
+            pages.push(p);
+            page_blocks.push(b);
+            page_stats.push(s);
+        }
+        Ok((pages, page_blocks, page_stats, page_filtered))
+    }
+
+    /// Build the output directly from blocks: the caller owns block-level
+    /// structure (headings, lists, tables, merged cells) alongside the text
+    /// items, so per-page markdown renders from the block model with
+    /// `render_blocks` while page `.text` still comes from grid projection
+    /// over the supplied text items.
+    pub fn parse_from_blocks(
+        &self,
+        pages: Vec<Page>,
+        page_blocks: Vec<Vec<crate::markdown_layout::PositionedBlock>>,
+        all_blocks: Option<Vec<crate::markdown_layout::PositionedBlock>>,
+        outline: Vec<OutlineTarget>,
+        images: Vec<crate::types::ExtractedImage>,
+        page_stats: Vec<Option<crate::ocr_merge::PageComplexityStats>>,
+    ) -> Result<ParseResult, LiteParseError> {
+        // Reported before page filtering, matching every other path.
+        let total_pages = pages.len().min(u32::MAX as usize) as u32;
+        let (pages, page_blocks, page_stats, page_filtered) =
+            self.select_block_pages(pages, page_blocks, page_stats)?;
+        let all_blocks = if page_filtered { None } else { all_blocks };
+
+        let markdown_out = self.config.output_format == crate::config::OutputFormat::Markdown;
+        let mut parsed_pages = projection::project_pages_to_grid(pages);
+        for ((page, blocks), stats) in parsed_pages.iter_mut().zip(&page_blocks).zip(page_stats) {
+            if markdown_out {
+                page.markdown = crate::markdown_layout::render_blocks(blocks);
+            }
+            if self.config.extract_blocks {
+                page.blocks = Some(
+                    blocks
+                        .iter()
+                        .map(crate::layout::LayoutBlock::from)
+                        .collect(),
+                );
+            }
+            page.complexity = stats;
+            if !self.config.extract_content_bounds {
+                page.content_bounds = None;
+            }
+        }
+
+        let full_text = if markdown_out {
+            match all_blocks {
+                Some(blocks) => crate::markdown_layout::render_blocks(&blocks),
+                None => parsed_pages
+                    .iter()
+                    .map(|p| p.markdown.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n-----\n\n"),
+            }
+        } else {
+            parsed_pages
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+
+        Ok(ParseResult {
+            total_pages,
+            pages: parsed_pages,
+            page_errors: Vec::new(),
+            text: full_text,
+            outline,
+            images,
+            screenshots: Vec::new(),
+            image_error_count: 0,
+            form_type: None,
+            creator: None,
+            producer: None,
+            doc_meta: None,
+            // Office containers carry no XFA packets; `Some([])` keeps the
+            // JSON shape identical to the conversion path, which also finds
+            // none in a LibreOffice-produced PDF.
+            xfa_packets: self.config.extract_xfa_packets.then(Vec::new),
+        })
+    }
+
     /// Generate screenshots of document pages as PNG bytes.
     ///
     /// Non-PDF files are automatically converted to PDF first (requires
@@ -1195,6 +1314,75 @@ mod tests {
         assert_eq!(item.stroke_color.as_deref(), Some("ff445566"));
         assert_eq!(item.char_codes, vec![104, 101, 108, 108, 111]);
         assert!(item.trailing_space_generated);
+    }
+
+    /// `parse_from_blocks`: markdown comes from the block model, page text
+    /// from grid projection over the text items, and the doc-level markdown
+    /// renders from `all_blocks` rather than a page join.
+    #[test]
+    fn parse_from_blocks_renders_blocks_and_projects_text() {
+        use crate::markdown_layout::{Block, PositionedBlock};
+
+        let blocks = vec![PositionedBlock::unlocated(Block::Heading {
+            level: 1,
+            text: "hello".into(),
+        })];
+        let result = LiteParse::new(LiteParseConfig {
+            output_format: crate::config::OutputFormat::Markdown,
+            ..Default::default()
+        })
+        .parse_from_blocks(
+            vec![page_with_text_metadata()],
+            vec![blocks.clone()],
+            Some(blocks),
+            vec![],
+            vec![],
+            vec![None],
+        )
+        .expect("no page filter configured");
+        assert_eq!(result.pages.len(), 1);
+        assert_eq!(result.pages[0].markdown, "# hello");
+        assert_eq!(result.text, "# hello");
+        // Projection, not a reading-order join: the projected page text
+        // carries the item's text content.
+        assert!(result.pages[0].text.contains("hello"));
+    }
+
+    /// Page filtering drops `all_blocks` (a doc-level render would leak
+    /// filtered pages' content) and falls back to joining survivors.
+    #[test]
+    fn parse_from_blocks_page_filter_drops_all_blocks() {
+        use crate::markdown_layout::{Block, PositionedBlock};
+
+        let mut p2 = page_with_text_metadata();
+        p2.page_number = 2;
+        p2.text_items[0].text = "world".into();
+        let b1 = vec![PositionedBlock::unlocated(Block::Heading {
+            level: 1,
+            text: "hello".into(),
+        })];
+        let b2 = vec![PositionedBlock::unlocated(Block::Heading {
+            level: 1,
+            text: "world".into(),
+        })];
+        let all = b1.iter().chain(&b2).cloned().collect::<Vec<_>>();
+        let result = LiteParse::new(LiteParseConfig {
+            output_format: crate::config::OutputFormat::Markdown,
+            target_pages: Some("2".into()),
+            ..Default::default()
+        })
+        .parse_from_blocks(
+            vec![page_with_text_metadata(), p2],
+            vec![b1, b2],
+            Some(all),
+            vec![],
+            vec![],
+            vec![None, None],
+        )
+        .expect("valid page filter");
+        assert_eq!(result.pages.len(), 1);
+        assert_eq!(result.pages[0].page_number, 2);
+        assert_eq!(result.text, "# world");
     }
 
     #[test]

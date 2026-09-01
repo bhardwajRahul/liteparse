@@ -14,7 +14,7 @@
 
 use serde::Serialize;
 
-use crate::markdown_layout::{Block, Cell, PositionedBlock};
+use crate::markdown_layout::{Block, Cell, PositionedBlock, SpanCell};
 use crate::types::Rect;
 
 /// One table cell: its rendered text and the region it occupied.
@@ -27,6 +27,13 @@ pub struct LayoutCell {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bbox: Option<Rect>,
+    /// Merge spans, present only on `merged_table` cells (and only when > 1).
+    /// A cell absorbed by a neighbour's span is absent from its row entirely,
+    /// matching HTML's occupancy model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub colspan: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rowspan: Option<u16>,
 }
 
 impl From<&Cell> for LayoutCell {
@@ -34,6 +41,19 @@ impl From<&Cell> for LayoutCell {
         LayoutCell {
             text: c.text.clone(),
             bbox: c.bbox.clone(),
+            colspan: None,
+            rowspan: None,
+        }
+    }
+}
+
+impl From<&SpanCell> for LayoutCell {
+    fn from(c: &SpanCell) -> Self {
+        LayoutCell {
+            text: c.text.clone(),
+            bbox: c.bbox.clone(),
+            colspan: (c.colspan > 1).then_some(c.colspan),
+            rowspan: (c.rowspan > 1).then_some(c.rowspan),
         }
     }
 }
@@ -46,7 +66,7 @@ impl From<&Cell> for LayoutCell {
 #[derive(Debug, Clone, Serialize)]
 pub struct LayoutBlock {
     /// One of `heading`, `paragraph`, `list_item`, `code`, `table`,
-    /// `grid_fallback`, `rule`, `figure`.
+    /// `merged_table`, `grid_fallback`, `rule`, `figure`.
     pub kind: &'static str,
     /// Rendered text for the text-bearing kinds (`heading`, `paragraph`,
     /// `list_item`). Table text lives in `header`/`rows`; code and grid text in
@@ -77,9 +97,14 @@ pub struct LayoutBlock {
     /// `table`: the header row, when one was detected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub header: Option<Vec<LayoutCell>>,
-    /// `table`: the body rows.
+    /// `table`: the body rows. `merged_table`: all rows (header rows lead,
+    /// counted by `header_rows`); rows are ragged — cells covered by a
+    /// neighbour's span are absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rows: Option<Vec<Vec<LayoutCell>>>,
+    /// `merged_table`: how many leading rows of `rows` are header rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header_rows: Option<usize>,
     /// `figure`: the image's page-scoped id and encoded format, matching the
     /// `img_{id}.{format}` target the markdown renderer emits.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -109,6 +134,7 @@ impl LayoutBlock {
             lang: None,
             header: None,
             rows: None,
+            header_rows: None,
             id: None,
             format: None,
             bbox,
@@ -160,6 +186,15 @@ impl From<&PositionedBlock> for LayoutBlock {
                 header: header.as_ref().map(|h| cells(h)),
                 rows: Some(rows.iter().map(|r| cells(r)).collect()),
                 ..LayoutBlock::of("table", bbox)
+            },
+            Block::MergedTable { rows, header_rows } => LayoutBlock {
+                header_rows: Some(*header_rows),
+                rows: Some(
+                    rows.iter()
+                        .map(|r| r.iter().map(LayoutCell::from).collect())
+                        .collect(),
+                ),
+                ..LayoutBlock::of("merged_table", bbox)
             },
             Block::GridFallback { lines } => LayoutBlock {
                 lines: Some(lines.clone()),

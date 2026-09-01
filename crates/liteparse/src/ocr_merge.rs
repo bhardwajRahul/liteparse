@@ -271,6 +271,160 @@ pub(crate) fn calculate_page_complexity(
     })
 }
 
+/// Native-office analogue of [`calculate_page_complexity`] +
+/// [`calculate_layout_complexity`] in one: the facts a PDF object walk digs
+/// out arrive here as source-document data. `image_rects` are the page's
+/// placed media rects (viewport pt), `table_count` the page's table blocks,
+/// `column_count` the section-declared column count.
+///
+/// Deliberate divergences from the PDF pair, all following from "the source
+/// states it":
+/// - `uncovered_vector_area` is `Some(0.0)` when no cheaper predicate fired —
+///   text painted as vector outlines cannot exist on this path (every glyph
+///   the layout draws is in the text stream), so the area is a known zero,
+///   not an unmeasured `None`.
+/// - No `AnnotationText` reason: there are no PDF annotations to paint text.
+/// - `ruled_table_coverage` stays 0.0 and `text_table_run_count` 0: blocks
+///   carry no geometry, and the ruled/borderless split is a PDF-detector
+///   concept — `ruled_table_count` carries the (exact) table count and drives
+///   `TableLikely` on its own.
+/// - `figure_count`/`figure_coverage` count placed images rather than
+///   vector-graphic clusters — the closest native analogue.
+pub fn calculate_native_page_complexity(
+    page: &Page,
+    image_rects: &[crate::types::Rect],
+    table_count: usize,
+    column_count: usize,
+) -> PageComplexityStats {
+    let pw = page.page_width;
+    let ph = page.page_height;
+    let page_area = pw * ph;
+
+    // Same "usable text only" filter as the PDF path. Native text should
+    // never trip it, but sharing the predicate keeps the two paths honest.
+    let text_length: usize = page
+        .text_items
+        .iter()
+        .filter(|item| !is_unusable_native(item))
+        .map(|item| item.text.len())
+        .sum();
+
+    // Same filters as the PDF path's `image_bounds(MIN_IMAGE_SIZE_PT, ∞)` +
+    // full-page split: tiny decorations dropped, full-page backgrounds
+    // excluded from inline-figure coverage but remembered as the scan signal.
+    let sized: Vec<&crate::types::Rect> = image_rects
+        .iter()
+        .filter(|r| r.width >= MIN_IMAGE_SIZE_PT && r.height >= MIN_IMAGE_SIZE_PT)
+        .collect();
+    let is_full_page = |r: &crate::types::Rect| {
+        r.width > pw * MAX_IMAGE_PAGE_COVERAGE && r.height > ph * MAX_IMAGE_PAGE_COVERAGE
+    };
+    let full_page_image = sized.iter().any(|r| is_full_page(r));
+    let counted: Vec<&crate::types::Rect> =
+        sized.iter().copied().filter(|r| !is_full_page(r)).collect();
+    let has_images = !counted.is_empty();
+
+    let (image_area_sum, largest_image_area) =
+        counted.iter().fold((0.0_f32, 0.0_f32), |(sum, max), r| {
+            let area = r.width.max(0.0) * r.height.max(0.0);
+            (sum + area, max.max(area))
+        });
+    let (image_coverage, largest_image_coverage) = if page_area > 0.0 {
+        (
+            (image_area_sum / page_area).min(1.0),
+            (largest_image_area / page_area).min(1.0),
+        )
+    } else {
+        (0.0, 0.0)
+    };
+    let text_bbox_area: f32 = page
+        .text_items
+        .iter()
+        .filter(|item| !is_unusable_native(item))
+        .map(|item| item.width * item.height)
+        .sum();
+    let text_coverage = if page_area > 0.0 {
+        text_bbox_area / page_area
+    } else {
+        0.0
+    };
+
+    let sparse_text = text_length < 2000 && text_coverage < 0.15;
+    // Native text comes straight from the source XML — a garbled result would
+    // be an engine bug, not a font-encoding casualty. Run the shared detector
+    // anyway so the two paths can never silently diverge on the predicate.
+    let is_garbled = page_is_garbled(page);
+
+    let mut reasons = Vec::new();
+    if text_length < 20 {
+        reasons.push(if full_page_image {
+            ComplexityReason::Scanned
+        } else {
+            ComplexityReason::NoText
+        });
+    } else if sparse_text {
+        reasons.push(ComplexityReason::SparseText);
+    }
+    if has_images {
+        reasons.push(ComplexityReason::EmbeddedImages);
+    }
+    if is_garbled {
+        reasons.push(ComplexityReason::Garbled);
+    }
+    let needs_ocr = !reasons.is_empty();
+    let uncovered_vector_area = (!needs_ocr).then_some(0.0);
+
+    // Layout half. `figure` coverage from ALL placed images (the PDF layout
+    // half counts every figure region, full-page ones included).
+    let all_image_area: f32 = image_rects
+        .iter()
+        .map(|r| r.width.max(0.0) * r.height.max(0.0))
+        .sum();
+    let figure_coverage = if page_area > 0.0 && all_image_area > 0.0 {
+        (all_image_area / page_area).min(1.0)
+    } else {
+        0.0
+    };
+    let column_count = column_count.max(1);
+    let mut layout_reasons = Vec::new();
+    if column_count >= 2 {
+        layout_reasons.push(LayoutComplexityReason::MultiColumn);
+    }
+    if table_count > 0 {
+        layout_reasons.push(LayoutComplexityReason::TableLikely);
+    }
+    if figure_coverage >= DENSE_GRAPHICS_MIN_COVERAGE {
+        layout_reasons.push(LayoutComplexityReason::DenseGraphics);
+    }
+    let layout = LayoutComplexityStats {
+        column_count,
+        ruled_table_count: table_count,
+        ruled_table_coverage: 0.0,
+        text_table_run_count: 0,
+        figure_count: image_rects.len(),
+        figure_coverage,
+        is_complex: !layout_reasons.is_empty(),
+        reasons: layout_reasons,
+    };
+
+    PageComplexityStats {
+        page_number: page.page_number,
+        text_length,
+        text_coverage,
+        has_substantial_images: has_images,
+        image_block_count: counted.len(),
+        image_coverage,
+        largest_image_coverage,
+        full_page_image,
+        uncovered_vector_area,
+        is_garbled,
+        page_area,
+        needs_ocr,
+        reasons,
+        layout: Some(layout),
+    }
+}
+
 /// Why a page's layout is expected to be hard to reconstruct faithfully.
 /// Orthogonal to `ComplexityReason`: none of these imply OCR — they signal
 /// that the text-only path may mangle reading order or structure, so a caller
@@ -1163,6 +1317,129 @@ mod tests {
     #[test]
     fn test_count_columns_empty_page() {
         assert_eq!(count_columns(&leaf(0), 0), 0);
+    }
+
+    mod native {
+        use super::super::*;
+        use crate::types::Rect;
+
+        fn item(text: &str, x: f32, y: f32, w: f32, h: f32) -> TextItem {
+            TextItem {
+                text: text.to_string(),
+                x,
+                y,
+                width: w,
+                height: h,
+                ..TextItem::default()
+            }
+        }
+
+        fn page(items: Vec<TextItem>) -> Page {
+            Page {
+                page_number: 1,
+                page_width: 612.0,
+                page_height: 792.0,
+                content_bounds: None,
+                text_items: items,
+                graphics: Vec::new(),
+                vector_graphics: None,
+                struct_nodes: Vec::new(),
+                image_refs: Vec::new(),
+                annotations: None,
+                form_fields: None,
+                structure_tree: None,
+            }
+        }
+
+        fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
+            Rect {
+                x,
+                y,
+                width: w,
+                height: h,
+            }
+        }
+
+        #[test]
+        fn text_dense_page_is_simple_with_known_zero_vector_area() {
+            // 40 wide items -> text_length >= 20 and coverage >= 15%.
+            let items: Vec<TextItem> = (0..40)
+                .map(|i| item("some meaningful text", 40.0, 20.0 * i as f32, 500.0, 18.0))
+                .collect();
+            let stats = calculate_native_page_complexity(&page(items), &[], 0, 1);
+            assert!(!stats.needs_ocr);
+            assert!(stats.reasons.is_empty());
+            // Known zero, not unmeasured: vector text cannot exist natively.
+            assert_eq!(stats.uncovered_vector_area, Some(0.0));
+            let layout = stats.layout.expect("native stats always carry layout");
+            assert_eq!(layout.column_count, 1);
+            assert!(!layout.is_complex);
+        }
+
+        #[test]
+        fn tables_columns_and_images_drive_layout_reasons() {
+            let items = vec![item(
+                "cell text and more cell text",
+                40.0,
+                40.0,
+                500.0,
+                700.0,
+            )];
+            // One large inline figure (not full-page).
+            let figures = [rect(100.0, 100.0, 400.0, 300.0)];
+            let stats = calculate_native_page_complexity(&page(items), &figures, 2, 2);
+            assert!(
+                stats.reasons.contains(&ComplexityReason::EmbeddedImages),
+                "sized inline image counts"
+            );
+            let layout = stats.layout.unwrap();
+            assert_eq!(layout.ruled_table_count, 2);
+            assert_eq!(layout.column_count, 2);
+            assert!(
+                layout
+                    .reasons
+                    .contains(&LayoutComplexityReason::TableLikely)
+            );
+            assert!(
+                layout
+                    .reasons
+                    .contains(&LayoutComplexityReason::MultiColumn)
+            );
+            assert!(
+                layout
+                    .reasons
+                    .contains(&LayoutComplexityReason::DenseGraphics),
+                "400x300 over 612x792 is ~25% coverage"
+            );
+            assert!(layout.is_complex);
+        }
+
+        #[test]
+        fn full_page_image_with_no_text_reads_as_scanned() {
+            let figures = [rect(0.0, 0.0, 612.0, 792.0)];
+            let stats = calculate_native_page_complexity(&page(Vec::new()), &figures, 0, 1);
+            assert!(stats.reasons.contains(&ComplexityReason::Scanned));
+            assert!(stats.full_page_image);
+            assert_eq!(
+                stats.image_block_count, 0,
+                "full-page background is not an inline figure"
+            );
+            // The cheap predicate fired, so the (zero) vector walk is skipped,
+            // mirroring the PDF flow's None.
+            assert_eq!(stats.uncovered_vector_area, None);
+        }
+
+        #[test]
+        fn tiny_decorations_are_ignored() {
+            let items: Vec<TextItem> = (0..40)
+                .map(|i| item("some meaningful text", 40.0, 20.0 * i as f32, 500.0, 18.0))
+                .collect();
+            // A 10pt icon: below MIN_IMAGE_SIZE_PT on both axes.
+            let figures = [rect(40.0, 40.0, 10.0, 10.0)];
+            let stats = calculate_native_page_complexity(&page(items), &figures, 0, 1);
+            assert!(!stats.has_substantial_images);
+            assert!(!stats.needs_ocr);
+        }
     }
 
     #[test]
