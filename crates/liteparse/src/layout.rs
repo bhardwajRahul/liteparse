@@ -51,7 +51,7 @@ impl From<&SpanCell> for LayoutCell {
     fn from(c: &SpanCell) -> Self {
         LayoutCell {
             text: c.text.clone(),
-            bbox: None,
+            bbox: c.bbox.clone(),
             colspan: (c.colspan > 1).then_some(c.colspan),
             rowspan: (c.rowspan > 1).then_some(c.rowspan),
         }

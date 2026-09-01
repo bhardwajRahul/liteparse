@@ -530,34 +530,6 @@ choco install libreoffice-fresh
 
 > _On Windows, you may need to add LibreOffice's program directory (usually `C:\Program Files\LibreOffice\program`) to your PATH._
 
-#### Fonts (optional, affects DOCX geometry)
-
-DOCX files carry no coordinates, so LiteParse lays them out itself and measures the
-glyphs to decide where each word lands. A bounding box is therefore only as accurate
-as the font behind it — when a document asks for a font you don't have, the measure
-falls back to a generic sans and coordinates shift, differently on different machines.
-Text and structure are unaffected; this only matters for visual citations, screenshot
-highlighting, or cross-host geometry comparisons.
-
-```bash
-./scripts/install-fonts.sh              # metric clones + common open fonts
-./scripts/install-fonts.sh --metric     # metric clones only
-./scripts/install-fonts.sh --dry-run    # print the commands, install nothing
-```
-
-Installs only freely-redistributable fonts: metric-compatible clones of the Microsoft
-faces (Carlito for Calibri, Caladea for Cambria, Liberation/Croscore for Arial, Times
-New Roman and Courier New), plus common open families like Open Sans, Lato and Roboto.
-The clones share the originals' advance widths exactly, so geometry becomes
-reproducible on any host with the same set.
-
-It does not install Calibri, Aptos, Corbel or Franklin Gothic — those are
-Microsoft-licensed. The clones cover Calibri and Cambria exactly; the others have no
-free metric equivalent and stay approximate without Microsoft Office installed.
-
-> _On a 45-document corpus this took the share of text measured against a generic
-> fallback from 64% to 14%._
-
 #### Images (native support)
 - **Formats**: `.jpg`, `.jpeg`, `.png`, `.gif`, `.bmp`, `.tiff`, `.webp`, `.svg`
 

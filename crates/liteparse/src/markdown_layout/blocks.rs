@@ -80,13 +80,19 @@ impl PartialEq<String> for Cell {
 /// One cell of a [`Block::MergedTable`]. `colspan`/`rowspan` are 1 for an
 /// ordinary cell; the cells they cover are absent from `rows` rather than
 /// present-and-empty, matching HTML's occupancy model. Distinct from [`Cell`]:
-/// that type carries the page geometry a cell was *read from*, this one the
-/// merge structure a producer *declared*.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// that type describes a cell a classifier *read off the page*, this one a
+/// merge structure a producer *declared* — but both carry the region the cell
+/// occupies when the producer knows it, so merged tables ground exactly like
+/// plain ones.
+#[derive(Debug, Clone)]
 pub struct SpanCell {
     pub text: String,
     pub colspan: u16,
     pub rowspan: u16,
+    /// Region the cell occupies on the page (the *whole* merged region for a
+    /// spanning cell), in the same viewport space as `text_items`. `None` when
+    /// the producer has no geometry for it.
+    pub bbox: Option<Rect>,
 }
 
 impl SpanCell {
@@ -96,6 +102,7 @@ impl SpanCell {
             text: text.into(),
             colspan: 1,
             rowspan: 1,
+            bbox: None,
         }
     }
 
@@ -107,13 +114,31 @@ impl SpanCell {
             text: text.into(),
             colspan: colspan.max(1),
             rowspan: rowspan.max(1),
+            bbox: None,
         }
+    }
+
+    /// Attach the region this cell occupies.
+    pub fn with_bbox(mut self, bbox: Rect) -> Self {
+        self.bbox = Some(bbox);
+        self
     }
 
     fn is_plain(&self) -> bool {
         self.colspan <= 1 && self.rowspan <= 1
     }
 }
+
+// Like `Cell`, geometry is derived metadata, not identity: two cells with the
+// same text and spans are the same table structure whether or not either one
+// knows its coordinates, and assertions compare against plain literals.
+impl PartialEq for SpanCell {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text && self.colspan == other.colspan && self.rowspan == other.rowspan
+    }
+}
+
+impl Eq for SpanCell {}
 
 /// Coarse block representation: the output of page classification, consumed by
 /// `render_blocks` to produce the final markdown string.

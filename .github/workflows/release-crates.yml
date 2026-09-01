@@ -67,10 +67,6 @@ jobs:
           }
           publish_if_new liteparse-pdfium-sys
           publish_if_new liteparse-pdfium
-          # Must precede liteparse: it is a path dependency of the `docx-native`
-          # feature, and cargo refuses to publish a crate whose path deps are
-          # unpublished — optional or not.
-          publish_if_new liteparse-ooxml
           publish_if_new liteparse
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
