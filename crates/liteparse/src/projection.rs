@@ -3425,6 +3425,78 @@ const XY_BANNER_CLEARANCE_FACTOR: f32 = 1.5;
 /// are separated by ≥`XY_COLUMN_MIN_GAP_FRACTION × bbox.width`, returns a
 /// V-cut at the midpoint between them with a high score so it beats any
 /// density-based cut except banner.
+/// Per-column fill for a candidate peak set: for each y-band, each column's
+/// covered x-span / slot width, averaged per column. Returns
+/// `(min_fill, band-count-weighted avg_fill)` — the same statistics the main
+/// fill gate in `xy_find_column_cut` uses to separate prose columns
+/// (near edge-to-edge fill) from table cells (wide whitespace). `sorted` must
+/// be y-then-x sorted item indices; `peaks` left→right.
+fn xy_peak_fill_stats(
+    items: &[ProjectedTextItem],
+    sorted: &[usize],
+    peaks: &[(f32, usize)],
+    band_tol: f32,
+    bucket_pt: f32,
+    max_x: f32,
+) -> (f32, f32) {
+    let n = peaks.len();
+    let mut covered_sum = vec![0.0f32; n];
+    let mut band_count = vec![0usize; n];
+    let mut kk = 0;
+    while kk < sorted.len() {
+        let by = items[sorted[kk]].item.y;
+        let mut jj = kk;
+        while jj < sorted.len() && (items[sorted[jj]].item.y - by).abs() <= band_tol {
+            jj += 1;
+        }
+        let mut lo_x = vec![f32::INFINITY; n];
+        let mut hi_x = vec![f32::NEG_INFINITY; n];
+        for &idx in &sorted[kk..jj] {
+            let it = &items[idx].item;
+            if !it.x.is_finite() {
+                continue;
+            }
+            let mut c = 0;
+            while c + 1 < n && it.x >= peaks[c + 1].0 - bucket_pt {
+                c += 1;
+            }
+            lo_x[c] = lo_x[c].min(it.x);
+            hi_x[c] = hi_x[c].max(it.x + it.width.max(0.0));
+        }
+        for c in 0..n {
+            if hi_x[c] > lo_x[c] {
+                let col_w = if c + 1 < n {
+                    peaks[c + 1].0 - peaks[c].0
+                } else {
+                    max_x - peaks[c].0
+                };
+                if col_w > 1.0 {
+                    covered_sum[c] += ((hi_x[c] - lo_x[c]) / col_w).min(1.0);
+                    band_count[c] += 1;
+                }
+            }
+        }
+        kk = jj;
+    }
+    let mut min_fill = f32::INFINITY;
+    let mut weighted_sum = 0.0f32;
+    let mut weighted_n = 0.0f32;
+    for c in 0..n {
+        if band_count[c] > 0 {
+            let f = covered_sum[c] / band_count[c] as f32;
+            min_fill = min_fill.min(f);
+            weighted_sum += f * band_count[c] as f32;
+            weighted_n += band_count[c] as f32;
+        }
+    }
+    let avg_fill = if weighted_n > 0.0 {
+        weighted_sum / weighted_n
+    } else {
+        f32::INFINITY
+    };
+    (min_fill, avg_fill)
+}
+
 fn xy_find_column_cut(
     items: &[ProjectedTextItem],
     idxs: &[usize],
@@ -3615,6 +3687,53 @@ fn xy_find_column_cut(
     let adaptive_min = (n_starts / 6).clamp(4, XY_COLUMN_MIN_LINES_PER_PEAK);
     peaks.retain(|(_, c)| *c >= adaptive_min);
     if peaks.len() < 2 {
+        // A table with a sparse row (missing cells) drops most column peaks
+        // just under `adaptive_min`, so classification never reaches the
+        // fill gate and the region is left unprotected against density
+        // V-cuts down its cell gutters — which transposes the table into
+        // column-major fragments. The raw-peak shape is still decisive
+        // tabular evidence on its own: 3+ balanced peaks that jointly
+        // account for nearly all line-starts only occur when most bands
+        // place a cell at most column edges. Real prose columns show 1–2
+        // dominant peaks here, and scattered indents fail dominance.
+        // Classification only — never a cut.
+        if raw_counts.len() >= 3 {
+            let raw_sum: usize = raw_counts.iter().map(|(_, c)| *c).sum();
+            let raw_min = raw_counts.iter().map(|(_, c)| *c).min().unwrap_or(0);
+            let raw_max = raw_counts.iter().map(|(_, c)| *c).max().unwrap_or(0);
+            let balanced = raw_max > 0
+                && raw_min >= 2
+                && raw_min as f32 / raw_max as f32 >= XY_COLUMN_PEAK_BALANCE_RATIO;
+            let dominance = raw_sum as f32 / n_starts.max(1) as f32;
+            if balanced && dominance >= XY_COLUMN_PEAK_DOMINANCE {
+                // Peak shape alone can't separate a table from N-column
+                // prose whose short columns fell under `adaptive_min`
+                // (newspaper pages, multi-column TOCs). Require the table's
+                // signature whitespace too: prose columns fill their slots
+                // nearly edge-to-edge, cells don't. Same statistics as the
+                // main fill gate below.
+                let mut raw_peaks = raw_counts.clone();
+                raw_peaks.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let (min_fill, avg_fill) =
+                    xy_peak_fill_stats(items, &sorted, &raw_peaks, band_tol, bucket_pt, max_x);
+                let sparse = (min_fill.is_finite() && min_fill < 0.38)
+                    || (avg_fill.is_finite() && avg_fill < XY_COLUMN_MIN_FILL);
+                if sparse {
+                    *tabular = true;
+                }
+                if dbg {
+                    eprintln!(
+                        "[xy col-weak-peaks] {} balanced raw peaks (min={raw_min} max={raw_max}) dominance={dominance:.2} min_fill={min_fill:.2} avg_fill={avg_fill:.2} — {}",
+                        raw_counts.len(),
+                        if sparse {
+                            "tabular, no cut"
+                        } else {
+                            "filled (prose), not tabular"
+                        }
+                    );
+                }
+            }
+        }
         if dbg {
             let preview: Vec<String> = raw_counts
                 .iter()
@@ -5258,6 +5377,72 @@ mod tests {
         // should be at least as strong. We mostly just want to confirm both
         // paths return without panicking and the figure path produces a split.
         let _ = region_no_fig;
+    }
+
+    #[test]
+    fn xy_cut_no_vertical_split_on_table_with_sparse_row() {
+        // Regression test for issue #400: an 8-column table where one row is
+        // sparse (3 of 8 cells) plus a free-text note line. The sparse row
+        // drags most column-start peaks just under the strong-peak floor, so
+        // the histogram used to reject with "peaks<2" WITHOUT classifying
+        // the region tabular — leaving the density V-cut free to slice the
+        // table down a cell gutter and transpose it into column-major prose.
+        // The weak-peaks tabular check must keep the region row-major.
+        let cols = [48.0, 108.0, 190.0, 300.0, 360.0, 424.0, 486.0, 545.0];
+        let cells = [
+            "10/10/2024",
+            "IC-1000",
+            "WIDGET",
+            "Open",
+            "$1.00",
+            "$0.00",
+            "$2.00",
+            "N/A",
+        ];
+        // Realistic glyph widths: cells cover well under their column slots
+        // (the whitespace signature the fill check keys on).
+        let widths = [42.0, 30.0, 55.0, 22.0, 24.0, 22.0, 24.0, 15.0];
+        let mut items = Vec::new();
+        let mut y = 100.0;
+        // Header + 2 full rows.
+        for i in 0..8 {
+            for r in 0..3 {
+                items.push(item_at(
+                    cells[i],
+                    cols[i],
+                    100.0 + r as f32 * 16.0,
+                    widths[i],
+                    9.0,
+                ));
+            }
+        }
+        y += 3.0 * 16.0;
+        // Sparse row: only columns 0, 1, 3 populated.
+        for i in [0usize, 1, 3] {
+            items.push(item_at(cells[i], cols[i], y, widths[i], 9.0));
+        }
+        y += 22.0;
+        // Free-text note under the Description column.
+        items.push(item_at(
+            "note text spanning a while here",
+            190.0,
+            y,
+            220.0,
+            9.0,
+        ));
+        y += 22.0;
+        // 2 more full rows.
+        for _ in 0..2 {
+            for i in 0..8 {
+                items.push(item_at(cells[i], cols[i], y, widths[i], 9.0));
+            }
+            y += 16.0;
+        }
+        let region = xy_cut(&items, 612.0, 792.0, &[]);
+        assert!(
+            !has_vertical_split(&region),
+            "table region must not be V-cut into column fragments"
+        );
     }
 
     fn has_vertical_split(region: &Region) -> bool {
