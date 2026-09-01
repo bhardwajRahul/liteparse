@@ -3425,12 +3425,10 @@ const XY_BANNER_CLEARANCE_FACTOR: f32 = 1.5;
 /// are separated by ≥`XY_COLUMN_MIN_GAP_FRACTION × bbox.width`, returns a
 /// V-cut at the midpoint between them with a high score so it beats any
 /// density-based cut except banner.
-/// Per-column fill for a candidate peak set: for each y-band, each column's
-/// covered x-span / slot width, averaged per column. Returns
-/// `(min_fill, band-count-weighted avg_fill)` — the same statistics the main
-/// fill gate in `xy_find_column_cut` uses to separate prose columns
-/// (near edge-to-edge fill) from table cells (wide whitespace). `sorted` must
-/// be y-then-x sorted item indices; `peaks` left→right.
+/// Per-column fill for a candidate peak set: per y-band covered x-span /
+/// slot width, averaged per column. Returns `(min_fill, band-count-weighted
+/// avg_fill)`, the same statistics as `xy_find_column_cut`'s main fill gate.
+/// `sorted` must be y-then-x sorted item indices; `peaks` left→right.
 fn xy_peak_fill_stats(
     items: &[ProjectedTextItem],
     sorted: &[usize],
@@ -3687,16 +3685,11 @@ fn xy_find_column_cut(
     let adaptive_min = (n_starts / 6).clamp(4, XY_COLUMN_MIN_LINES_PER_PEAK);
     peaks.retain(|(_, c)| *c >= adaptive_min);
     if peaks.len() < 2 {
-        // A table with a sparse row (missing cells) drops most column peaks
-        // just under `adaptive_min`, so classification never reaches the
-        // fill gate and the region is left unprotected against density
-        // V-cuts down its cell gutters — which transposes the table into
-        // column-major fragments. The raw-peak shape is still decisive
-        // tabular evidence on its own: 3+ balanced peaks that jointly
-        // account for nearly all line-starts only occur when most bands
-        // place a cell at most column edges. Real prose columns show 1–2
-        // dominant peaks here, and scattered indents fail dominance.
-        // Classification only — never a cut.
+        // A table with a sparse row drops most peaks just under
+        // `adaptive_min`, so the fill gate below never runs and density
+        // V-cuts are free to slice the table's cell gutters (transposing it
+        // column-major). 3+ balanced, dominant, low-fill raw peaks are still
+        // tabular evidence — classify only, never cut.
         if raw_counts.len() >= 3 {
             let raw_sum: usize = raw_counts.iter().map(|(_, c)| *c).sum();
             let raw_min = raw_counts.iter().map(|(_, c)| *c).min().unwrap_or(0);
@@ -3706,12 +3699,10 @@ fn xy_find_column_cut(
                 && raw_min as f32 / raw_max as f32 >= XY_COLUMN_PEAK_BALANCE_RATIO;
             let dominance = raw_sum as f32 / n_starts.max(1) as f32;
             if balanced && dominance >= XY_COLUMN_PEAK_DOMINANCE {
-                // Peak shape alone can't separate a table from N-column
-                // prose whose short columns fell under `adaptive_min`
-                // (newspaper pages, multi-column TOCs). Require the table's
-                // signature whitespace too: prose columns fill their slots
-                // nearly edge-to-edge, cells don't. Same statistics as the
-                // main fill gate below.
+                // The low-fill requirement is load-bearing: N-column prose
+                // whose short columns fell under `adaptive_min` (newspaper
+                // pages, multi-column TOCs) matches the peak shape but fills
+                // its slots nearly edge-to-edge.
                 let mut raw_peaks = raw_counts.clone();
                 raw_peaks.sort_by(|a, b| a.0.total_cmp(&b.0));
                 let (min_fill, avg_fill) =
@@ -5381,13 +5372,9 @@ mod tests {
 
     #[test]
     fn xy_cut_no_vertical_split_on_table_with_sparse_row() {
-        // Regression test for issue #400: an 8-column table where one row is
-        // sparse (3 of 8 cells) plus a free-text note line. The sparse row
-        // drags most column-start peaks just under the strong-peak floor, so
-        // the histogram used to reject with "peaks<2" WITHOUT classifying
-        // the region tabular — leaving the density V-cut free to slice the
-        // table down a cell gutter and transpose it into column-major prose.
-        // The weak-peaks tabular check must keep the region row-major.
+        // Issue #400: a sparse row (3 of 8 cells) plus a note line drag the
+        // column peaks under the strong-peak floor, and the unprotected
+        // density V-cut used to transpose the table into column-major prose.
         let cols = [48.0, 108.0, 190.0, 300.0, 360.0, 424.0, 486.0, 545.0];
         let cells = [
             "10/10/2024",
@@ -5399,8 +5386,8 @@ mod tests {
             "$2.00",
             "N/A",
         ];
-        // Realistic glyph widths: cells cover well under their column slots
-        // (the whitespace signature the fill check keys on).
+        // Widths must undershoot the column slots — the fill check keys on
+        // that whitespace.
         let widths = [42.0, 30.0, 55.0, 22.0, 24.0, 22.0, 24.0, 15.0];
         let mut items = Vec::new();
         let mut y = 100.0;
