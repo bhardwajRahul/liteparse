@@ -568,6 +568,23 @@ fn classify_region(
             state.flush_code(&mut blocks);
             state.reset_list();
             let run = table_iter.next().unwrap();
+            // Prose lines the run stepped over between its header and body
+            // sit inside `[run.start, run.end)`, which this loop skips — emit
+            // each as its own paragraph ahead of the table so the text isn't
+            // dropped.
+            for note in run.interstitials {
+                if note.text.is_empty() {
+                    continue;
+                }
+                blocks.push(PositionedBlock::new(
+                    Block::Paragraph {
+                        text: note.text,
+                        bold: false,
+                        italic: false,
+                    },
+                    note.bbox,
+                ));
+            }
             blocks.push(PositionedBlock::new(run.block, run.bbox));
             idx = run.end;
             continue;

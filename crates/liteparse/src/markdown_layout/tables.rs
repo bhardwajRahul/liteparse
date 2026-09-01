@@ -272,6 +272,12 @@ pub(super) struct TableRun {
     /// re-extraction pass must not re-bin those header lines as body rows.
     pub(super) body_start: usize,
     pub(super) block: Block,
+    /// Free-standing prose lines the run stepped over between its absorbed
+    /// header and body rows (e.g. a note interleaved under the header). They
+    /// are inside the run's `[start, end)` span, so the classifier never
+    /// visits them — the consumer must emit each as its own paragraph ahead
+    /// of the table or the text is silently dropped. Top-to-bottom order.
+    pub(super) interstitials: Vec<Cell>,
     /// Region the whole table occupies. For ruled tables this is the drawn
     /// grid; for the borderless detectors it is the union of the lines the run
     /// consumed. `None` when the run was built without geometry (tests, and
@@ -924,8 +930,10 @@ fn finalize_table_run(
     // 1 when the bold-first-row promotion consumes rows[0].
     let first_row = &rows[0].2;
     let bold_header_qualifies = absorbed.is_none() && bold_first_row_eligible;
-    let (run_start, header, row_start) = match absorbed {
-        Some((hstart, header_texts)) => (hstart, Some(header_texts), 0),
+    let (run_start, header, row_start, interstitials) = match absorbed {
+        Some((hstart, header_texts, interstitials)) => {
+            (hstart, Some(header_texts), 0, interstitials)
+        }
         None if bold_header_qualifies => (
             start_idx,
             Some(
@@ -935,8 +943,9 @@ fn finalize_table_run(
                     .collect(),
             ),
             1,
+            Vec::new(),
         ),
-        None => (start_idx, None, 0),
+        None => (start_idx, None, 0, Vec::new()),
     };
     let body_rows: Vec<Vec<Cell>> = rows[row_start..]
         .iter()
@@ -967,6 +976,7 @@ fn finalize_table_run(
             header,
             rows: body_rows,
         },
+        interstitials,
     })
 }
 
@@ -1419,6 +1429,7 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
             body_start: start_idx,
             bbox: lines_bbox(lines, start_idx, end),
             block: Block::GridFallback { lines: raw },
+            interstitials: Vec::new(),
         });
     }
 
@@ -1448,12 +1459,20 @@ fn absorb_header_lines(
     track_ranges: &[(f32, f32)],
     column_count: usize,
     floor: usize,
-) -> Option<(usize, Vec<Cell>)> {
+) -> Option<(usize, Vec<Cell>, Vec<Cell>)> {
     let dbgt = *super::flags::DEBUG_TABLE;
     // Line index is kept alongside the cells so the assembled header cells can
     // report the band they were read from — a wrapped header spans every line
     // that contributed to it, not just the last one.
     let mut absorbed: Vec<(usize, Vec<TableCell>)> = Vec::new();
+    // A single free-text line interleaved between the header and the first
+    // body row (a note, a caption) used to end absorption here, leaving the
+    // table headerless — the markdown emitter then promotes the first *data*
+    // row into the header slot and that row disappears when parsed. Step over
+    // at most one such line and keep walking; it only commits if a genuine
+    // header (≥2 cells, all track-aligned) is found directly above, otherwise
+    // absorption fails as before and the line stays outside the run.
+    let mut skipped: Vec<usize> = Vec::new();
     let mut j = start_idx;
     while j > floor {
         let cand = j - 1;
@@ -1475,7 +1494,13 @@ fn absorb_header_lines(
         // a merged-run header is a single line, whereas letting recovery
         // track-align line after line lets absorption climb an entire
         // paragraph, one plausible-looking row at a time.
-        if absorbed.is_empty() && cells.len() < column_count {
+        // Also gated on no interstitial skip having happened: skip + recovery
+        // compose into two speculative rescues, and together they manufacture
+        // headers out of wrapped document titles (a title line above a
+        // stepped-over caption shreds into plausible short cells and then
+        // suppresses the legitimate bold-first-row promotion). A post-skip
+        // header must split into multiple cells on its own.
+        if absorbed.is_empty() && skipped.is_empty() && cells.len() < column_count {
             const HEADER_MAX_CELL_CHARS: usize = 30;
             let tracks: Vec<f32> = track_ranges.iter().map(|r| r.0).collect();
             if let Some(recovered) = recover_merged_cell(cells.clone(), &tracks)
@@ -1500,6 +1525,24 @@ fn absorb_header_lines(
         // A header line must carry at least two cells (a single cell is a
         // title/caption, not a header) and sit tight above the row below it.
         if cells.len() < 2 {
+            // Interstitial skip: a single-cell prose line sitting tight above
+            // the body may have a real header directly above it. Restricted to
+            // one line, before any absorption (the note sits against the body,
+            // never inside a wrapped header band), and the line must be
+            // adjacent to the row below it so absorption can't jump gaps.
+            if absorbed.is_empty()
+                && skipped.is_empty()
+                && cells.len() == 1
+                && cand > floor
+                && table_rows_adjacent(&lines[cand], &lines[j])
+            {
+                if dbgt {
+                    eprintln!("[tbl-absorb skip @{cand}] single-cell interstitial, continuing up");
+                }
+                skipped.push(cand);
+                j = cand;
+                continue;
+            }
             break;
         }
         if !table_rows_adjacent(&lines[cand], &lines[j]) {
@@ -1520,6 +1563,15 @@ fn absorb_header_lines(
     if absorbed.is_empty() {
         return None;
     }
+    // Skips only commit when a header was found above them — otherwise the
+    // run keeps its old start and the stepped-over line is classified
+    // normally. Each committed skip is handed back as owned text + box so the
+    // consumer can emit it as a paragraph (the line index lands inside the
+    // run span, where the classifier never looks).
+    let interstitials: Vec<Cell> = skipped
+        .iter()
+        .map(|&idx| Cell::located(lines[idx].text.trim().to_string(), lines[idx].bbox.clone()))
+        .collect();
     // Collected bottom-up; reverse so text reads top-to-bottom per column.
     absorbed.reverse();
     let mut header = vec![Cell::default(); column_count];
@@ -1535,7 +1587,24 @@ fn absorb_header_lines(
             Rect::extend(&mut header[idx].bbox, &cell_rect(c, &lines[*line_idx]));
         }
     }
-    Some((j, header))
+    // A header reached via a skip is held to a coverage bar: it must name at
+    // least a third of the columns. A sparse group-label line (2 cells over an
+    // 11-column body) absorbed across the wrapped remainder of its own band
+    // would otherwise displace the fully-populated real header row below it
+    // into the body. Failing the bar fails the whole absorption — the run
+    // falls back to its pre-skip behavior.
+    if !skipped.is_empty() {
+        let nonempty = header.iter().filter(|c| !c.text.is_empty()).count();
+        if nonempty * 3 < column_count {
+            if dbgt {
+                eprintln!(
+                    "[tbl-absorb reject] post-skip header names {nonempty}/{column_count} columns"
+                );
+            }
+            return None;
+        }
+    }
+    Some((j, header, interstitials))
 }
 
 /// Scan `lines` once and return all detected tabular regions (sorted by
@@ -2141,6 +2210,7 @@ fn try_detect_description_list(lines: &[ProjectedLine], start_idx: usize) -> Opt
             header: None,
             rows: body,
         },
+        interstitials: Vec::new(),
     })
 }
 
@@ -2705,6 +2775,11 @@ fn build_union_table(
         start,
         end: window_end,
         body_start: window_start,
+        // Fragments' own interstitials are not carried over: the union span
+        // starts at the first fragment's body and `union_header_from_above`
+        // stops at prose, so any stepped-over line lands outside the new span
+        // and is classified normally — preserved as a paragraph, not dropped.
+        interstitials: Vec::new(),
         bbox: lines_bbox(lines, start, window_end),
         block: Block::Table { header, rows },
     })
@@ -2943,6 +3018,12 @@ fn try_merge_pair(a: &TableRun, b: &TableRun, lines: &[ProjectedLine]) -> Option
             // between them.
             bbox: lines_bbox(lines, a.start, b.end),
             block: Block::Table { header, rows },
+            interstitials: a
+                .interstitials
+                .iter()
+                .chain(&b.interstitials)
+                .cloned()
+                .collect(),
         });
     }
 
@@ -3009,6 +3090,12 @@ fn try_merge_pair(a: &TableRun, b: &TableRun, lines: &[ProjectedLine]) -> Option
                 header: Some(merged_header),
                 rows: merged_rows,
             },
+            interstitials: a
+                .interstitials
+                .iter()
+                .chain(&b.interstitials)
+                .cloned()
+                .collect(),
         });
     }
 
@@ -4525,6 +4612,7 @@ fn build_ruled_table_from(
             start,
             end,
             body_start: start,
+            interstitials: Vec::new(),
             // A ruled table's region is the grid the generator actually drew.
             bbox: Some(bbox),
             block: Block::Table {
@@ -5630,6 +5718,55 @@ mod tests {
     }
 
     #[test]
+    fn absorbs_header_over_interleaved_note_line() {
+        // Issue #395: a free-text note between the header and the first body
+        // row blocked header absorption, leaving the table headerless — the
+        // pipe-table emitter then promotes the first DATA row into the header
+        // slot and that row is lost to downstream markdown parsers. The walk
+        // must step over one such line, absorb the real header, and hand the
+        // note back as an interstitial paragraph.
+        // Geometry mirrors the issue's PDF: the note sits a wider-than-row
+        // gap below the header (so the forward walk can't wrap it into the
+        // header row) but still within absorption adjacency, and tight above
+        // the first body row.
+        let lines = vec![
+            line_with_spans(
+                &[("Name", 50.0), ("Score", 150.0), ("Ref", 250.0)],
+                100.0,
+                10.0,
+            ),
+            line_with_spans(&[("Shipment was delayed in transit.", 80.0)], 122.0, 10.0),
+            line_with_spans(&[("A", 50.0), ("1", 150.0), ("2", 250.0)], 136.0, 10.0),
+            line_with_spans(&[("B", 50.0), ("3", 150.0), ("4", 250.0)], 150.0, 10.0),
+            line_with_spans(&[("C", 50.0), ("5", 150.0), ("6", 250.0)], 164.0, 10.0),
+        ];
+        let runs = detect_tables(&lines);
+        assert_eq!(runs.len(), 1);
+        let run = &runs[0];
+        assert_eq!(run.start, 0, "header must be absorbed across the note");
+        assert_eq!(run.end, 5);
+        assert_eq!(
+            run.interstitials
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Shipment was delayed in transit."],
+            "the stepped-over note must be preserved for paragraph emission"
+        );
+        match &run.block {
+            Block::Table { header, rows } => {
+                let header = header.as_ref().expect("header should be present");
+                assert_eq!(
+                    header,
+                    &vec!["Name".to_string(), "Score".to_string(), "Ref".to_string()]
+                );
+                assert_eq!(rows.len(), 3, "no data row may be consumed as header");
+            }
+            other => panic!("expected Block::Table, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn does_not_absorb_single_cell_title_above_body() {
         // A one-cell title/caption above a table is NOT a header row and must
         // not be absorbed.
@@ -5903,6 +6040,7 @@ mod tests {
     #[test]
     fn merge_prefers_ruled_when_overlapping() {
         let ruled = vec![TableRun {
+            interstitials: Vec::new(),
             start: 5,
             end: 10,
             body_start: 5,
@@ -5913,6 +6051,7 @@ mod tests {
             },
         }];
         let borderless = vec![TableRun {
+            interstitials: Vec::new(),
             start: 6,
             end: 11,
             body_start: 6,
@@ -5965,6 +6104,7 @@ mod tests {
             three_col_line("b3", 70.0),
         ];
         let a = TableRun {
+            interstitials: Vec::new(),
             start: 0,
             end: 2,
             body_start: 0,
@@ -5975,6 +6115,7 @@ mod tests {
             },
         };
         let b = TableRun {
+            interstitials: Vec::new(),
             start: 2,
             end: 5,
             body_start: 2,
@@ -6015,6 +6156,7 @@ mod tests {
             four_col_line("body", 70.0),
         ];
         let a = TableRun {
+            interstitials: Vec::new(),
             start: 0,
             end: 2,
             body_start: 0,
@@ -6028,6 +6170,7 @@ mod tests {
             },
         };
         let b = TableRun {
+            interstitials: Vec::new(),
             start: 2,
             end: 5,
             body_start: 2,
@@ -6069,6 +6212,7 @@ mod tests {
             three_col_line("b2", 215.0),
         ];
         let a = TableRun {
+            interstitials: Vec::new(),
             start: 0,
             end: 2,
             body_start: 0,
@@ -6079,6 +6223,7 @@ mod tests {
             },
         };
         let b = TableRun {
+            interstitials: Vec::new(),
             start: 2,
             end: 4,
             body_start: 2,
@@ -6104,6 +6249,7 @@ mod tests {
             .chain((0..3).map(|i| four_col_line("y", 160.0 + i as f32 * 15.0)))
             .collect();
         let a = TableRun {
+            interstitials: Vec::new(),
             start: 0,
             end: 10,
             body_start: 0,
@@ -6116,6 +6262,7 @@ mod tests {
             },
         };
         let b = TableRun {
+            interstitials: Vec::new(),
             start: 10,
             end: 13,
             body_start: 10,
@@ -6162,6 +6309,7 @@ mod tests {
             ),
         ];
         let a = TableRun {
+            interstitials: Vec::new(),
             start: 0,
             end: 2,
             body_start: 0,
@@ -6175,6 +6323,7 @@ mod tests {
             },
         };
         let b = TableRun {
+            interstitials: Vec::new(),
             start: 2,
             end: 4,
             body_start: 2,
@@ -6199,6 +6348,7 @@ mod tests {
             three_col_line("c", 40.0),
         ];
         let a = TableRun {
+            interstitials: Vec::new(),
             start: 0,
             end: 2,
             body_start: 0,
@@ -6212,6 +6362,7 @@ mod tests {
             },
         };
         let b = TableRun {
+            interstitials: Vec::new(),
             start: 2,
             end: 3,
             body_start: 2,
@@ -6245,6 +6396,7 @@ mod tests {
             three_col_line("b", 70.0),
         ];
         let a = TableRun {
+            interstitials: Vec::new(),
             start: 0,
             end: 2,
             body_start: 0,
@@ -6255,6 +6407,7 @@ mod tests {
             },
         };
         let b = TableRun {
+            interstitials: Vec::new(),
             start: 3,
             end: 5,
             body_start: 3,
@@ -6285,6 +6438,7 @@ mod tests {
             four_col_line("body", 85.0),
         ];
         let a = TableRun {
+            interstitials: Vec::new(),
             start: 0,
             end: 2,
             body_start: 0,
@@ -6298,6 +6452,7 @@ mod tests {
             },
         };
         let b = TableRun {
+            interstitials: Vec::new(),
             start: 3,
             end: 6,
             body_start: 3,
