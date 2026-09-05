@@ -110,6 +110,13 @@ impl<'lib> Document<'lib> {
         unsafe { ffi!(FPDF_GetFormType(self.handle)) }
     }
 
+    /// Whether the catalog declares the document tagged (`/MarkInfo /Marked true`).
+    /// A structure tree can be present without this flag — residual or stale
+    /// tagging — so callers that treat the tree as authoritative gate on it.
+    pub fn is_tagged(&self) -> bool {
+        (unsafe { ffi!(FPDFCatalog_IsTagged(self.handle)) }) != 0
+    }
+
     /// Initialize read-only AcroForm access. Returns `None` for documents with
     /// no form catalog or when PDFium rejects the form-fill environment.
     pub fn form_environment(&self) -> Option<FormEnvironment<'_, 'lib>> {

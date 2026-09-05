@@ -460,13 +460,19 @@ pub struct ExtractionOutputOptions {
     pub emit_word_boxes: bool,
 }
 
+fn non_empty(value: &Option<String>) -> Option<String> {
+    value.as_ref().filter(|v| !v.is_empty()).cloned()
+}
+
 fn document_annotation(annotation: &pdfium::PdfAnnotation) -> DocumentAnnotation {
     DocumentAnnotation {
         subtype: annotation.subtype.clone(),
-        contents: annotation.contents.clone(),
-        created: annotation.created.clone(),
-        modified: annotation.modified.clone(),
-        title: annotation.title.clone(),
+        // The pdfium layer keeps present-but-empty strings as `Some("")`; this
+        // output has always omitted them.
+        contents: non_empty(&annotation.contents),
+        created: non_empty(&annotation.created),
+        modified: non_empty(&annotation.modified),
+        title: non_empty(&annotation.title),
         rect: annotation.rect.map(rect_from_pdfium),
         quadpoint_rects: annotation
             .quadpoint_rects

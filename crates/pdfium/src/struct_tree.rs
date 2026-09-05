@@ -40,6 +40,18 @@ pub struct StructureElement {
     pub annotation_object_numbers: Vec<i32>,
 }
 
+/// The page-scoped structure tree with the root count pdfium reported.
+///
+/// `root_count` can exceed `roots.len()`: pdfium returns a null element for a
+/// root that does not belong to the page, and those are skipped. Callers that
+/// shape output on "one root vs several" need the declared count, not the
+/// number that resolved.
+#[derive(Debug, Clone, Default)]
+pub struct StructureTree {
+    pub root_count: usize,
+    pub roots: Vec<StructureElement>,
+}
+
 /// One node in the structure tree, flattened for downstream use.
 #[derive(Debug, Clone)]
 pub struct StructNode {
@@ -59,9 +71,15 @@ impl Page<'_, '_> {
     /// Extract the complete tagged-PDF structure tree for public output.
     /// Returns an empty vector for untagged pages and preserves multiple roots.
     pub fn structure_tree(&self) -> Vec<StructureElement> {
+        self.structure_tree_with_root_count().roots
+    }
+
+    /// [`Page::structure_tree`] plus the number of roots pdfium declared for
+    /// the page, including the ones it could not resolve.
+    pub fn structure_tree_with_root_count(&self) -> StructureTree {
         let tree = unsafe { ffi!(FPDF_StructTree_GetForPage(self.handle)) };
         if tree.is_null() {
-            return Vec::new();
+            return StructureTree::default();
         }
         let count = unsafe { ffi!(FPDF_StructTree_CountChildren(tree)) };
         let mut roots = Vec::with_capacity(count.max(0) as usize);
@@ -72,7 +90,10 @@ impl Page<'_, '_> {
             }
         }
         unsafe { ffi!(FPDF_StructTree_Close(tree)) };
-        roots
+        StructureTree {
+            root_count: count.max(0) as usize,
+            roots,
+        }
     }
 
     /// Walk this page's structure tree (tagged-PDF tree). Returns an empty

@@ -15,10 +15,10 @@ pub use error::PdfiumError;
 pub use font::{Font, FontType};
 pub use library::Library;
 pub use page::{
-    ImageBounds, ImageObjectInfo, ImageObjects, Page, PathObject, PathSegment, PdfAnnotation,
-    PdfFormField, PdfLink, SegmentKind, ViewportTransform,
+    FormPageGuard, ImageBounds, ImageObjectInfo, ImageObjects, Page, PathObject, PathSegment,
+    PdfAnnotation, PdfFormField, PdfLink, SegmentKind, ViewportTransform,
 };
-pub use struct_tree::{StructNode, StructureAttributeValue, StructureElement};
+pub use struct_tree::{StructNode, StructureAttributeValue, StructureElement, StructureTree};
 pub use text_page::{TextChar, TextCharIter, TextPage};
 pub use types::*;
 

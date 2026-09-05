@@ -3,6 +3,7 @@
 #include "fpdf_edit.h"
 #include "fpdf_doc.h"
 #include "fpdf_annot.h"
+#include "fpdf_catalog.h"
 #include "fpdf_structtree.h"
 #include "fpdf_transformpage.h"
 #include "fpdf_signature.h"
