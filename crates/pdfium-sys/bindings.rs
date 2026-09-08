@@ -2937,6 +2937,20 @@ unsafe extern "C" {
     pub fn FPDFAnnot_GetObjNum(annot: FPDF_ANNOTATION) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn FPDFCatalog_IsTagged(document: FPDF_DOCUMENT) -> FPDF_BOOL;
+}
+unsafe extern "C" {
+    pub fn FPDFCatalog_GetLanguage(
+        document: FPDF_DOCUMENT,
+        buffer: *mut FPDF_WCHAR,
+        buflen: ::std::os::raw::c_ulong,
+    ) -> ::std::os::raw::c_ulong;
+}
+unsafe extern "C" {
+    pub fn FPDFCatalog_SetLanguage(document: FPDF_DOCUMENT, language: FPDF_WIDESTRING)
+        -> FPDF_BOOL;
+}
+unsafe extern "C" {
     pub fn FPDF_StructTree_GetForPage(page: FPDF_PAGE) -> FPDF_STRUCTTREE;
 }
 unsafe extern "C" {

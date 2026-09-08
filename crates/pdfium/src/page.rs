@@ -182,7 +182,9 @@ pub struct PdfLink {
 }
 
 /// One PDF annotation with geometry normalized to viewport space (top-left
-/// origin, 72 DPI). String fields mirror the standard annotation dictionary.
+/// origin, 72 DPI). String fields mirror the standard annotation dictionary:
+/// `None` when the key is absent, `Some("")` when it is present but empty, so
+/// callers can tell the two apart.
 #[derive(Debug, Clone)]
 pub struct PdfAnnotation {
     pub object_number: Option<i32>,
@@ -192,8 +194,19 @@ pub struct PdfAnnotation {
     pub modified: Option<String>,
     pub title: Option<String>,
     pub rect: Option<RectF>,
+    /// Whether pdfium reports attachment points for this annotation
+    /// (`FPDFAnnot_HasAttachmentPoints`: a subtype test — links and the
+    /// text-markup subtypes). Tells "declares no quads" from "subtype never has
+    /// them" when `quadpoint_rects` is empty.
+    pub has_attachment_points: bool,
+    /// Bounding boxes of the `/QuadPoints` quads, when `has_attachment_points`.
     pub quadpoint_rects: Vec<RectF>,
+    /// The link's URI, decoded lossily and only when non-empty.
     pub uri: Option<String>,
+    /// The link's URI action bytes exactly as stored (no trailing NUL), present
+    /// whenever the link annotation carries a URI action — including an empty
+    /// URI or one that is not valid UTF-8, which `uri` cannot represent.
+    pub uri_raw: Option<Vec<u8>>,
 }
 
 /// One AcroForm widget with its resolved field metadata. A logical radio or
@@ -365,28 +378,35 @@ impl<'doc, 'lib: 'doc> Page<'doc, 'lib> {
         dpi: f32,
         form: Option<&FormEnvironment>,
     ) -> Result<Bitmap<'lib>, PdfiumError> {
-        if let Some(form) = form {
-            unsafe {
-                ffi!(FORM_OnAfterLoadPage(self.handle, form.handle));
-                ffi!(FORM_DoPageAAction(
-                    self.handle,
-                    form.handle,
-                    pdfium_sys::FPDFPAGE_AACTION_OPEN as i32,
-                ));
-            }
+        let _form_page = form.map(|form| self.notify_form_page_loaded(form));
+        self.render_bitmap(dpi, form)
+    }
+
+    /// Tell the form-fill environment this page is open: `FORM_OnAfterLoadPage`
+    /// then the page's `/AA` open action. The returned guard runs the close
+    /// action and `FORM_OnBeforeClosePage` when dropped, so drop it before the
+    /// page itself goes away.
+    ///
+    /// This is not only for rendering. Loading the page into the environment is
+    /// when pdfium builds its widget objects and regenerates appearance streams
+    /// that are missing or stale (`NeedAppearances` forms), and a checkbox's
+    /// export value is read off that appearance dictionary — so form-field
+    /// extraction that skips the notification sees fewer values than a viewer
+    /// would.
+    pub fn notify_form_page_loaded<'a>(&'a self, form: &'a FormEnvironment) -> FormPageGuard<'a> {
+        unsafe {
+            ffi!(FORM_OnAfterLoadPage(self.handle, form.handle));
+            ffi!(FORM_DoPageAAction(
+                self.handle,
+                form.handle,
+                pdfium_sys::FPDFPAGE_AACTION_OPEN as i32,
+            ));
         }
-        let result = self.render_bitmap(dpi, form);
-        if let Some(form) = form {
-            unsafe {
-                ffi!(FORM_DoPageAAction(
-                    self.handle,
-                    form.handle,
-                    pdfium_sys::FPDFPAGE_AACTION_CLOSE as i32,
-                ));
-                ffi!(FORM_OnBeforeClosePage(self.handle, form.handle));
-            }
+        FormPageGuard {
+            page: self.handle,
+            form: form.handle,
+            _lifetime: std::marker::PhantomData,
         }
-        result
     }
 
     fn render_bitmap(
@@ -862,7 +882,8 @@ impl<'doc, 'lib: 'doc> Page<'doc, 'lib> {
             };
 
             let mut quadpoint_rects = Vec::new();
-            if unsafe { ffi!(FPDFAnnot_HasAttachmentPoints(annot)) } != 0 {
+            let has_attachment_points = unsafe { ffi!(FPDFAnnot_HasAttachmentPoints(annot)) } != 0;
+            if has_attachment_points {
                 let quad_count = unsafe { ffi!(FPDFAnnot_CountAttachmentPoints(annot)) };
                 quadpoint_rects.reserve(quad_count);
                 for quad_index in 0..quad_count {
@@ -882,7 +903,7 @@ impl<'doc, 'lib: 'doc> Page<'doc, 'lib> {
                 }
             }
 
-            let uri = if subtype == pdfium_sys::FPDF_ANNOT_LINK as i32 {
+            let uri_raw = if subtype == pdfium_sys::FPDF_ANNOT_LINK as i32 {
                 let link = unsafe { ffi!(FPDFAnnot_GetLink(annot)) };
                 if link.is_null() {
                     None
@@ -891,12 +912,13 @@ impl<'doc, 'lib: 'doc> Page<'doc, 'lib> {
                     if action.is_null() {
                         None
                     } else {
-                        read_uri_path(self.doc_handle, action)
+                        read_uri_path_bytes(self.doc_handle, action)
                     }
                 }
             } else {
                 None
             };
+            let uri = uri_raw.as_deref().and_then(decode_uri_path);
 
             out.push(PdfAnnotation {
                 object_number: match unsafe { ffi!(FPDFAnnot_GetObjNum(annot)) } {
@@ -904,13 +926,15 @@ impl<'doc, 'lib: 'doc> Page<'doc, 'lib> {
                     _ => None,
                 },
                 subtype: annotation_subtype_name(subtype).to_string(),
-                contents: read_annotation_string(annot, b"Contents\0"),
-                created: read_annotation_string(annot, b"CreationDate\0"),
-                modified: read_annotation_string(annot, b"M\0"),
-                title: read_annotation_string(annot, b"T\0"),
+                contents: read_annotation_string_if_present(annot, b"Contents\0"),
+                created: read_annotation_string_if_present(annot, b"CreationDate\0"),
+                modified: read_annotation_string_if_present(annot, b"M\0"),
+                title: read_annotation_string_if_present(annot, b"T\0"),
                 rect,
+                has_attachment_points,
                 quadpoint_rects,
                 uri,
+                uri_raw,
             });
             unsafe { ffi!(FPDFPage_CloseAnnot(annot)) };
         }
@@ -1244,6 +1268,27 @@ impl<'doc, 'lib: 'doc> Page<'doc, 'lib> {
     }
 }
 
+/// A page's open session in a form-fill environment; see
+/// [`Page::notify_form_page_loaded`]. Closing notifications run on drop.
+pub struct FormPageGuard<'a> {
+    page: pdfium_sys::FPDF_PAGE,
+    form: pdfium_sys::FPDF_FORMHANDLE,
+    _lifetime: std::marker::PhantomData<&'a ()>,
+}
+
+impl Drop for FormPageGuard<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            ffi!(FORM_DoPageAAction(
+                self.page,
+                self.form,
+                pdfium_sys::FPDFPAGE_AACTION_CLOSE as i32,
+            ));
+            ffi!(FORM_OnBeforeClosePage(self.page, self.form));
+        }
+    }
+}
+
 /// The optional page-flatten API, resolved together so a build missing either
 /// half degrades to "no flattening" rather than failing the whole pdfium load.
 struct FlattenApi {
@@ -1400,16 +1445,34 @@ fn read_form_string(
     (!value.is_empty()).then_some(value)
 }
 
+/// One choice-field option label. An empty label is a real option (the blank
+/// first entry of many combo boxes) and is kept as `Some("")`; `None` only
+/// when pdfium has no label at all for the index.
 fn read_form_option_label(
     form: pdfium_sys::FPDF_FORMHANDLE,
     annot: pdfium_sys::FPDF_ANNOTATION,
     index: i32,
 ) -> Option<String> {
-    read_form_string(form, annot, |handle, annotation, buffer, len| unsafe {
+    let needed = unsafe {
         ffi!(FPDFAnnot_GetOptionLabel(
-            handle, annotation, index, buffer, len
+            form,
+            annot,
+            index,
+            std::ptr::null_mut(),
+            0
         ))
-    })
+    } as usize;
+    if needed == 0 {
+        return None;
+    }
+    Some(
+        read_form_string(form, annot, |handle, annotation, buffer, len| unsafe {
+            ffi!(FPDFAnnot_GetOptionLabel(
+                handle, annotation, index, buffer, len
+            ))
+        })
+        .unwrap_or_default(),
+    )
 }
 
 fn annotation_rect(
@@ -1470,6 +1533,19 @@ fn annotation_subtype_name(subtype: pdfium_sys::FPDF_ANNOTATION_SUBTYPE) -> &'st
         .unwrap_or("unknown")
 }
 
+/// An annotation dictionary string by key: `None` when the key is absent,
+/// `Some("")` when present but empty. (`FPDFAnnot_GetStringValue` alone
+/// reports both as an empty string, so presence is checked first.)
+fn read_annotation_string_if_present(
+    annot: pdfium_sys::FPDF_ANNOTATION,
+    key: &'static [u8],
+) -> Option<String> {
+    if unsafe { ffi!(FPDFAnnot_HasKey(annot, key.as_ptr().cast())) } == 0 {
+        return None;
+    }
+    Some(read_annotation_string(annot, key).unwrap_or_default())
+}
+
 fn read_annotation_string(
     annot: pdfium_sys::FPDF_ANNOTATION,
     key: &'static [u8],
@@ -1511,13 +1587,16 @@ fn read_annotation_string(
 /// Read a link action's URI path. PDFium returns the URI as a NUL-terminated
 /// 7-bit-ASCII byte string; the two-call protocol queries the length first.
 /// Returns `None` for non-URI actions (length 0) or empty URIs.
-fn read_uri_path(
+/// The URI action's path bytes as stored, without the trailing NUL. `None`
+/// when `action` is not a URI action.
+fn read_uri_path_bytes(
     doc: pdfium_sys::FPDF_DOCUMENT,
     action: pdfium_sys::FPDF_ACTION,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     let needed =
         unsafe { ffi!(FPDFAction_GetURIPath(doc, action, std::ptr::null_mut(), 0)) } as usize;
-    if needed < 2 {
+    // pdfium reports `len + 1` for a URI action (the NUL), 0 for anything else.
+    if needed < 1 {
         return None;
     }
     let mut buf: Vec<u8> = vec![0; needed];
@@ -1529,15 +1608,29 @@ fn read_uri_path(
             needed as std::os::raw::c_ulong,
         ))
     } as usize;
-    if written < 2 {
+    if written < 1 {
         return None;
     }
-    // `written` includes the trailing NUL.
-    let end = written.saturating_sub(1).min(buf.len());
-    let uri = String::from_utf8_lossy(&buf[..end])
+    buf.truncate(written.saturating_sub(1).min(buf.len()));
+    Some(buf)
+}
+
+/// The lossy, NUL-trimmed, non-empty form of a URI path for callers that want
+/// a string to show or match on.
+fn decode_uri_path(bytes: &[u8]) -> Option<String> {
+    let uri = String::from_utf8_lossy(bytes)
         .trim_matches(char::from(0))
         .to_string();
     if uri.is_empty() { None } else { Some(uri) }
+}
+
+fn read_uri_path(
+    doc: pdfium_sys::FPDF_DOCUMENT,
+    action: pdfium_sys::FPDF_ACTION,
+) -> Option<String> {
+    read_uri_path_bytes(doc, action)
+        .as_deref()
+        .and_then(decode_uri_path)
 }
 
 const FS_IDENTITY: pdfium_sys::FS_MATRIX = pdfium_sys::FS_MATRIX {
