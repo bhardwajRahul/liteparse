@@ -15,7 +15,7 @@
 use serde::Serialize;
 
 use crate::markdown_layout::{Block, Cell, PositionedBlock, SpanCell};
-use crate::types::Rect;
+use crate::types::{ParsedPage, Rect};
 
 /// One table cell: its rendered text and the region it occupied.
 ///
@@ -207,5 +207,129 @@ impl From<&PositionedBlock> for LayoutBlock {
                 ..LayoutBlock::of("figure", bbox)
             },
         }
+    }
+}
+
+/// Public block list for one page: the classifier's blocks converted to the
+/// flat serializable shape, with geometry in the page's viewport frame.
+///
+/// Block and cell boxes are unioned from `ProjectedLine.bbox`, which lives in
+/// the *projection* frame. On pages where rotation handling moved text (see
+/// `ParsedPage::projected_item_frames`) that frame is a virtual canvas —
+/// unrotated sidebars, body text pushed a page-height down — so those boxes
+/// are mapped back here. Pages without rotated text have an empty table and
+/// pass through unchanged.
+pub(crate) fn blocks_for_page(page: &ParsedPage, blocks: &[PositionedBlock]) -> Vec<LayoutBlock> {
+    let mut out: Vec<LayoutBlock> = blocks.iter().map(LayoutBlock::from).collect();
+    if !page.projected_item_frames.is_empty() {
+        remap_to_page_frame(&mut out, &page.projected_item_frames);
+    }
+    out
+}
+
+/// Map text-derived block and cell boxes from the projection frame back to
+/// the page frame. A box is the union of the text items it was built from,
+/// so its page-frame counterpart is the union of those items' original
+/// rects — found by testing which projected items sit inside it. `figure`
+/// and `rule` boxes come from graphics, already in page coordinates, and are
+/// left alone; so is any box that contains no projected item (nothing to
+/// map it through).
+fn remap_to_page_frame(blocks: &mut [LayoutBlock], frames: &[(Rect, Rect)]) {
+    for block in blocks.iter_mut() {
+        if matches!(block.kind, "figure" | "rule") {
+            continue;
+        }
+        remap_opt(&mut block.bbox, frames);
+        for cell in block.header.iter_mut().flatten() {
+            remap_opt(&mut cell.bbox, frames);
+        }
+        for cell in block.rows.iter_mut().flatten().flatten() {
+            remap_opt(&mut cell.bbox, frames);
+        }
+    }
+}
+
+fn remap_opt(bbox: &mut Option<Rect>, frames: &[(Rect, Rect)]) {
+    if let Some(r) = bbox.as_ref().and_then(|r| remap_rect(r, frames)) {
+        *bbox = Some(r);
+    }
+}
+
+/// Union of the original rects of every item whose projected centre lies in
+/// `rect` (with a small tolerance for float drift in the unions). `None` when
+/// no item does.
+fn remap_rect(rect: &Rect, frames: &[(Rect, Rect)]) -> Option<Rect> {
+    const TOL: f32 = 0.5;
+    let x0 = rect.x - TOL;
+    let y0 = rect.y - TOL;
+    let x1 = rect.x + rect.width + TOL;
+    let y1 = rect.y + rect.height + TOL;
+    let mut acc: Option<Rect> = None;
+    for (projected, original) in frames {
+        let cx = projected.x + projected.width / 2.0;
+        let cy = projected.y + projected.height / 2.0;
+        if cx >= x0 && cx <= x1 && cy >= y0 && cy <= y1 {
+            Rect::extend(&mut acc, original);
+        }
+    }
+    acc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    fn para(bbox: Rect) -> LayoutBlock {
+        LayoutBlock {
+            text: Some("t".into()),
+            ..LayoutBlock::of("paragraph", Some(bbox))
+        }
+    }
+
+    #[test]
+    fn remap_unions_original_rects_of_contained_items() {
+        // Body text displaced one page-height (792pt) down by rotation handling.
+        let frames = vec![
+            (
+                rect(50.0, 892.0, 100.0, 10.0),
+                rect(50.0, 100.0, 100.0, 10.0),
+            ),
+            (
+                rect(50.0, 904.0, 120.0, 10.0),
+                rect(50.0, 112.0, 120.0, 10.0),
+            ),
+            // A rotated sidebar, unrotated in the projection frame.
+            (
+                rect(20.0, 30.0, 200.0, 12.0),
+                rect(14.0, 300.0, 12.0, 200.0),
+            ),
+        ];
+        let mut blocks = vec![
+            para(rect(50.0, 892.0, 120.0, 22.0)),
+            para(rect(20.0, 30.0, 200.0, 12.0)),
+            LayoutBlock::of("figure", Some(rect(300.0, 300.0, 50.0, 50.0))),
+        ];
+        remap_to_page_frame(&mut blocks, &frames);
+        assert_eq!(blocks[0].bbox, Some(rect(50.0, 100.0, 120.0, 22.0)));
+        assert_eq!(blocks[1].bbox, Some(rect(14.0, 300.0, 12.0, 200.0)));
+        // Graphics-derived boxes are already in page space.
+        assert_eq!(blocks[2].bbox, Some(rect(300.0, 300.0, 50.0, 50.0)));
+    }
+
+    #[test]
+    fn remap_leaves_boxes_with_no_items_untouched() {
+        let frames = vec![(rect(0.0, 900.0, 10.0, 10.0), rect(0.0, 100.0, 10.0, 10.0))];
+        let mut blocks = vec![para(rect(200.0, 200.0, 50.0, 10.0))];
+        remap_to_page_frame(&mut blocks, &frames);
+        assert_eq!(blocks[0].bbox, Some(rect(200.0, 200.0, 50.0, 10.0)));
     }
 }

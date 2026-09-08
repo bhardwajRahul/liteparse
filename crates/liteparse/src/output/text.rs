@@ -27,6 +27,7 @@ mod tests {
             graphics: vec![],
             vector_graphics: None,
             figures: vec![],
+            projected_item_frames: vec![],
             struct_nodes: vec![],
             image_refs: vec![],
             complexity: None,
