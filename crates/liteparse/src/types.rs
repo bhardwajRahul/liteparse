@@ -444,6 +444,17 @@ pub struct ParsedPage {
     /// obstacles, and reused downstream for figure classification.
     #[serde(skip)]
     pub figures: Vec<Rect>,
+    /// `(projected, original)` geometry of every text item, populated only
+    /// when the two differ for at least one item on the page. Rotation
+    /// reading-order handling unrotates 90°/270° text and can displace whole
+    /// groups onto a virtual canvas below the page so they read in the right
+    /// order; `ProjectedLine.bbox` (and so every block bbox unioned from it)
+    /// lives in that projected frame. Block/cell boxes are mapped back
+    /// through this table before they are reported, so they land in the
+    /// same viewport space as `text_items`. Empty for pages without rotated
+    /// text, which is the overwhelming majority.
+    #[serde(skip)]
+    pub projected_item_frames: Vec<(Rect, Rect)>,
     /// Structure-tree nodes for this page (tagged PDFs only). Pre-flattened in
     /// pre-order. Consumed by the markdown classifier for highest-priority
     /// heading / figure / table detection.
@@ -526,7 +537,7 @@ pub struct ExtractedImage {
 }
 
 #[doc(hidden)]
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Rect {
     pub x: f32,
     pub y: f32,

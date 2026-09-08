@@ -2891,6 +2891,7 @@ pub fn project_pages_to_grid(pages: Vec<Page>) -> Vec<ParsedPage> {
                 page.page_height,
                 &obstacles,
             );
+            let projected_item_frames = projected_item_frames(&projected_items);
             ParsedPage {
                 page_number: page.page_number,
                 page_width: page.page_width,
@@ -2914,6 +2915,7 @@ pub fn project_pages_to_grid(pages: Vec<Page>) -> Vec<ParsedPage> {
                 graphics: page.graphics,
                 vector_graphics: page.vector_graphics,
                 figures,
+                projected_item_frames,
                 struct_nodes: page.struct_nodes,
                 image_refs: page.image_refs,
                 complexity: None,
@@ -2924,6 +2926,38 @@ pub fn project_pages_to_grid(pages: Vec<Page>) -> Vec<ParsedPage> {
                 // page (and whole-document signals) to run.
                 blocks: None,
             }
+        })
+        .collect()
+}
+
+/// `(projected, original)` rect per text item when rotation handling moved
+/// any item on the page (see `ParsedPage::projected_item_frames`); empty
+/// otherwise. Gated on the `rotated` flag rather than on coordinate drift:
+/// projection also rounds sizes and merges neighbours, and those small
+/// deltas are not the frame change block boxes need mapping through — so
+/// the common no-rotation page pays nothing and its boxes pass through
+/// untouched.
+fn projected_item_frames(items: &[ProjectedTextItem]) -> Vec<(Rect, Rect)> {
+    if !items.iter().any(|p| p.rotated) {
+        return Vec::new();
+    }
+    items
+        .iter()
+        .map(|p| {
+            (
+                Rect {
+                    x: p.item.x,
+                    y: p.item.y,
+                    width: p.item.width,
+                    height: p.item.height,
+                },
+                Rect {
+                    x: p.orig_x,
+                    y: p.orig_y,
+                    width: p.orig_width,
+                    height: p.orig_height,
+                },
+            )
         })
         .collect()
 }
