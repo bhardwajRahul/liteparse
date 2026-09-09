@@ -46,6 +46,14 @@ pub(crate) struct RenderedPage {
     pub height: u32,
     /// DPI this page was actually rendered at.
     pub dpi: f32,
+    /// The page has real native text (it was not sent to OCR as scanned,
+    /// blank, or garbled). OCR is then an enrichment pass over native text,
+    /// and the merge applies the stricter artifact filters.
+    pub has_native_text: bool,
+    /// Embedded raster figure rects (viewport pt, excluding full-page
+    /// backgrounds), so the merge can judge each figure's OCR output as a
+    /// group — a chart's axis/legend labels are dropped together.
+    pub image_rects: Vec<ImageBounds>,
 }
 
 /// Why a page was flagged as needing more than the cheap text-only path.
@@ -660,12 +668,38 @@ pub(crate) fn render_pages_for_ocr(
                 bitmap.to_rgb()
             };
 
+            let has_native_text = !page_complexity.reasons.iter().any(|r| {
+                matches!(
+                    r,
+                    ComplexityReason::Scanned
+                        | ComplexityReason::NoText
+                        | ComplexityReason::Garbled
+                        | ComplexityReason::AnnotationText
+                )
+            });
+            let image_rects = if has_native_text {
+                let pw = page.page_width;
+                let ph = page.page_height;
+                page_obj
+                    .image_bounds(MIN_IMAGE_SIZE_PT, f32::INFINITY)
+                    .into_iter()
+                    .filter(|b| {
+                        !(b.width > pw * MAX_IMAGE_PAGE_COVERAGE
+                            && b.height > ph * MAX_IMAGE_PAGE_COVERAGE)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
             Ok(Some(RenderedPage {
                 idx,
                 pixels,
                 width,
                 height,
                 dpi: eff_dpi,
+                has_native_text,
+                image_rects,
             }))
         })();
         match page_render {
@@ -704,13 +738,14 @@ pub(crate) async fn ocr_and_merge_rendered(
     // blocking thread pool. Run each JavaScript OCR callback directly so the
     // returned Promise can make progress on the browser event loop.
     #[cfg(target_arch = "wasm32")]
-    let task_results: Vec<(usize, usize, f32, OcrTaskResult)> = {
+    let task_results: Vec<(usize, usize, f32, (bool, Vec<ImageBounds>), OcrTaskResult)> = {
         let _ = num_workers;
         let mut results = Vec::with_capacity(rendered.len());
         for r in rendered {
             let idx = r.idx;
             let page_number = pages[idx].page_number;
             let page_dpi = r.dpi;
+            let native = (r.has_native_text, r.image_rects.clone());
             let options = OcrOptions {
                 language: ocr_language.to_string(),
                 dpi: page_dpi,
@@ -718,7 +753,7 @@ pub(crate) async fn ocr_and_merge_rendered(
             let result = ocr_engine
                 .recognize(&r.pixels, r.width, r.height, &options)
                 .await;
-            results.push((idx, page_number, page_dpi, result));
+            results.push((idx, page_number, page_dpi, native, result));
         }
         results
     };
@@ -737,7 +772,7 @@ pub(crate) async fn ocr_and_merge_rendered(
     // pass deadlocks. Acquiring the permit asynchronously parks the lightweight
     // task instead, so only `num_workers` blocking threads are ever consumed.
     #[cfg(not(target_arch = "wasm32"))]
-    let task_results: Vec<(usize, usize, f32, OcrTaskResult)> = {
+    let task_results: Vec<(usize, usize, f32, (bool, Vec<ImageBounds>), OcrTaskResult)> = {
         let num_workers = num_workers.max(1);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(num_workers));
         let mut handles = Vec::with_capacity(rendered.len());
@@ -755,6 +790,7 @@ pub(crate) async fn ocr_and_merge_rendered(
                 r.idx,
                 page_number,
                 r.dpi,
+                (r.has_native_text, r.image_rects.clone()),
                 tokio::spawn(async move {
                     // Park the task (not an OS thread) until a permit is available.
                     let _permit = sem.acquire_owned().await.expect("semaphore closed");
@@ -782,14 +818,14 @@ pub(crate) async fn ocr_and_merge_rendered(
         }
 
         let mut results = Vec::with_capacity(handles.len());
-        for (idx, page_number, page_dpi, handle) in handles {
+        for (idx, page_number, page_dpi, native, handle) in handles {
             let result = match handle.await {
                 Ok(result) => result,
                 Err(join_err) => {
                     Err(Box::new(join_err) as Box<dyn std::error::Error + Send + Sync>)
                 }
             };
-            results.push((idx, page_number, page_dpi, result));
+            results.push((idx, page_number, page_dpi, native, result));
         }
         results
     };
@@ -813,7 +849,7 @@ pub(crate) async fn ocr_and_merge_rendered(
     let mut failed_sparse_text_page = false;
     let mut first_error: Option<String> = None;
 
-    for (idx, page_number, page_dpi, result) in task_results {
+    for (idx, page_number, page_dpi, (has_native_text, image_rects), result) in task_results {
         let ocr_results: Vec<OcrResult> = match result {
             Ok(results) => results,
             Err(e) => {
@@ -861,6 +897,24 @@ pub(crate) async fn ocr_and_merge_rendered(
         // OCR lines whose bounding boxes touched within tolerance to suppress each
         // other, dropping every second line on scanned pages.
         let native_count = page.text_items.len();
+        let debug_ocr = std::env::var_os("LITEPARSE_DEBUG_OCR").is_some();
+        // Judge each embedded figure's OCR output as a group: a figure whose
+        // recognised text is mostly numbers and short tokens is a chart
+        // (axes, ticks, legend keys), and none of it belongs in the text flow.
+        let chart_images: Vec<bool> = if has_native_text {
+            chart_like_images(&image_rects, &ocr_results, scale_factor)
+        } else {
+            Vec::new()
+        };
+        if debug_ocr {
+            eprintln!(
+                "[ocr-merge] page {} native_items={} ocr_results={} dpi={}",
+                page_number,
+                native_count,
+                ocr_results.len(),
+                page_dpi
+            );
+        }
         for r in &ocr_results {
             if r.confidence <= 0.1 {
                 continue;
@@ -897,14 +951,55 @@ pub(crate) async fn ocr_and_merge_rendered(
                 ),
             };
 
-            if overlaps_existing_text(
+            // On pages that already have native text, OCR only enriches:
+            // a bar-shaped single glyph is a table border / rule misread
+            // (Tesseract reads vertical rules as `|`/`I`), and a result with
+            // no letters or digits is decoration. Both would otherwise be
+            // glued onto the adjacent native line by the projection's
+            // item-merge pass, corrupting cell text.
+            if has_native_text && is_rule_artifact(&r.text, ocr_w, ocr_h) {
+                if debug_ocr {
+                    eprintln!(
+                        "[ocr-merge]   skip(rule-artifact) {:?} w={:.1} h={:.1}",
+                        r.text, ocr_w, ocr_h
+                    );
+                }
+                continue;
+            }
+            if has_native_text
+                && chart_images
+                    .iter()
+                    .zip(&image_rects)
+                    .any(|(is_chart, rect)| {
+                        *is_chart && box_center_in(rect, ocr_x, ocr_y, ocr_w, ocr_h)
+                    })
+            {
+                if debug_ocr {
+                    eprintln!("[ocr-merge]   skip(chart-figure) {:?}", r.text);
+                }
+                continue;
+            }
+            let overlaps = overlaps_existing_text(
                 &page.text_items[..native_count],
                 ocr_x,
                 ocr_y,
                 ocr_w,
                 ocr_h,
                 2.0,
-            ) {
+            );
+            if debug_ocr {
+                eprintln!(
+                    "[ocr-merge]   {} conf={:.2} x={:.1} y={:.1} w={:.1} h={:.1} {:?}",
+                    if overlaps { "skip(overlap)" } else { "ADD" },
+                    r.confidence,
+                    ocr_x,
+                    ocr_y,
+                    ocr_w,
+                    ocr_h,
+                    r.text
+                );
+            }
+            if overlaps {
                 continue;
             }
 
@@ -1190,6 +1285,103 @@ fn polygon_rotation_deg(poly: &[[f32; 2]; 4]) -> f32 {
 }
 
 /// Check if an OCR bounding box overlaps with any existing text item.
+/// Maximum width/height ratio for a single-glyph OCR result to count as a
+/// misread rule: real narrow glyphs ("1", "l", "I") in a tight OCR box sit
+/// around 0.3–0.5 of their height; a table border is a hairline.
+const RULE_ARTIFACT_MAX_ASPECT: f32 = 0.35;
+
+/// An OCR result that is a misread of a rule/border or pure decoration, not
+/// text: no letters or digits at all, or a single bar-like glyph in a box far
+/// narrower than it is tall.
+fn is_rule_artifact(text: &str, w: f32, h: f32) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || !trimmed.chars().any(|c| c.is_alphanumeric()) {
+        return true;
+    }
+    let mut chars = trimmed.chars();
+    let (first, rest) = (chars.next(), chars.next());
+    if rest.is_none() {
+        if let Some(c) = first {
+            if matches!(
+                c,
+                '|' | 'I'
+                    | 'l'
+                    | '1'
+                    | '!'
+                    | 'i'
+                    | 'j'
+                    | '['
+                    | ']'
+                    | '('
+                    | ')'
+                    | '{'
+                    | '}'
+                    | '/'
+                    | '\\'
+            ) && h > 0.0
+                && w < RULE_ARTIFACT_MAX_ASPECT * h
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Minimum OCR results inside a figure before it is judged as a chart.
+const CHART_MIN_RESULTS: usize = 4;
+/// Fraction of a figure's OCR results that must be numeric or very short
+/// tokens for the figure to count as a chart.
+const CHART_LABEL_FRACTION: f32 = 0.5;
+
+fn box_center_in(rect: &ImageBounds, x: f32, y: f32, w: f32, h: f32) -> bool {
+    let cx = x + w / 2.0;
+    let cy = y + h / 2.0;
+    cx >= rect.x && cx <= rect.x + rect.width && cy >= rect.y && cy <= rect.y + rect.height
+}
+
+/// A chart label: a number (with separators/units) or a token of ≤ 3 chars.
+fn is_chart_label(text: &str) -> bool {
+    let t = text.trim();
+    if t.chars().count() <= 3 {
+        return true;
+    }
+    t.chars().any(|c| c.is_ascii_digit())
+        && t.chars().all(|c| {
+            c.is_ascii_digit()
+                || matches!(
+                    c,
+                    ',' | '.' | '%' | '-' | '+' | '$' | '€' | '£' | ' ' | 'k' | 'K' | 'M' | 'x'
+                )
+        })
+}
+
+/// For each figure rect, whether its OCR results look like a chart's
+/// axes/ticks/legend rather than text worth keeping.
+fn chart_like_images(rects: &[ImageBounds], results: &[OcrResult], scale_factor: f32) -> Vec<bool> {
+    rects
+        .iter()
+        .map(|rect| {
+            let (mut n, mut labels) = (0usize, 0usize);
+            for r in results {
+                let (x, y, w, h) = (
+                    r.bbox[0] * scale_factor,
+                    r.bbox[1] * scale_factor,
+                    (r.bbox[2] - r.bbox[0]) * scale_factor,
+                    (r.bbox[3] - r.bbox[1]) * scale_factor,
+                );
+                if box_center_in(rect, x, y, w, h) {
+                    n += 1;
+                    if is_chart_label(&r.text) {
+                        labels += 1;
+                    }
+                }
+            }
+            n >= CHART_MIN_RESULTS && labels as f32 >= CHART_LABEL_FRACTION * n as f32
+        })
+        .collect()
+}
+
 fn overlaps_existing_text(
     items: &[TextItem],
     ocr_x: f32,
@@ -1250,6 +1442,65 @@ fn clean_ocr_table_artifacts(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::types::Rect;
+
+    #[test]
+    fn rule_artifact_catches_bars_and_decoration() {
+        // Tesseract reading a table border / hairline.
+        assert!(is_rule_artifact("|", 4.3, 12.5));
+        assert!(is_rule_artifact("I", 1.0, 7.2));
+        assert!(is_rule_artifact("|  |", 3.0, 12.0));
+        assert!(is_rule_artifact("—", 20.0, 3.0));
+        assert!(is_rule_artifact("  ", 1.0, 1.0));
+        // Real narrow glyphs sit well above the hairline aspect.
+        assert!(!is_rule_artifact("1", 5.0, 12.0));
+        assert!(!is_rule_artifact("I", 4.0, 10.0));
+        // Anything with letters/digits and more than one char is text.
+        assert!(!is_rule_artifact("If", 1.0, 12.0));
+        assert!(!is_rule_artifact("N/A", 12.0, 8.0));
+    }
+
+    #[test]
+    fn chart_labels_and_chart_like_figures() {
+        assert!(is_chart_label("140,000"));
+        assert!(is_chart_label("2016"));
+        assert!(is_chart_label("$1.5M"));
+        assert!(is_chart_label("0"));
+        assert!(is_chart_label("Yr"));
+        assert!(!is_chart_label("Year"));
+        assert!(!is_chart_label("Fruit Production in British Columbia"));
+
+        let rect = ImageBounds {
+            x: 50.0,
+            y: 100.0,
+            width: 200.0,
+            height: 150.0,
+        };
+        let mk = |text: &str, x: f32, y: f32| OcrResult {
+            text: text.to_string(),
+            bbox: [x, y, x + 20.0, y + 8.0],
+            confidence: 0.9,
+            polygon: None,
+        };
+        // Axis ticks + one title: mostly labels -> chart.
+        let chart = vec![
+            mk("100", 60.0, 110.0),
+            mk("80", 60.0, 130.0),
+            mk("60", 60.0, 150.0),
+            mk("2016", 100.0, 240.0),
+            mk("Fruit Production", 120.0, 105.0),
+        ];
+        assert_eq!(chart_like_images(&[rect.clone()], &chart, 1.0), vec![true]);
+        // An infographic with sentences: not a chart.
+        let prose = vec![
+            mk("Wash your hands", 60.0, 110.0),
+            mk("for twenty seconds", 60.0, 130.0),
+            mk("before every meal", 60.0, 150.0),
+            mk("2020", 100.0, 240.0),
+        ];
+        assert_eq!(chart_like_images(&[rect.clone()], &prose, 1.0), vec![false]);
+        // Too few results to judge.
+        assert_eq!(chart_like_images(&[rect], &chart[..3], 1.0), vec![false]);
+    }
 
     fn leaf(n: usize) -> Region {
         Region {
@@ -1745,6 +1996,8 @@ mod tests {
 
     fn make_rendered(idx: usize) -> RenderedPage {
         RenderedPage {
+            has_native_text: false,
+            image_rects: Vec::new(),
             idx,
             // 1x1 grayscale pixel; the engine never inspects it.
             pixels: vec![0u8],
