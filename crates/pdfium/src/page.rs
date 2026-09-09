@@ -270,6 +270,66 @@ impl<'doc, 'lib: 'doc> Page<'doc, 'lib> {
         unsafe { ffi!(FPDFPage_GetRotation(self.handle)) }
     }
 
+    /// Replace the page's `/CropBox` (PDF user space, points, bottom-left origin).
+    /// pdfium recomputes the page size, so [`Self::width`], [`Self::height`],
+    /// [`Self::view_box`] and any later render see the new box. This is how a
+    /// caller renders one region of a page at full resolution: crop, then render
+    /// the whole (now smaller) page.
+    pub fn set_crop_box(&self, left: f32, bottom: f32, right: f32, top: f32) {
+        unsafe { ffi!(FPDFPage_SetCropBox(self.handle, left, bottom, right, top)) }
+    }
+
+    /// Render into a caller-owned bitmap with explicit pixel geometry and pdfium
+    /// flags, then draw form fields on top when `form` is given.
+    ///
+    /// The page is mapped onto the `size_x × size_y` pixel rectangle whose top-left
+    /// sits at (`start_x`, `start_y`) in `bitmap`; parts outside the bitmap are
+    /// clipped, so a shorter bitmap with a negative `start_y` renders one horizontal
+    /// strip of a tall page. The bitmap is not cleared first. For a plain DPI-based
+    /// render use [`Self::render_with_form`]; this exists for consumers that need an
+    /// exact edge length or a different flag set (the LlamaParse extractor renders
+    /// with `FPDF_ANNOT` alone, at a pixel size it computes from a max-edge rule).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_into(
+        &self,
+        bitmap: &Bitmap<'lib>,
+        start_x: i32,
+        start_y: i32,
+        size_x: i32,
+        size_y: i32,
+        form: Option<&FormEnvironment>,
+        flags: i32,
+    ) {
+        unsafe {
+            ffi!(FPDF_RenderPageBitmap(
+                bitmap.handle(),
+                self.handle,
+                start_x,
+                start_y,
+                size_x,
+                size_y,
+                0,
+                flags,
+            ));
+        }
+        if let Some(form) = form {
+            // Form layer drawn with flags 0, as the extractor does (no popups).
+            unsafe {
+                ffi!(FPDF_FFLDraw(
+                    form.handle,
+                    bitmap.handle(),
+                    self.handle,
+                    start_x,
+                    start_y,
+                    size_x,
+                    size_y,
+                    0,
+                    0,
+                ));
+            }
+        }
+    }
+
     /// Page dimensions in the same rotation-adjusted viewport coordinate
     /// space returned by [`Self::page_to_viewport`]. Unlike [`Self::width`]/
     /// [`Self::height`], this applies the `/UserUnit` multiplier, so the

@@ -120,6 +120,7 @@ pub struct PdfiumBindings {
     pub FPDF_GetPageHeightF: unsafe extern "C" fn(FPDF_PAGE) -> f32,
     pub FPDF_GetPageBoundingBox: unsafe extern "C" fn(FPDF_PAGE, *mut FS_RECTF) -> FPDF_BOOL,
     pub FPDFPage_GetRotation: unsafe extern "C" fn(FPDF_PAGE) -> std::os::raw::c_int,
+    pub FPDFPage_SetCropBox: unsafe extern "C" fn(FPDF_PAGE, f32, f32, f32, f32),
     /// LlamaParse fork API (absent from stock pdfium and older fork
     /// releases); callers fall back to the raw-byte `/UserUnit` scan.
     pub FPDFPage_GetUserUnit: Option<unsafe extern "C" fn(FPDF_PAGE) -> f32>,
@@ -593,6 +594,7 @@ impl PdfiumBindings {
             FPDF_GetPageHeightF: load_fn!(lib, "FPDF_GetPageHeightF"),
             FPDF_GetPageBoundingBox: load_fn!(lib, "FPDF_GetPageBoundingBox"),
             FPDFPage_GetRotation: load_fn!(lib, "FPDFPage_GetRotation"),
+            FPDFPage_SetCropBox: load_fn!(lib, "FPDFPage_SetCropBox"),
             FPDFPage_GetUserUnit: load_fn_opt!(lib, "FPDFPage_GetUserUnit"),
             FPDFPage_Flatten: load_fn_opt!(lib, "FPDFPage_Flatten"),
             FPDF_PageToDevice: load_fn!(lib, "FPDF_PageToDevice"),

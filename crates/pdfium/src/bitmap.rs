@@ -36,11 +36,24 @@ impl<'lib> Bitmap<'lib> {
     /// from the call site (e.g. returning a `Bitmap<'lib>` from a method on
     /// `Page<'_, 'lib>`, whose existence already proves the lock is held).
     pub unsafe fn new(width: i32, height: i32) -> Result<Self, PdfiumError> {
+        unsafe { Self::new_with_format(width, height, pdfium_sys::FPDFBitmap_BGRA as i32) }
+    }
+
+    /// Like [`Self::new`] with an explicit pdfium pixel format (`FPDFBitmap_BGR`,
+    /// `FPDFBitmap_BGRA`, `FPDFBitmap_BGRx`, `FPDFBitmap_Gray`). pdfium composites
+    /// 24-bit and 32-bit targets through different paths, so a consumer matching
+    /// another renderer's pixels byte for byte has to pick the same format it used.
+    /// `buffer()`/`stride()` follow the format: 3 bytes per pixel for BGR.
+    pub unsafe fn new_with_format(
+        width: i32,
+        height: i32,
+        format: i32,
+    ) -> Result<Self, PdfiumError> {
         let handle = unsafe {
             ffi!(FPDFBitmap_CreateEx(
                 width,
                 height,
-                pdfium_sys::FPDFBitmap_BGRA as i32,
+                format,
                 std::ptr::null_mut(),
                 0, // stride=0 lets pdfium choose
             ))
