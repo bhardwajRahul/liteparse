@@ -601,11 +601,20 @@ pub fn compute_body_size(pages: &[ParsedPage]) -> f32 {
     // Among sizes that are co-dominant with the heaviest size, pick the
     // largest. This rescues the true body when a dense references/footnote
     // block at a smaller size would otherwise win the raw char-weight vote.
-    weights
+    let body = weights
         .values()
         .filter(|(_, n)| *n >= threshold)
         .map(|(s, _)| *s)
-        .fold(0.0_f32, f32::max)
+        .fold(0.0_f32, f32::max);
+    if std::env::var_os("LITEPARSE_DEBUG_MD").is_some() {
+        let mut w: Vec<_> = weights.values().copied().collect();
+        w.sort_by(|a, b| b.1.cmp(&a.1));
+        eprintln!(
+            "[MD body-size] body={body:.2} top weights={:?}",
+            &w[..w.len().min(6)]
+        );
+    }
+    body
 }
 
 /// Minimum total non-whitespace characters across all occurrences at a font

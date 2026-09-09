@@ -1,4 +1,5 @@
 import io
+import os
 import logging
 import traceback
 from typing import Any
@@ -23,13 +24,32 @@ class StatusResponse(BaseModel):
 
 class PaddleOCRServer:
     def __init__(self) -> None:
-        self.ocr: PaddleOCR = PaddleOCR(
-            lang="en",
+        self.ocr: PaddleOCR = self._make_ocr("en")
+        self.current_language: str = "en"
+
+    @staticmethod
+    def _make_ocr(language: str) -> PaddleOCR:
+        """Build a PaddleOCR 3.x pipeline.
+
+        PADDLE_DET_LIMIT_SIDE_LEN (default 1600) caps the long edge fed to the
+        text detector ("max" limit type). Large page renders (e.g. 3500x4500 px
+        scans at 150 DPI) otherwise take minutes and several GB on CPU; the
+        recognizer still crops from the full-resolution image.
+        """
+        kwargs: dict[str, Any] = dict(
+            lang=language,
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
-            use_textline_orientation=True,
+            use_textline_orientation=os.environ.get("PADDLE_TEXTLINE_ORIENTATION", "1") not in ("0", "false"),
         )
-        self.current_language: str = "en"
+        limit = os.environ.get("PADDLE_DET_LIMIT_SIDE_LEN", "1600")
+        if limit and limit != "0":
+            kwargs["text_det_limit_side_len"] = int(limit)
+            kwargs["text_det_limit_type"] = "max"
+        threads = os.environ.get("PADDLE_CPU_THREADS")
+        if threads:
+            kwargs["cpu_threads"] = int(threads)
+        return PaddleOCR(**kwargs)
 
     @staticmethod
     def normalize_language(language: str) -> str:
@@ -62,12 +82,7 @@ class PaddleOCRServer:
                 # Initialize OCR if needed or language changed
                 if self.current_language != language:
                     # PaddleOCR 3.x parameters
-                    self.ocr = PaddleOCR(
-                        lang=language,
-                        use_doc_orientation_classify=False,
-                        use_doc_unwarping=False,
-                        use_textline_orientation=True,
-                    )
+                    self.ocr = self._make_ocr(language)
                     self.current_language = language
 
                 # Load image

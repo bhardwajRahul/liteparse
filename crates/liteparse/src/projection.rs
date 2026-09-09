@@ -4766,6 +4766,15 @@ pub(crate) fn build_projected_lines(
         .filter(|f| f.width * f.height < page_area * 0.55)
         .cloned()
         .collect();
+    // On a page with native text, OCR only enriches embedded figures
+    // (charts, diagrams, formula images, logos). Lines built from that OCR
+    // text are figure content whatever their box height says, so they are
+    // excluded from heading candidacy like any other in-figure line. On a
+    // scanned page (no native text) OCR *is* the text and headings must
+    // still come from it.
+    let page_has_native_text = items
+        .iter()
+        .any(|p| p.item.font_name.as_deref() != Some("OCR"));
 
     let mut out: Vec<ProjectedLine> = Vec::new();
     for (path, indices) in leaves {
@@ -4830,6 +4839,7 @@ pub(crate) fn build_projected_lines(
                     &current,
                     path.clone(),
                     &heading_excl_figures,
+                    page_has_native_text,
                 ));
                 current = vec![idx];
                 current_y = y;
@@ -4842,6 +4852,7 @@ pub(crate) fn build_projected_lines(
                 &current,
                 path.clone(),
                 &heading_excl_figures,
+                page_has_native_text,
             ));
         }
     }
@@ -4883,6 +4894,7 @@ fn build_one_line(
     idxs: &[usize],
     region_path: Vec<u16>,
     figures: &[Rect],
+    page_has_native_text: bool,
 ) -> ProjectedLine {
     // Sort by x so concatenation reads left→right even if reading order had
     // rotated insertions. `spans` stays in this x-ascending order — the table
@@ -4918,6 +4930,13 @@ fn build_one_line(
     let mut italic_chars: usize = 0;
     let mut mono_chars: usize = 0;
     let mut total_chars: usize = 0;
+    // Chars contributed by OCR-sourced items. Their `font_size` is the OCR
+    // box height, i.e. a bbox estimate with the same jitter as the
+    // baked-size fallback below, so an OCR-dominated line is flagged
+    // `font_size_is_estimated` and gets the wider heading margin. Without
+    // this, chart labels OCR'd at 9.1–9.6pt next to a 9pt body open heading
+    // levels the body then matches under the 0.6pt tolerance.
+    let mut ocr_chars: usize = 0;
     let mut anchor_weights: HashMap<u8, usize> = HashMap::new();
     let mut mcid: Option<i32> = None;
     let mut spans: Vec<TextItem> = Vec::with_capacity(sorted.len());
@@ -4952,6 +4971,9 @@ fn build_one_line(
 
         let n = it.text.chars().count().max(1);
         total_chars += n;
+        if it.font_name.as_deref() == Some("OCR") {
+            ocr_chars += n;
+        }
 
         if let Some(size) = it.font_size
             && size > 0.0
@@ -5031,8 +5053,9 @@ fn build_one_line(
     // Fallback: when PDFium reports font_size ≤ 1.5 (size baked into the text
     // matrix), use char-weighted bbox height so the size-dependent grouping
     // (tables, paragraphs) keeps its well-tuned behavior.
+    let ocr_dominated = ocr_chars * 2 > total_chars;
     let (dominant_font_size, font_size_is_estimated) = if dominant_size_from_font > 1.5 {
-        (dominant_size_from_font, false)
+        (dominant_size_from_font, ocr_dominated)
     } else {
         let h = height_weights
             .iter()
@@ -5111,7 +5134,7 @@ fn build_one_line(
         })
     } else {
         false
-    };
+    } || (ocr_dominated && page_has_native_text);
 
     ProjectedLine {
         text,
