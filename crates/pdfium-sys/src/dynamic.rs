@@ -79,6 +79,12 @@ pub struct PdfiumBindings {
         *mut std::os::raw::c_void,
         std::os::raw::c_ulong,
     ) -> std::os::raw::c_ulong,
+    pub FPDF_GetPageLabel: unsafe extern "C" fn(
+        FPDF_DOCUMENT,
+        std::os::raw::c_int,
+        *mut std::os::raw::c_void,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
     pub FPDF_GetFileVersion:
         unsafe extern "C" fn(FPDF_DOCUMENT, *mut std::os::raw::c_int) -> FPDF_BOOL,
     pub FPDF_GetSecurityHandlerRevision: unsafe extern "C" fn(FPDF_DOCUMENT) -> std::os::raw::c_int,
@@ -579,6 +585,7 @@ impl PdfiumBindings {
             FORM_DoPageAAction: load_fn!(lib, "FORM_DoPageAAction"),
             FPDF_FFLDraw: load_fn!(lib, "FPDF_FFLDraw"),
             FPDF_GetMetaText: load_fn!(lib, "FPDF_GetMetaText"),
+            FPDF_GetPageLabel: load_fn!(lib, "FPDF_GetPageLabel"),
             FPDF_GetFileVersion: load_fn!(lib, "FPDF_GetFileVersion"),
             FPDF_GetSecurityHandlerRevision: load_fn!(lib, "FPDF_GetSecurityHandlerRevision"),
             FPDF_GetDocPermissions: load_fn!(lib, "FPDF_GetDocPermissions"),

@@ -556,6 +556,9 @@ impl JsPageInput {
     pub fn to_rust(&self) -> Page {
         Page {
             page_number: self.page_number as usize,
+            // Externally supplied pages carry no source PDF, so there is no
+            // /PageLabels tree to read a label from.
+            page_label: None,
             page_width: self.page_width as f32,
             page_height: self.page_height as f32,
             content_bounds: None,
@@ -583,6 +586,10 @@ impl JsPageInput {
 #[derive(Clone)]
 pub struct JsParsedPage {
     pub page_num: u32,
+    /// The document's `/PageLabels` label for this page ("iv", "A-1"), absent
+    /// when the PDF defines none. This is what a reader displays for the page
+    /// and is not always its position; fall back to `page_num` when absent.
+    pub page_label: Option<String>,
     pub width: f64,
     pub height: f64,
     /// Union bbox of the page's top-level content objects in viewport
@@ -946,6 +953,7 @@ impl JsParsedPage {
     pub fn from_rust(page: &ParsedPage, extract_text_metadata: bool) -> Self {
         Self {
             page_num: page.page_number as u32,
+            page_label: page.page_label.clone(),
             width: page.page_width as f64,
             height: page.page_height as f64,
             content_bounds: page.content_bounds.as_ref().map(|b| JsRect {

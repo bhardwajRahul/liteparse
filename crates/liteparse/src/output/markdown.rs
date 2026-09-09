@@ -200,6 +200,7 @@ mod tests {
     fn page_with(n: usize, lines: Vec<ProjectedLine>) -> ParsedPage {
         ParsedPage {
             page_number: n,
+            page_label: None,
             page_width: 612.0,
             page_height: 792.0,
             content_bounds: None,
@@ -259,6 +260,7 @@ mod tests {
     fn test_fallback_when_no_projected_lines() {
         let p = ParsedPage {
             page_number: 1,
+            page_label: None,
             page_width: 0.0,
             page_height: 0.0,
             content_bounds: None,

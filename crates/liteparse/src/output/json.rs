@@ -46,6 +46,10 @@ pub(crate) struct JsonTextItem {
 #[derive(Debug, Serialize)]
 pub(crate) struct JsonPage {
     pub page: usize,
+    /// The document's `/PageLabels` label for this page, omitted when the
+    /// PDF defines none. See `ParsedPage::page_label`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_label: Option<String>,
     pub width: f32,
     pub height: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,6 +123,7 @@ pub(crate) fn build_json(pages: &[ParsedPage], extract_text_metadata: bool) -> P
             .iter()
             .map(|page| JsonPage {
                 page: page.page_number,
+                page_label: page.page_label.clone(),
                 width: page.page_width,
                 height: page.page_height,
                 content_bounds: page.content_bounds.clone(),
@@ -238,6 +243,7 @@ mod tests {
     fn page(items: Vec<TextItem>) -> ParsedPage {
         ParsedPage {
             page_number: 1,
+            page_label: None,
             page_width: 612.0,
             page_height: 792.0,
             content_bounds: None,

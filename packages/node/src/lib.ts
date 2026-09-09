@@ -250,6 +250,12 @@ export interface Rect {
 
 export interface ParsedPage {
   pageNum: number;
+  /**
+   * The document's `/PageLabels` label for this page ("iv", "A-1"), absent
+   * when the PDF defines none. This is what a reader displays for the page
+   * and is not always its position, so fall back to `pageNum` when absent.
+   */
+  pageLabel?: string;
   width: number;
   height: number;
   /**
@@ -926,6 +932,7 @@ export function toParseResult(result: NativeParseResult): ParseResult {
 function toPage(p: NativeParsedPage): ParsedPage {
   return {
     pageNum: p.pageNum,
+    pageLabel: p.pageLabel ?? undefined,
     width: p.width,
     height: p.height,
     contentBounds: p.contentBounds,

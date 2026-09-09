@@ -174,6 +174,11 @@ class ParsedPage:
     height: float
     text: str
     markdown: str = ""
+    #: The document's ``/PageLabels`` label for this page ("iv", "A-1"),
+    #: or ``None`` when the PDF defines none. This is what a reader displays
+    #: for the page and is not always its position in the document, so fall
+    #: back to ``page_num`` when it is ``None``.
+    page_label: Optional[str] = None
     text_items: List[TextItem] = field(default_factory=list)
     #: Per-page complexity signals (the same :meth:`LiteParse.is_complex`
     #: returns). Populated only when parsing with ``include_complexity=True``;
