@@ -1250,6 +1250,7 @@ mod tests {
     fn page_with_text_metadata() -> Page {
         Page {
             page_number: 1,
+            page_label: None,
             page_width: 100.0,
             page_height: 100.0,
             content_bounds: None,
@@ -1478,6 +1479,7 @@ mod tests {
 
         let mut pages = vec![ParsedPage {
             page_number: 1,
+            page_label: None,
             page_width: 612.0,
             page_height: 792.0,
             content_bounds: None,

@@ -132,6 +132,7 @@ export interface NativeRect {
 
 export interface NativeParsedPage {
   pageNum: number;
+  pageLabel?: string;
   width: number;
   height: number;
   contentBounds?: NativeRect;

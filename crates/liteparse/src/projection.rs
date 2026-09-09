@@ -2894,6 +2894,7 @@ pub fn project_pages_to_grid(pages: Vec<Page>) -> Vec<ParsedPage> {
             let projected_item_frames = projected_item_frames(&projected_items);
             ParsedPage {
                 page_number: page.page_number,
+                page_label: page.page_label,
                 page_width: page.page_width,
                 page_height: page.page_height,
                 content_bounds: page.content_bounds,
@@ -5195,6 +5196,7 @@ mod tests {
     fn project_to_grid_handles_text_sparse_zero_width_items() {
         let page = Page {
             page_number: 1,
+            page_label: None,
             page_width: 612.0,
             page_height: 792.0,
             content_bounds: None,
@@ -5563,6 +5565,7 @@ mod tests {
     fn project_pages_to_grid_handles_page_with_no_text_items() {
         let pages = vec![Page {
             page_number: 1,
+            page_label: None,
             page_width: 612.0,
             page_height: 792.0,
             content_bounds: None,
@@ -5588,6 +5591,7 @@ mod tests {
         let y = 50.25;
         let pages = vec![Page {
             page_number: 1,
+            page_label: None,
             page_width: 612.0,
             page_height: 792.0,
             content_bounds: None,
@@ -5639,6 +5643,7 @@ mod tests {
         let y = 50.25;
         let pages = vec![Page {
             page_number: 1,
+            page_label: None,
             page_width: 612.0,
             page_height: 792.0,
             content_bounds: None,
@@ -5698,6 +5703,7 @@ mod tests {
     fn project_pages_to_grid_unions_original_bbox_when_continuous_items_merge() {
         let pages = vec![Page {
             page_number: 1,
+            page_label: None,
             page_width: 612.0,
             page_height: 792.0,
             content_bounds: None,

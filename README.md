@@ -117,6 +117,135 @@ flowchart LR
       style CLI fill:#FFBFF8,color:#000000,stroke:#FF8DF2,stroke-width:1px
 ```
 
+## Benchmarks
+
+LiteParse is measured on three public PDF→Markdown benchmarks, each with its own harness and
+scorer used unmodified. All numbers below are **model-free** (no LLM, no GPU) and were produced on
+the current release from one command (see [Reproducing](#reproducing-the-benchmarks)).
+
+| Benchmark | Metric | LiteParse | + Tesseract OCR | + PaddleOCR | Best other free tool | Commercial reference |
+|---|---|---:|---:|---:|---:|---:|
+| [ParseBench](https://github.com/run-llama/parse-bench) (2,049 docs) | Overall (mean of 5 categories) | 0.371 | 0.380 | **0.389** | pymupdf4llm 0.310 | — |
+| [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) (200 docs) | Overall (NID + TEDS + MHS) | 0.886 | 0.896 | **0.901** | opendataloader 0.831 | nutrient 0.885 |
+| [olmOCR-bench](https://github.com/allenai/olmocr/tree/main/olmocr/bench) (1,403 pages) | % tests passed | 39.6 | 41.1 | **42.2** | pymupdf4llm 32.9 | — |
+
+**Speed** (`lit parse --format markdown`, single process, Apple M2 Max, 10 real-world reports and
+filings totalling 1,266 pages):
+
+| Mode | Pages / second | Seconds per 100-page document |
+|---|---:|---:|
+| No OCR | 183 | 0.5 |
+| Built-in Tesseract | 3.5 | 28 |
+| PaddleOCR server | 1.4 | 70 |
+
+OCR runs only on pages that need it (scans, embedded figures, sparse or garbled text), so
+OCR-mode throughput depends heavily on how image-heavy a document is.
+
+<details>
+<summary><b>ParseBench</b> — tables, charts, content faithfulness, formatting, visual grounding</summary>
+
+Rule-based scoring, no LLM judge. Each column is ParseBench's canonical per-category metric
+(Tables = GriTS/TRM composite; the others are rule pass-rates). Overall is the mean of the five,
+as on the ParseBench leaderboard.
+
+| Pipeline | Overall | Tables | Charts | Content Faithfulness | Semantic Formatting | Visual Grounding |
+|---|---:|---:|---:|---:|---:|---:|
+| **LiteParse + PaddleOCR** | **0.389** | **0.430** | 0.013 | **0.787** | 0.402 | 0.314 |
+| **LiteParse + Tesseract** | 0.380 | 0.428 | 0.012 | 0.751 | 0.399 | 0.307 |
+| **LiteParse (no OCR)** | 0.371 | 0.424 | 0.013 | 0.700 | 0.385 | **0.336** |
+| pymupdf4llm | 0.310 | 0.373 | 0.015 | 0.609 | **0.446** | 0.107 |
+| opendataloader | 0.294 | 0.352 | 0.009 | 0.661 | 0.341 | 0.108 |
+| pdf-inspector | 0.266 | 0.266 | **0.053** | 0.561 | 0.351 | 0.099 |
+| markitdown | 0.186 | 0.158 | 0.020 | 0.645 | 0.009 | 0.099 |
+
+Notes:
+- **Visual Grounding** scores layout blocks with bounding boxes (`lit parse --extract-blocks`).
+  The other tools emit no layout data, so their score is only what the reading-order rules
+  award; treat that column as LiteParse-only.
+- **Charts** is near zero for every model-free tool — none reconstruct chart data.
+- Competitor rows were run on 2026-06-15 with the same harness; LiteParse rows on 2026-09-09.
+
+</details>
+
+<details>
+<summary><b>opendataloader-bench</b> — reading order, table structure, heading hierarchy</summary>
+
+NID = reading-order similarity, TEDS = table structure, MHS = heading hierarchy. Overall is the
+harness's own mean.
+
+| Engine | Overall | NID | TEDS | MHS |
+|---|---:|---:|---:|---:|
+| **LiteParse + PaddleOCR** | **0.901** | **0.932** | **0.832** | **0.840** |
+| **LiteParse + Tesseract** | 0.896 | 0.928 | 0.829 | 0.828 |
+| **LiteParse (no OCR)** | 0.886 | 0.917 | 0.818 | 0.821 |
+| nutrient *(commercial)* | 0.885 | 0.925 | 0.708 | 0.819 |
+| opendataloader | 0.831 | 0.902 | 0.489 | 0.740 |
+| pymupdf4llm | 0.732 | 0.885 | 0.401 | 0.412 |
+| markitdown | 0.589 | 0.844 | 0.273 | 0.000 |
+
+Notes:
+- nutrient and pymupdf4llm have no runnable parser in this harness (commercial / AGPL); their
+  rows are the harness's preserved predictions on the same corpus and ground truth.
+- The corpus is native-text PDFs, so OCR gains come from embedded figures and a handful of
+  scanned pages.
+
+</details>
+
+<details>
+<summary><b>olmOCR-bench</b> — 1,403 single pages, 8,413 unit tests</summary>
+
+Score = average of per-category pass rates. The two math categories require LaTeX output and
+are 0% for every model-free tool; they still count in the average.
+
+| Engine | Overall | baseline | headers_footers | multi_column | table_tests | long_tiny_text | old_scans | arxiv_math | old_scans_math |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **LiteParse + PaddleOCR** | **42.2** | **99.9** | 48.7 | **69.1** | **54.0** | **46.4** | **19.4** | 0.0 | 0.0 |
+| **LiteParse + Tesseract** | 41.1 | **99.9** | 52.1 | 66.2 | **54.1** | 42.5 | 13.9 | 0.0 | 0.0 |
+| **LiteParse (no OCR)** | 39.6 | **99.9** | **55.8** | 66.3 | 52.5 | 29.2 | 13.3 | 0.0 | 0.0 |
+| pymupdf4llm | 32.9 | 84.5 | 39.5 | 66.7 | 46.3 | 12.7 | 13.3 | 0.0 | 0.0 |
+| opendataloader | 32.7 | 86.9 | 37.5 | 62.8 | 25.7 | 35.1 | 13.3 | 0.0 | 0.0 |
+| pdf-inspector | 30.5 | 82.9 | 52.0 | 38.2 | 40.0 | 17.4 | 13.3 | 0.0 | 0.0 |
+| markitdown | 28.7 | 86.8 | 38.8 | 39.3 | 19.9 | 31.2 | 13.3 | 0.0 | 0.0 |
+
+Notes:
+- **headers_footers** expects letterhead and footer text to be *absent*. OCR recovers that text
+  from logo and address images on single-page documents, where the repeated-header filter cannot
+  fire, so the OCR rows score lower there by design — we chose not to drop text by page position.
+- **old_scans** is largely cursive handwriting; Tesseract cannot read it, PaddleOCR partially can.
+
+</details>
+
+<details>
+<summary><b>How the runs are configured</b></summary>
+
+- **Same scorer for every tool.** Each benchmark's own evaluator, unmodified. The ground truth in
+  all three corpora is plain text, so every tool including LiteParse runs with hyperlink syntax
+  off (`--no-links`); everything else is the default `lit parse --format markdown`.
+- **OCR modes.** *No OCR* is `--no-ocr`. *Tesseract* is the built-in engine with no setup.
+  *PaddleOCR* is the PP-OCRv5 mobile detector and English recognizer served over the
+  [OCR HTTP API](OCR_API_SPEC.md) by [`ocr/rapidocr`](ocr/rapidocr), which runs the PaddleOCR
+  models on ONNX Runtime — the same models as [`ocr/paddleocr`](ocr/paddleocr), 20–40× faster
+  per page on CPU-only machines.
+- **Competitors** are the model-free converters we could run locally: pymupdf4llm, markitdown,
+  opendataloader (its non-hybrid mode), pdf-inspector. Numbers from public leaderboards or
+  LLM-assisted modes are not mixed in.
+- **Machine:** Apple M2 Max, 12 cores, 32 GB. LiteParse rows: v2.14.4 (2026-09-09).
+
+</details>
+
+### Reproducing the benchmarks
+
+```sh
+./run_benchmarks.sh --liteparse-only                # all three benches, no OCR
+./run_benchmarks.sh --liteparse-only --ocr=tesseract
+( cd ocr/rapidocr && uv run server.py ) &           # then:
+./run_benchmarks.sh --liteparse-only --ocr=paddle
+./run_benchmarks.sh                                 # also re-run the model-free competitors
+```
+
+Results and a `SUMMARY.md` land in `bench_results/latest/`. See [BENCHMARKS.md](BENCHMARKS.md)
+for per-harness details and the artifact-freshness checklist.
+
 ## Installation
 
 Install via your preferred package manager. All versions (except WASM) ship with the same `lit` CLI.

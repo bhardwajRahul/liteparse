@@ -1588,6 +1588,7 @@ mod tests {
         fn page(items: Vec<TextItem>) -> Page {
             Page {
                 page_number: 1,
+                page_label: None,
                 page_width: 612.0,
                 page_height: 792.0,
                 content_bounds: None,
@@ -1872,6 +1873,7 @@ mod tests {
     fn make_blank_page(page_number: usize) -> Page {
         Page {
             page_number,
+            page_label: None,
             page_width: 100.0,
             page_height: 100.0,
             content_bounds: None,
@@ -2013,6 +2015,7 @@ mod tests {
     fn make_native_text_page(page_number: usize) -> Page {
         Page {
             page_number,
+            page_label: None,
             page_width: 100.0,
             page_height: 100.0,
             content_bounds: None,
@@ -2041,6 +2044,7 @@ mod tests {
     fn make_low_coverage_text_page(page_number: usize) -> Page {
         Page {
             page_number,
+            page_label: None,
             page_width: 100.0,
             page_height: 100.0,
             content_bounds: None,

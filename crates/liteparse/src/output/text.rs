@@ -16,6 +16,7 @@ mod tests {
     fn page(n: usize, text: &str) -> ParsedPage {
         ParsedPage {
             page_number: n,
+            page_label: None,
             page_width: 0.0,
             page_height: 0.0,
             content_bounds: None,

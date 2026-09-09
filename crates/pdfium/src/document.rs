@@ -249,6 +249,52 @@ impl<'lib> Document<'lib> {
         Some(String::from_utf16_lossy(&buf[..end]))
     }
 
+    /// The document's `/PageLabels` entry for a zero-based page index, when
+    /// the document defines one.
+    ///
+    /// This is the label a reader displays for the page — `"iv"`, `"A-1"`,
+    /// `"12"` — which is not always the page's position in the document.
+    /// `None` when the document has no `/PageLabels` tree, or none covering
+    /// this page; callers should fall back to the one-based page number.
+    pub fn page_label(&self, page_index: i32) -> Option<String> {
+        if page_index < 0 {
+            return None;
+        }
+        let needed = unsafe {
+            ffi!(FPDF_GetPageLabel(
+                self.handle,
+                page_index,
+                std::ptr::null_mut(),
+                0
+            ))
+        } as usize;
+        // `needed` is the byte length of the UTF-16 label including its
+        // trailing NUL, so anything under 4 bytes is an empty or absent label.
+        if needed < 4 {
+            return None;
+        }
+        let mut buf: Vec<u16> = vec![0; needed / 2];
+        let written = unsafe {
+            ffi!(FPDF_GetPageLabel(
+                self.handle,
+                page_index,
+                buf.as_mut_ptr() as *mut std::os::raw::c_void,
+                needed as std::os::raw::c_ulong,
+            ))
+        } as usize;
+        if written < 4 {
+            return None;
+        }
+        let chars = written / 2;
+        let end = if buf.get(chars - 1) == Some(&0) {
+            chars - 1
+        } else {
+            chars
+        };
+        let label = String::from_utf16_lossy(&buf[..end]);
+        (!label.is_empty()).then_some(label)
+    }
+
     /// Encoded PDF version (`14` means PDF 1.4), when present.
     pub fn file_version(&self) -> Option<i32> {
         let mut version = 0;

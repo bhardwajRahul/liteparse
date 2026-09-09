@@ -208,6 +208,12 @@ pub struct WordBox {
 #[derive(Debug, Serialize)]
 pub struct Page {
     pub page_number: usize,
+    /// The document's `/PageLabels` entry for this page ("iv", "A-1"), when
+    /// the PDF defines one. This is what a reader displays for the page and
+    /// is not always its position in the document; `None` means the PDF has
+    /// no label for it and consumers should fall back to `page_number`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_label: Option<String>,
     pub page_width: f32,
     pub page_height: f32,
     /// Union bbox of the page's top-level content objects in viewport
@@ -413,6 +419,12 @@ pub struct StructNode {
 #[derive(Debug, Serialize)]
 pub struct ParsedPage {
     pub page_number: usize,
+    /// The document's `/PageLabels` entry for this page ("iv", "A-1"), when
+    /// the PDF defines one. This is what a reader displays for the page and
+    /// is not always its position in the document; `None` means the PDF has
+    /// no label for it and consumers should fall back to `page_number`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_label: Option<String>,
     pub page_width: f32,
     pub page_height: f32,
     /// Union bbox of the page's top-level content objects in viewport
@@ -823,6 +835,7 @@ mod tests {
     fn page_serializes() {
         let p = Page {
             page_number: 1,
+            page_label: None,
             page_width: 100.0,
             page_height: 200.0,
             content_bounds: None,

@@ -378,6 +378,11 @@ pub struct TextItem {
 #[serde(rename_all = "camelCase")]
 pub struct ParsedPage {
     pub page_num: usize,
+    /// The document's `/PageLabels` label for this page ("iv", "A-1"), absent
+    /// when the PDF defines none. This is what a reader displays for the page
+    /// and is not always its position; fall back to `page_num` when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_label: Option<String>,
     pub width: f32,
     pub height: f32,
     /// Union bbox of the page's top-level content objects in viewport
@@ -1127,6 +1132,7 @@ fn to_js_result(result: &liteparse::ParseResult, extract_text_metadata: bool) ->
         .iter()
         .map(|p| ParsedPage {
             page_num: p.page_number,
+            page_label: p.page_label.clone(),
             width: p.page_width,
             height: p.page_height,
             content_bounds: p.content_bounds.as_ref().map(|b| VectorRect {

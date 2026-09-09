@@ -32,6 +32,7 @@ pub(crate) fn line(text: &str, x: f32, y: f32, h: f32, size: f32) -> ProjectedLi
 pub(crate) fn page(lines: Vec<ProjectedLine>) -> ParsedPage {
     ParsedPage {
         page_number: 1,
+        page_label: None,
         page_width: 612.0,
         page_height: 792.0,
         content_bounds: None,
@@ -192,6 +193,7 @@ pub(crate) fn header_footer_page(n: usize, header: &str, footer: &str, body: &st
     ];
     ParsedPage {
         page_number: n,
+        page_label: None,
         page_width: 612.0,
         page_height: 100.0,
         content_bounds: None,

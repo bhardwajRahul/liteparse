@@ -359,6 +359,7 @@ fn extract_single_page(
     Ok(PageExtraction {
         page: LitePage {
             page_number: page_number as usize,
+            page_label: document.page_label(page_index),
             page_width,
             page_height,
             content_bounds: output_options
@@ -3925,6 +3926,7 @@ mod tests {
     fn page_with(items: Vec<TextItem>) -> LitePage {
         LitePage {
             page_number: 1,
+            page_label: None,
             page_width: 100.0,
             page_height: 100.0,
             content_bounds: None,

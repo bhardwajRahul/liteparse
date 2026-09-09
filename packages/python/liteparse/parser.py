@@ -1,5 +1,7 @@
 """LiteParse Python wrapper - native Rust bindings via PyO3."""
 
+import asyncio
+from concurrent.futures import Executor
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -203,6 +205,7 @@ def _convert_native_result(native_result: Any) -> ParseResult:
         pages.append(
             ParsedPage(
                 page_num=native_page.page_num,
+                page_label=getattr(native_page, "page_label", None),
                 width=native_page.width,
                 height=native_page.height,
                 content_bounds=(
@@ -737,6 +740,30 @@ class LiteParse:
             return _convert_native_result(native_result)
         except Exception as e:
             raise ParseError(str(e)) from e
+
+    async def aparse(
+        self,
+        file_data: Union[str, Path, bytes],
+        *,
+        executor: Optional[Executor] = None,
+    ) -> ParseResult:
+        """
+        Parse a document without blocking the running event loop.
+
+        Args:
+            file_data: Path to the document file, or raw PDF bytes.
+            executor: Executor to run the parse on. Defaults to the running
+                loop's default thread pool.
+
+        Returns:
+            ParseResult containing the parsed document data.
+
+        Raises:
+            The same exceptions as :meth:`parse`, re-raised on the awaiting
+            side.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(executor, self.parse, file_data)
 
     def parse_batches(
         self,

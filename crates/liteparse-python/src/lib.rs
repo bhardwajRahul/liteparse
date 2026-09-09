@@ -518,6 +518,11 @@ impl PyTextItem {
 struct PyParsedPage {
     #[pyo3(get)]
     page_num: u32,
+    /// The document's `/PageLabels` label for this page ("iv", "A-1"), absent
+    /// when the PDF defines none. This is what a reader displays for the page
+    /// and is not always its position; fall back to `page_num` when absent.
+    #[pyo3(get)]
+    page_label: Option<String>,
     #[pyo3(get)]
     width: f64,
     #[pyo3(get)]
@@ -662,6 +667,7 @@ impl PyParsedPage {
     fn from_rust(page: liteparse::types::ParsedPage, extract_text_metadata: bool) -> Self {
         Self {
             page_num: page.page_number as u32,
+            page_label: page.page_label.clone(),
             width: page.page_width as f64,
             height: page.page_height as f64,
             content_bounds: page.content_bounds.as_ref().map(|b| PyRect {
