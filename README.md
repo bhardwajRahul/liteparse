@@ -132,7 +132,7 @@ run locally with minimal dependencies.
 | [olmOCR-bench](https://github.com/allenai/olmocr/tree/main/olmocr/bench) (1,403 pages) | % tests passed | 39.6 | 41.1 | **42.2** | pdf-inspector 33.7 |
 
 <details>
-<summary><b>ParseBench</b> — tables, charts, content faithfulness, formatting, visual grounding</summary>
+<summary><b>ParseBench</b></summary>
 
 Rule-based scoring, no LLM judge. Each column is [ParseBench's](https://parsebench.ai) canonical per-category metric
 (Tables = GriTS/TRM composite; the others are rule pass-rates). Overall is the mean of the five,
@@ -153,7 +153,7 @@ Notes:
 </details>
 
 <details>
-<summary><b>opendataloader-bench</b> — reading order, table structure, heading hierarchy</summary>
+<summary><b>opendataloader-bench</b></summary>
 
 NID = reading-order similarity, TEDS = table structure, MHS = heading hierarchy. Overall is the
 harness's own mean.
@@ -175,7 +175,7 @@ Notes:
 </details>
 
 <details>
-<summary><b>olmOCR-bench</b> — 1,403 single pages, 8,413 unit tests</summary>
+<summary><b>olmOCR-bench</b></summary>
 
 Score = average of per-category pass rates. The two math categories require LaTeX output and
 are 0% for every tool here; they still count in the average.
