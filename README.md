@@ -126,11 +126,11 @@ all** (no LLM, no layout model, no GPU). pymupdf4llm ≥ 1.28 bundles a layout-d
 (`pymupdf-layout`, ONNX, CPU) that is active by default, so it gets two rows: as shipped, and with
 that model switched off.
 
-| Benchmark | Metric | LiteParse | + Tesseract OCR | + PaddleOCR | Best other model-free tool | pymupdf4llm + layout model | Commercial reference |
-|---|---|---|---:|---:|---:|---:|---:|
-| [ParseBench](https://github.com/run-llama/parse-bench) (2,049 docs) | Overall (mean of 5 categories) | 0.364 | 0.380 | **0.389** | pymupdf4llm (model off) 0.309 | 0.541 | — |
-| [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) (200 docs) | Overall (NID + TEDS + MHS) | 0.886 | 0.896 | **0.901** | opendataloader 0.842 | n/a | nutrient 0.885 |
-| [olmOCR-bench](https://github.com/allenai/olmocr/tree/main/olmocr/bench) (1,403 pages) | % tests passed | 39.6 | 41.1 | **42.2** | pdf-inspector 33.7 | 37.3 | — |
+| Benchmark | Metric | LiteParse | + Tesseract OCR | + PaddleOCR | Best other model-free tool |
+|---|---|---|---:|---:|---:|
+| [ParseBench](https://github.com/run-llama/parse-bench) (2,049 docs) | Overall (mean of 5 categories) | 0.364 | 0.380 | **0.389** | pymupdf4llm (model off) 0.309 |
+| [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) (200 docs) | Overall (NID + TEDS + MHS) | 0.886 | 0.896 | **0.901** | opendataloader 0.842 |
+| [olmOCR-bench](https://github.com/allenai/olmocr/tree/main/olmocr/bench) (1,403 pages) | % tests passed | 39.6 | 41.1 | **42.2** | pdf-inspector 33.7 |
 
 LiteParse leads every model-free tool on all three benchmarks. With its layout model on, pymupdf4llm
 leads ParseBench (tables and bounding boxes are what a layout model is for) and trails LiteParse on
