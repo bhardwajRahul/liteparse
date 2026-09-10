@@ -4,6 +4,37 @@ use crate::error::PdfiumError;
 use crate::ffi;
 use crate::library::Library;
 
+/// Pixel layout of a [`Bitmap`], as `FPDFBitmap_GetFormat` reports it. Bitmaps this
+/// crate creates are BGRA unless [`Bitmap::new_with_format`] says otherwise; bitmaps
+/// pdfium hands back (an embedded image's own pixels, for instance) can be any of
+/// these, and `buffer()` has to be read with the matching bytes per pixel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitmapFormat {
+    Unknown,
+    /// One byte per pixel.
+    Gray,
+    /// Three bytes per pixel, blue first.
+    Bgr,
+    /// Four bytes per pixel, the fourth unused.
+    Bgrx,
+    /// Four bytes per pixel with straight alpha.
+    Bgra,
+    /// Four bytes per pixel with premultiplied alpha.
+    BgraPremul,
+}
+
+impl BitmapFormat {
+    /// Bytes each pixel occupies in the buffer, `None` for [`BitmapFormat::Unknown`].
+    pub fn bytes_per_pixel(self) -> Option<usize> {
+        match self {
+            BitmapFormat::Unknown => None,
+            BitmapFormat::Gray => Some(1),
+            BitmapFormat::Bgr => Some(3),
+            BitmapFormat::Bgrx | BitmapFormat::Bgra | BitmapFormat::BgraPremul => Some(4),
+        }
+    }
+}
+
 /// A BGRA pixel buffer owned by PDFium.
 ///
 /// The `'lib` lifetime ties the bitmap to a held [`Library`] lock, so it
@@ -81,6 +112,18 @@ impl<'lib> Bitmap<'lib> {
 
     pub fn stride(&self) -> i32 {
         unsafe { ffi!(FPDFBitmap_GetStride(self.handle)) }
+    }
+
+    /// The pixel layout (`FPDFBitmap_GetFormat`).
+    pub fn format(&self) -> BitmapFormat {
+        match unsafe { ffi!(FPDFBitmap_GetFormat(self.handle)) } as u32 {
+            pdfium_sys::FPDFBitmap_Gray => BitmapFormat::Gray,
+            pdfium_sys::FPDFBitmap_BGR => BitmapFormat::Bgr,
+            pdfium_sys::FPDFBitmap_BGRx => BitmapFormat::Bgrx,
+            pdfium_sys::FPDFBitmap_BGRA => BitmapFormat::Bgra,
+            pdfium_sys::FPDFBitmap_BGRA_Premul => BitmapFormat::BgraPremul,
+            _ => BitmapFormat::Unknown,
+        }
     }
 
     /// Fill a rectangle with an ARGB color (0xAARRGGBB).

@@ -4,12 +4,13 @@ mod error;
 mod font;
 mod library;
 mod page;
+mod page_object;
 mod struct_tree;
 mod text_page;
 mod types;
 mod user_unit;
 
-pub use bitmap::Bitmap;
+pub use bitmap::{Bitmap, BitmapFormat};
 pub use document::{Document, FormEnvironment, OutlineEntry, SignatureSummary, XfaPacket};
 pub use error::PdfiumError;
 pub use font::{Font, FontType};
@@ -18,6 +19,7 @@ pub use page::{
     FormPageGuard, ImageBounds, ImageObjectInfo, ImageObjects, Page, PathObject, PathSegment,
     PdfAnnotation, PdfFormField, PdfLink, SegmentKind, ViewportTransform,
 };
+pub use page_object::{ImageMetadata, PageObject, PageObjectKind, PathDrawMode, RawPathSegment};
 pub use struct_tree::{StructNode, StructureAttributeValue, StructureElement, StructureTree};
 pub use text_page::{TextChar, TextCharIter, TextPage};
 pub use types::*;
