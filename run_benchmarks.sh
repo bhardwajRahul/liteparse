@@ -24,11 +24,7 @@
 #                           all modes coexist and show up together in SUMMARY.md.
 #   -h, --help              Show this help.
 #
-# Competitors (model-free): pymupdf4llm, markitdown, opendataloader, pdf_inspector.
-#   - pymupdf4llm >= 1.28 bundles the pymupdf-layout GNN model (activated on import) and, in
-#     ParseBench's canonical pipeline, RapidOCR (`pip install rapidocr`). The extra
-#     pymupdf4llm_nolayout / pymupdf4llm_markdown_nolayout rows run it with the layout model
-#     off (and no OCR) as the model-free reference.
+# Competitors (model-free, commercial): markitdown, opendataloader, pdf_inspector.
 #   - opendataloader needs Java 11+ (the script auto-detects Homebrew openjdk@11/openjdk).
 #   - pdf_inspector needs the `pdf2md` binary (cargo install pdf-inspector).
 #   - nutrient is commercial and is NOT re-run here; see LAUNCH_BENCHMARKS.md for its
@@ -106,7 +102,7 @@ fi
 if [[ " $BENCHES " == *" olmocr "* ]]; then
   echo "### olmOCR-bench ..."
   DIR="$ROOT/olmocr/olmOCR-bench/bench_data"
-  for E in $(run_engines "$OLM_LP" "$OLM_LP" pymupdf4llm "pymupdf4llm:use_layout=False:name=pymupdf4llm_nolayout" markitdown opendataloader pdf_inspector); do
+  for E in $(run_engines "$OLM_LP" "$OLM_LP"  markitdown opendataloader pdf_inspector); do
     N="$E"; [ "$E" = "$OLM_LP" ] && N="$OLM_LP_NAME"
     [[ "$E" == *:name=* ]] && N="${E##*:name=}"
     echo "  convert $N"; stamp "olmocr_convert_$N start"
@@ -135,7 +131,7 @@ fi
 # === 4. ParseBench (all 5 groups, rule-based, no API key) =====================
 if [[ " $BENCHES " == *" parsebench "* ]]; then
   echo "### ParseBench ..."
-  for P in $(run_engines "$PB_LP" "$PB_LP" pymupdf4llm_markdown pymupdf4llm_markdown_nolayout markitdown opendataloader_markdown pdf_inspector); do
+  for P in $(run_engines "$PB_LP" "$PB_LP" markitdown opendataloader_markdown pdf_inspector); do
     echo "  run $P"; stamp "parsebench_$P start"
     EXTRA="--force"; [[ "$P" == liteparse* ]] && EXTRA="--force -m $PB_CONC"
     ( cd ParseBench && LITEPARSE_BIN="$ROOT/target/release/lit" \
@@ -174,7 +170,7 @@ if 'olmocr' in BENCHES:
             mm=re.search(rf'{re.escape(c)}(?:\.jsonl)?\s*:\s*([\d.]+)%\s*\(',txt)
             per[c]=mm.group(1) if mm else 'NA'
         data[eng]={'Overall':overall, **per}
-    order=[e for e in ['liteparse','liteparse_tesseract','liteparse_paddle','pymupdf4llm','pymupdf4llm_nolayout','markitdown','opendataloader','pdf_inspector'] if e in data]
+    order=[e for e in ['liteparse','liteparse_tesseract','liteparse_paddle','markitdown','opendataloader','pdf_inspector'] if e in data]
     if order:
         hdr=['Engine','Overall']+cats
         rows=[[e]+[data[e]['Overall']]+[data[e][c] for c in cats] for e in order]
@@ -183,7 +179,7 @@ if 'olmocr' in BENCHES:
 # --- opendataloader: read evaluation.json ---
 if 'opendataloader' in BENCHES:
     rows=[]
-    for e in ['liteparse','liteparse-tesseract','liteparse-paddle','nutrient','opendataloader','pymupdf4llm','markitdown']:
+    for e in ['liteparse','liteparse-tesseract','liteparse-paddle','nutrient','opendataloader','markitdown']:
         f=f"{ROOT}/opendataloader-bench/prediction/{e}/evaluation.json"
         if not os.path.exists(f): continue
         s=json.load(open(f))['metrics']['score']
@@ -191,7 +187,7 @@ if 'opendataloader' in BENCHES:
     if rows:
         print("## opendataloader-bench\n")
         print(table(rows,['Engine','Overall','NID','TEDS','MHS']))
-        print("\n*nutrient/pymupdf4llm = preserved data (not re-run here).*\n")
+        print("\n*nutrient = preserved data (not re-run here).*\n")
 
 # --- ParseBench: per-category canonical metric (matches ParseBench leaderboard) ---
 if 'parsebench' in BENCHES:
@@ -201,8 +197,7 @@ if 'parsebench' in BENCHES:
           ('text_formatting',['avg_semantic_formatting','avg_rule_pass_rate'],'Semantic_Formatting'),
           ('layout',['avg_layout_element_rule_pass_rate','avg_rule_pass_rate'],'Visual_Grounding')]
     pipes=[('liteparse_markdown','LiteParse'),('liteparse_markdown_tesseract','LiteParse+tesseract'),
-           ('liteparse_markdown_paddle','LiteParse+paddle'),('pymupdf4llm_markdown','pymupdf4llm'),
-           ('pymupdf4llm_markdown_nolayout','pymupdf4llm (no layout model)'),
+           ('liteparse_markdown_paddle','LiteParse+paddle'),
            ('markitdown','markitdown'),('opendataloader_markdown','opendataloader'),
            ('pdf_inspector','pdf-inspector')]
     rows=[]; lay_n=None
