@@ -32,7 +32,7 @@ hard stuff so your models see clean, structured data and markdown.
 
 ## Overview
 
-- **Fast Text Parsing**: Spatial text parsing using PDFium
+- **Fast Text Parsing**: Spatial text parsing using PDFium, ~2-5ms per page
 - **Flexible OCR System**:
   - **Built-in**: Tesseract (zero setup, bundled with the library)
   - **HTTP Servers**: Plug in any OCR server (EasyOCR, PaddleOCR, custom)
@@ -116,6 +116,120 @@ flowchart LR
       style WASM fill:#FFBFF8,color:#000000,stroke:#FF8DF2,stroke-width:1px
       style CLI fill:#FFBFF8,color:#000000,stroke:#FF8DF2,stroke-width:1px
 ```
+
+## Benchmarks
+
+LiteParse is measured on multiple public Doc→Markdown benchmarks. All numbers below were produced on
+this machine from one command (see [Reproducing](#reproducing-the-benchmarks)), with every tool at
+its latest release as of 2026-09-09. LiteParse and the "model-free" competitors use **no ML model at
+all** (no LLM, no layout model, no GPU). All tested methods have permissive licenses and can be
+run locally with minimal dependencies.
+
+| Benchmark | Metric | LiteParse | + Tesseract OCR | + PaddleOCR | Best other model-free tool |
+|---|---|---|---:|---:|---:|
+| [ParseBench](https://github.com/run-llama/parse-bench) (2,049 docs) | Overall (mean of 5 categories) | 0.364 | 0.380 | **0.389** | pdf-inspector 0.283 |
+| [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) (200 docs) | Overall (NID + TEDS + MHS) | 0.886 | 0.896 | **0.901** | opendataloader 0.842 |
+| [olmOCR-bench](https://github.com/allenai/olmocr/tree/main/olmocr/bench) (1,403 pages) | % tests passed | 39.6 | 41.1 | **42.2** | pdf-inspector 33.7 |
+
+<details>
+<summary><b>ParseBench</b> — tables, charts, content faithfulness, formatting, visual grounding</summary>
+
+Rule-based scoring, no LLM judge. Each column is [ParseBench's](https://parsebench.ai) canonical per-category metric
+(Tables = GriTS/TRM composite; the others are rule pass-rates). Overall is the mean of the five,
+as on the ParseBench leaderboard.
+
+| Pipeline | Overall | Tables | Charts | Content Faithfulness | Semantic Formatting | Visual Grounding |
+|---|---:|---:|---:|---:|---:|---:|
+| **LiteParse + PaddleOCR** | 0.389 | 0.430 | 0.013 | 0.787 | 0.402 | 0.314 |
+| **LiteParse + Tesseract** | 0.380 | 0.428 | 0.012 | 0.751 | 0.399 | 0.307 |
+| **LiteParse (no OCR)** | 0.364 | 0.424 | 0.013 | 0.700 | 0.385 | 0.297 |
+| pdf-inspector 1.19 | 0.283 | 0.277 | 0.017 | 0.598 | 0.426 | 0.099 |
+| opendataloader 2.5.7 | 0.277 | 0.349 | 0.006 | 0.663 | 0.258 | 0.110 |
+| markitdown 0.1.7 | 0.185 | 0.158 | **0.020** | 0.652 | 0.001 | 0.110 |
+
+Notes:
+- **Visual Grounding** scores layout blocks with bounding boxes (`lit parse --extract-blocks`).
+- **Charts** is near zero for every tool here — none reconstruct chart data.
+</details>
+
+<details>
+<summary><b>opendataloader-bench</b> — reading order, table structure, heading hierarchy</summary>
+
+NID = reading-order similarity, TEDS = table structure, MHS = heading hierarchy. Overall is the
+harness's own mean.
+
+| Engine | Overall | NID | TEDS | MHS |
+|---|---:|---:|---:|---:|
+| **LiteParse + PaddleOCR** | **0.901** | **0.932** | **0.832** | **0.840** |
+| **LiteParse + Tesseract** | 0.896 | 0.928 | 0.829 | 0.828 |
+| **LiteParse (no OCR)** | 0.886 | 0.917 | 0.818 | 0.821 |
+| nutrient *(commercial)* | 0.885 | 0.925 | 0.708 | 0.819 |
+| opendataloader 2.5.7 | 0.842 | 0.912 | 0.483 | 0.757 |
+| markitdown 0.1.7 | 0.589 | 0.844 | 0.273 | 0.000 |
+
+Notes:
+- nutrient has no runnable parser in this harness (commercial)
+- The corpus is native-text PDFs, so OCR gains come from embedded figures and a handful of
+  scanned pages.
+
+</details>
+
+<details>
+<summary><b>olmOCR-bench</b> — 1,403 single pages, 8,413 unit tests</summary>
+
+Score = average of per-category pass rates. The two math categories require LaTeX output and
+are 0% for every tool here; they still count in the average.
+
+| Engine | Overall | baseline | headers_footers | multi_column | table_tests | long_tiny_text | old_scans | arxiv_math | old_scans_math |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **LiteParse + PaddleOCR** | **42.2** | **99.9** | 48.7 | **69.1** | 54.0 | **46.4** | **19.4** | 0.0 | 0.0 |
+| **LiteParse + Tesseract** | 41.1 | **99.9** | 52.1 | 66.2 | 54.1 | 42.5 | 13.9 | 0.0 | 0.0 |
+| **LiteParse (no OCR)** | 39.6 | **99.9** | 55.8 | 66.3 | 52.5 | 29.2 | 13.3 | 0.0 | 0.0 |
+| pdf-inspector 1.19 | 33.7 | 82.9 | **62.1** | 49.7 | 43.6 | 17.6 | 13.3 | 0.0 | 0.0 |
+| opendataloader 2.5.7 | 32.5 | 86.9 | 36.6 | 63.7 | 24.9 | 34.8 | 13.3 | 0.0 | 0.0 |
+| markitdown 0.1.7 | 28.7 | 86.8 | 38.8 | 39.3 | 19.9 | 31.2 | 13.3 | 0.0 | 0.0 |
+
+Notes:
+- **headers_footers** expects letterhead and footer text to be *absent*. OCR recovers that text
+  from logo and address images on single-page documents, where the repeated-header filter cannot
+  fire, so the OCR rows score lower there by design. We chose not to drop text by page position.
+  pdf-inspector 1.19 refuses scanned and image-based pages outright (192 of the 1,403), which is
+  why it tops this category while scoring nothing on those pages elsewhere.
+- **old_scans** is largely cursive handwriting; Tesseract cannot read it, PaddleOCR partially can.
+
+</details>
+
+<details>
+<summary><b>How the runs are configured</b></summary>
+
+- **Same scorer for every tool.** Each benchmark's own evaluator, unmodified. The ground truth in
+  all three corpora is plain text, so every tool including LiteParse runs with hyperlink syntax
+  off (`--no-links`); everything else is the default `lit parse --format markdown`.
+- **OCR modes.** *No OCR* is `--no-ocr`. *Tesseract* is the built-in engine with no setup.
+  *PaddleOCR* is the PP-OCRv5 mobile detector and English recognizer served over the
+  [OCR HTTP API](OCR_API_SPEC.md) by [`ocr/rapidocr`](ocr/rapidocr), which runs the PaddleOCR
+  models on ONNX Runtime — the same models as [`ocr/paddleocr`](ocr/paddleocr), just 20–40× faster
+  per page on CPU-only machines.
+- **Competitors** are the free converters we could run locally, each at its latest release on
+  2026-09-09: markitdown 0.1.7, opendataloader-pdf 2.5.7 (its non-hybrid mode),
+  pdf-inspector 1.19.0. Each benchmark's own runner for the tool is used as-is. Numbers from public
+  leaderboards or LLM-assisted modes are not mixed in.
+- **Machine:** Apple M2 Max, 12 cores, 32 GB. LiteParse rows: v2.14.4 (2026-09-09).
+
+</details>
+
+### Reproducing the benchmarks
+
+```sh
+./run_benchmarks.sh --liteparse-only                # all three benches, no OCR
+./run_benchmarks.sh --liteparse-only --ocr=tesseract
+( cd ocr/rapidocr && uv run server.py ) &           # then:
+./run_benchmarks.sh --liteparse-only --ocr=paddle
+./run_benchmarks.sh --competitors-only              # re-run the free competitors only
+./run_benchmarks.sh                                 # everything
+```
+
+Results and a `SUMMARY.md` land in `bench_results/latest/`.
 
 ## Installation
 
