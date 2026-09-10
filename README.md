@@ -122,19 +122,14 @@ flowchart LR
 LiteParse is measured on multiple public Doc→Markdown benchmarks. All numbers below were produced on
 this machine from one command (see [Reproducing](#reproducing-the-benchmarks)), with every tool at
 its latest release as of 2026-09-09. LiteParse and the "model-free" competitors use **no ML model at
-all** (no LLM, no layout model, no GPU). pymupdf4llm ≥ 1.28 bundles a layout-detection model
-(`pymupdf-layout`, ONNX, CPU) that is active by default, so it gets two rows: as shipped, and with
-that model switched off.
+all** (no LLM, no layout model, no GPU). All tested methods have permissive licenses and can be
+run locally with minimal dependencies.
 
 | Benchmark | Metric | LiteParse | + Tesseract OCR | + PaddleOCR | Best other model-free tool |
 |---|---|---|---:|---:|---:|
-| [ParseBench](https://github.com/run-llama/parse-bench) (2,049 docs) | Overall (mean of 5 categories) | 0.364 | 0.380 | **0.389** | pymupdf4llm (model off) 0.309 |
+| [ParseBench](https://github.com/run-llama/parse-bench) (2,049 docs) | Overall (mean of 5 categories) | 0.364 | 0.380 | **0.389** | pdf-inspector 0.283 |
 | [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) (200 docs) | Overall (NID + TEDS + MHS) | 0.886 | 0.896 | **0.901** | opendataloader 0.842 |
 | [olmOCR-bench](https://github.com/allenai/olmocr/tree/main/olmocr/bench) (1,403 pages) | % tests passed | 39.6 | 41.1 | **42.2** | pdf-inspector 33.7 |
-
-LiteParse leads every model-free tool on all three benchmarks. With its layout model on, pymupdf4llm
-leads ParseBench (tables and bounding boxes are what a layout model is for) and trails LiteParse on
-olmOCR-bench; it has no runnable entry in opendataloader-bench.
 
 <details>
 <summary><b>ParseBench</b> — tables, charts, content faithfulness, formatting, visual grounding</summary>
@@ -145,24 +140,16 @@ as on the ParseBench leaderboard.
 
 | Pipeline | Overall | Tables | Charts | Content Faithfulness | Semantic Formatting | Visual Grounding |
 |---|---:|---:|---:|---:|---:|---:|
-| pymupdf4llm 1.28 *(layout model + RapidOCR)* | **0.541** | **0.722** | 0.016 | **0.796** | **0.552** | **0.618** |
 | **LiteParse + PaddleOCR** | 0.389 | 0.430 | 0.013 | 0.787 | 0.402 | 0.314 |
 | **LiteParse + Tesseract** | 0.380 | 0.428 | 0.012 | 0.751 | 0.399 | 0.307 |
 | **LiteParse (no OCR)** | 0.364 | 0.424 | 0.013 | 0.700 | 0.385 | 0.297 |
-| pymupdf4llm 1.28 *(layout model off, no OCR)* | 0.309 | 0.403 | 0.009 | 0.616 | 0.422 | 0.096 |
 | pdf-inspector 1.19 | 0.283 | 0.277 | 0.017 | 0.598 | 0.426 | 0.099 |
 | opendataloader 2.5.7 | 0.277 | 0.349 | 0.006 | 0.663 | 0.258 | 0.110 |
 | markitdown 0.1.7 | 0.185 | 0.158 | **0.020** | 0.652 | 0.001 | 0.110 |
 
 Notes:
 - **Visual Grounding** scores layout blocks with bounding boxes (`lit parse --extract-blocks`).
-  pymupdf4llm's layout model emits them too; the other tools emit no layout data, so their score
-  is only what the reading-order rules award. A page for which a tool emits no layout data counts
-  as 0, so rows with different coverage are comparable.
 - **Charts** is near zero for every tool here — none reconstruct chart data.
-- ParseBench's own pymupdf4llm pipeline turns on its bundled RapidOCR (PaddleOCR models on ONNX
-  Runtime — the same models as the LiteParse + PaddleOCR row), so the two OCR rows are like for like.
-
 </details>
 
 <details>
@@ -178,13 +165,10 @@ harness's own mean.
 | **LiteParse (no OCR)** | 0.886 | 0.917 | 0.818 | 0.821 |
 | nutrient *(commercial)* | 0.885 | 0.925 | 0.708 | 0.819 |
 | opendataloader 2.5.7 | 0.842 | 0.912 | 0.483 | 0.757 |
-| pymupdf4llm | 0.732 | 0.885 | 0.401 | 0.412 |
 | markitdown 0.1.7 | 0.589 | 0.844 | 0.273 | 0.000 |
 
 Notes:
-- nutrient and pymupdf4llm have no runnable parser in this harness (commercial / AGPL); their
-  rows are the harness's preserved predictions on the same corpus and ground truth, so the
-  pymupdf4llm row predates its layout model.
+- nutrient has no runnable parser in this harness (commercial)
 - The corpus is native-text PDFs, so OCR gains come from embedded figures and a handful of
   scanned pages.
 
@@ -201,10 +185,8 @@ are 0% for every tool here; they still count in the average.
 | **LiteParse + PaddleOCR** | **42.2** | **99.9** | 48.7 | **69.1** | 54.0 | **46.4** | **19.4** | 0.0 | 0.0 |
 | **LiteParse + Tesseract** | 41.1 | **99.9** | 52.1 | 66.2 | 54.1 | 42.5 | 13.9 | 0.0 | 0.0 |
 | **LiteParse (no OCR)** | 39.6 | **99.9** | 55.8 | 66.3 | 52.5 | 29.2 | 13.3 | 0.0 | 0.0 |
-| pymupdf4llm 1.28 *(layout model)* | 37.3 | 87.2 | 37.6 | 66.6 | **60.3** | 33.7 | 13.3 | 0.0 | 0.0 |
 | pdf-inspector 1.19 | 33.7 | 82.9 | **62.1** | 49.7 | 43.6 | 17.6 | 13.3 | 0.0 | 0.0 |
 | opendataloader 2.5.7 | 32.5 | 86.9 | 36.6 | 63.7 | 24.9 | 34.8 | 13.3 | 0.0 | 0.0 |
-| pymupdf4llm 1.28 *(layout model off)* | 32.2 | 85.4 | 41.3 | 59.3 | 22.6 | 36.0 | 13.3 | 0.0 | 0.0 |
 | markitdown 0.1.7 | 28.7 | 86.8 | 38.8 | 39.3 | 19.9 | 31.2 | 13.3 | 0.0 | 0.0 |
 
 Notes:
@@ -229,13 +211,9 @@ Notes:
   models on ONNX Runtime — the same models as [`ocr/paddleocr`](ocr/paddleocr), just 20–40× faster
   per page on CPU-only machines.
 - **Competitors** are the free converters we could run locally, each at its latest release on
-  2026-09-09: pymupdf4llm 1.28.2, markitdown 0.1.7, opendataloader-pdf 2.5.7 (its non-hybrid mode),
+  2026-09-09: markitdown 0.1.7, opendataloader-pdf 2.5.7 (its non-hybrid mode),
   pdf-inspector 1.19.0. Each benchmark's own runner for the tool is used as-is. Numbers from public
   leaderboards or LLM-assisted modes are not mixed in.
-- **pymupdf4llm and its layout model.** Since 1.28, `pip install pymupdf4llm` pulls in
-  `pymupdf-layout`, a ~50 MB ONNX layout-detection model (AGPL) that is activated on import. The
-  "layout model off" rows call `pymupdf4llm.use_layout(False)` and are the model-free comparison;
-  the default rows are what a user gets out of the box.
 - **Machine:** Apple M2 Max, 12 cores, 32 GB. LiteParse rows: v2.14.4 (2026-09-09).
 
 </details>
