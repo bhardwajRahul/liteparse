@@ -41,9 +41,7 @@
 use pdfium::{Font, FontType, Page, RectF, TextPage};
 
 use crate::GlyphResolver;
-use crate::extract::{
-    CharInfoChunks, CharView, decompose_scale, is_buggy_codepoint, is_buggy_font,
-};
+use crate::extract::{CharInfoChunks, CharView, is_buggy_codepoint, is_buggy_font};
 use crate::glyph_names::resolve_glyph_name_codepoint;
 
 /// Angle difference, in radians, at which a glyph starts a new item.
@@ -196,6 +194,26 @@ fn load_glyph(
     }
 }
 
+/// `Parse_decomposeScale` from the C extractor, to the rounding: the entries of
+/// `MᵀM` are formed as `float` products and sums (the C operands are floats) and
+/// only then widened to double for the eigenvalue step. `crate::extract::decompose_scale`
+/// widens first; the two differ in the last float bits, which is enough to move an
+/// item's `fontHeight` across a three-decimal rounding boundary on a few items per
+/// thousand.
+fn decompose_scale_single_precision_products(m: &pdfium::Matrix) -> (f32, f32) {
+    let a = f64::from(m.a * m.a + m.b * m.b);
+    let b = f64::from(m.a * m.c + m.b * m.d);
+    let c = f64::from(m.c * m.a + m.d * m.b);
+    let d = f64::from(m.c * m.c + m.d * m.d);
+    let first = (a + d) / 2.0;
+    let second = ((a + d) * (a + d) - 4.0 * (a * d - c * b)).sqrt() / 2.0;
+    let sx = first + second;
+    let sx = if sx.is_nan() { 1.0 } else { sx };
+    let sy = first - second;
+    let sy = if sy.is_nan() { 1.0 } else { sy };
+    (sx.sqrt() as f32, sy.sqrt() as f32)
+}
+
 /// Fold the page's `/Rotate` into pdfium's counter-clockwise glyph angle and
 /// wrap it into `[0, 2π)`. Computed in f64 so the wrap does not lose precision.
 fn normalize_angle(angle_radians: f32, page_rotation: i32) -> f32 {
@@ -258,7 +276,7 @@ fn build_item(
     let font_height = if first.text_object.is_some() {
         let scale_y = first_char
             .matrix()
-            .map(|matrix| decompose_scale(&matrix).1)
+            .map(|matrix| decompose_scale_single_precision_products(&matrix).1)
             .unwrap_or(1.0);
         font_size * scale_y
     } else {
