@@ -17,7 +17,10 @@ pub struct ImageBounds {
     pub height: f32,
 }
 
-fn image_object_data(obj: pdfium_sys::FPDF_PAGEOBJECT, decoded: bool) -> Option<Vec<u8>> {
+pub(crate) fn image_object_data(
+    obj: pdfium_sys::FPDF_PAGEOBJECT,
+    decoded: bool,
+) -> Option<Vec<u8>> {
     let size = unsafe {
         if decoded {
             ffi!(FPDFImageObj_GetImageDataDecoded(
@@ -1864,7 +1867,7 @@ fn collect_path_objects(
 
 /// Helper: call a PDFium getter for RGBA color channels and pack into our `Color`.
 /// Returns None when the FFI call reports failure.
-fn read_color<F>(getter: F) -> Option<Color>
+pub(crate) fn read_color<F>(getter: F) -> Option<Color>
 where
     F: FnOnce(*mut u32, *mut u32, *mut u32, *mut u32) -> i32,
 {

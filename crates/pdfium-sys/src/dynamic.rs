@@ -155,6 +155,7 @@ pub struct PdfiumBindings {
         unsafe extern "C" fn(FPDF_PAGEOBJECT) -> std::os::raw::c_int,
     pub FPDFImageObj_GetRenderedBitmap:
         unsafe extern "C" fn(FPDF_DOCUMENT, FPDF_PAGE, FPDF_PAGEOBJECT) -> FPDF_BITMAP,
+    pub FPDFImageObj_GetBitmap: unsafe extern "C" fn(FPDF_PAGEOBJECT) -> FPDF_BITMAP,
     pub FPDFImageObj_GetImageDataDecoded: unsafe extern "C" fn(
         FPDF_PAGEOBJECT,
         *mut std::os::raw::c_void,
@@ -317,6 +318,7 @@ pub struct PdfiumBindings {
     pub FPDFBitmap_GetWidth: unsafe extern "C" fn(FPDF_BITMAP) -> std::os::raw::c_int,
     pub FPDFBitmap_GetHeight: unsafe extern "C" fn(FPDF_BITMAP) -> std::os::raw::c_int,
     pub FPDFBitmap_GetStride: unsafe extern "C" fn(FPDF_BITMAP) -> std::os::raw::c_int,
+    pub FPDFBitmap_GetFormat: unsafe extern "C" fn(FPDF_BITMAP) -> std::os::raw::c_int,
     pub FPDFBitmap_GetBuffer: unsafe extern "C" fn(FPDF_BITMAP) -> *mut std::os::raw::c_void,
     pub FPDFBitmap_FillRect: unsafe extern "C" fn(
         FPDF_BITMAP,
@@ -611,6 +613,7 @@ impl PdfiumBindings {
             FPDFPageObj_GetBounds: load_fn!(lib, "FPDFPageObj_GetBounds"),
             FPDFPageObj_GetMarkedContentID: load_fn!(lib, "FPDFPageObj_GetMarkedContentID"),
             FPDFImageObj_GetRenderedBitmap: load_fn!(lib, "FPDFImageObj_GetRenderedBitmap"),
+            FPDFImageObj_GetBitmap: load_fn!(lib, "FPDFImageObj_GetBitmap"),
             FPDFImageObj_GetImageDataDecoded: load_fn!(lib, "FPDFImageObj_GetImageDataDecoded"),
             FPDFImageObj_GetImageDataRaw: load_fn!(lib, "FPDFImageObj_GetImageDataRaw"),
             FPDFImageObj_GetImageFilterCount: load_fn!(lib, "FPDFImageObj_GetImageFilterCount"),
@@ -657,6 +660,7 @@ impl PdfiumBindings {
             FPDFBitmap_GetWidth: load_fn!(lib, "FPDFBitmap_GetWidth"),
             FPDFBitmap_GetHeight: load_fn!(lib, "FPDFBitmap_GetHeight"),
             FPDFBitmap_GetStride: load_fn!(lib, "FPDFBitmap_GetStride"),
+            FPDFBitmap_GetFormat: load_fn!(lib, "FPDFBitmap_GetFormat"),
             FPDFBitmap_GetBuffer: load_fn!(lib, "FPDFBitmap_GetBuffer"),
             FPDFBitmap_FillRect: load_fn!(lib, "FPDFBitmap_FillRect"),
             FPDF_RenderPageBitmap: load_fn!(lib, "FPDF_RenderPageBitmap"),
