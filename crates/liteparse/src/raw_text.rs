@@ -194,12 +194,6 @@ fn load_glyph(
     }
 }
 
-/// `Parse_decomposeScale` from the C extractor, to the rounding: the entries of
-/// `MᵀM` are formed as `float` products and sums (the C operands are floats) and
-/// only then widened to double for the eigenvalue step. `crate::extract::decompose_scale`
-/// widens first; the two differ in the last float bits, which is enough to move an
-/// item's `fontHeight` across a three-decimal rounding boundary on a few items per
-/// thousand.
 fn decompose_scale_single_precision_products(m: &pdfium::Matrix) -> (f32, f32) {
     let a = f64::from(m.a * m.a + m.b * m.b);
     let b = f64::from(m.a * m.c + m.b * m.d);
