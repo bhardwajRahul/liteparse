@@ -8,3 +8,4 @@
 #include "fpdf_transformpage.h"
 #include "fpdf_signature.h"
 #include "fpdf_flatten.h"
+#include "fpdf_ppo.h"

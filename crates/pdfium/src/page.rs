@@ -1036,6 +1036,25 @@ impl<'doc, 'lib: 'doc> Page<'doc, 'lib> {
         false
     }
 
+    /// Whether any visible AcroForm widget on the page paints text through its
+    /// appearance stream (nested form XObjects included). The cheap gate in
+    /// front of [`Document::widget_appearance_copy`]: pdfium's page text API
+    /// omits these glyphs until the appearances are flattened.
+    pub fn has_form_widget_text(&self) -> bool {
+        let count = unsafe { ffi!(FPDFPage_GetAnnotCount(self.handle)) };
+        (0..count).any(|index| {
+            let annot = unsafe { ffi!(FPDFPage_GetAnnot(self.handle, index)) };
+            if annot.is_null() {
+                return false;
+            }
+            let found = unsafe { ffi!(FPDFAnnot_GetSubtype(annot)) }
+                == pdfium_sys::FPDF_ANNOT_WIDGET as i32
+                && annotation_paints_text_deep(annot);
+            unsafe { ffi!(FPDFPage_CloseAnnot(annot)) };
+            found
+        })
+    }
+
     /// Viewport rects of the visible AcroForm widgets that paint text through
     /// their appearance streams. Empty when the page has no such widget, which
     /// is the signal not to flatten.

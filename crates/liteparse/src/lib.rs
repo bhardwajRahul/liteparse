@@ -11,7 +11,7 @@ pub use error::LiteParseError;
 pub use font_db_resolver::FontDbResolver;
 pub use glyph_resolver::{GLYPH_RESOLVER_FONT_SIZE, GlyphResolver};
 pub use parser::{LiteParse, ParseBatch, ParseResult, ParseSession, ScreenshotResult};
-pub use raw_text::{RawTextItem, extract_raw_text_items};
+pub use raw_text::{RawTextItem, append_raw_widget_text_items, extract_raw_text_items};
 pub use search::{SearchOptions, search_items};
 pub use types::{DocumentMetadata, ParsedPage, TextItem, WordBox};
 

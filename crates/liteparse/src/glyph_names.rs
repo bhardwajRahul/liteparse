@@ -50,7 +50,20 @@ pub(crate) fn resolve_glyph_name_codepoint(name: &str) -> Option<u32> {
     let control_or_private_use = codepoint <= 0x1F
         || (0x7F..=0x9F).contains(&codepoint)
         || (codepoint > 0xE000 && codepoint <= 0xF8FF);
-    (!control_or_private_use).then_some(codepoint)
+    if control_or_private_use {
+        return None;
+    }
+    // SOFT HYPHEN (U+00AD) is a discretionary line-break hint, not visible text:
+    // renderers show nothing for it and text consumers strip it. A glyph a Type3
+    // font names "sfthyphen" / "softhyphen" / "uni00AD" is nevertheless drawn as a
+    // dash (it sits at code 45 in every such font seen so far), and the glyph-shape
+    // path that decoded these fonts before /Differences names were consulted
+    // returned '-'. Keep the visible character.
+    Some(if codepoint == 0x00AD {
+        0x002D
+    } else {
+        codepoint
+    })
 }
 
 /// `uniXXXX` (exactly four hex digits) or `uXXXX`..`uXXXXXX`, hex digits in
