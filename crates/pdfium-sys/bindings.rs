@@ -3305,3 +3305,12 @@ unsafe extern "C" {
     pub fn FPDFPage_Flatten(page: FPDF_PAGE, nFlag: ::std::os::raw::c_int)
         -> ::std::os::raw::c_int;
 }
+unsafe extern "C" {
+    pub fn FPDF_ImportPagesByIndex(
+        dest_doc: FPDF_DOCUMENT,
+        src_doc: FPDF_DOCUMENT,
+        page_indices: *const ::std::os::raw::c_int,
+        length: ::std::os::raw::c_ulong,
+        index: ::std::os::raw::c_int,
+    ) -> FPDF_BOOL;
+}
