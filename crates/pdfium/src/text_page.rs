@@ -213,6 +213,21 @@ pub struct TextChar<'tp> {
 }
 
 impl TextChar<'_> {
+    /// The glyph's origin in page space (`FPDFText_GetCharOrigin`): the point
+    /// the text matrix places on the baseline, in unrotated PDF user units.
+    pub fn origin(&self) -> Option<(f64, f64)> {
+        let (mut x, mut y) = (0.0f64, 0.0f64);
+        let ok = unsafe {
+            ffi!(FPDFText_GetCharOrigin(
+                self.text_page.handle,
+                self.index,
+                &mut x,
+                &mut y
+            ))
+        };
+        (ok != 0).then_some((x, y))
+    }
+
     pub fn unicode(&self) -> u32 {
         unsafe { ffi!(FPDFText_GetUnicode(self.text_page.handle, self.index)) }
     }

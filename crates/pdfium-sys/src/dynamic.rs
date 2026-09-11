@@ -132,6 +132,24 @@ pub struct PdfiumBindings {
     pub FPDFPage_GetUserUnit: Option<unsafe extern "C" fn(FPDF_PAGE) -> f32>,
     pub FPDFPage_Flatten:
         Option<unsafe extern "C" fn(FPDF_PAGE, std::os::raw::c_int) -> std::os::raw::c_int>,
+    /// `fpdf_edit.h` / `fpdf_ppo.h` page-editing entry points, used to build a
+    /// disposable single-page copy for widget-appearance text (see
+    /// `Document::widget_appearance_copy`). Optional like `FPDFPage_Flatten`: a
+    /// trimmed build without them loses widget text, not the parse.
+    pub FPDF_CreateNewDocument: Option<unsafe extern "C" fn() -> FPDF_DOCUMENT>,
+    pub FPDF_ImportPagesByIndex: Option<
+        unsafe extern "C" fn(
+            FPDF_DOCUMENT,
+            FPDF_DOCUMENT,
+            *const std::os::raw::c_int,
+            std::os::raw::c_ulong,
+            std::os::raw::c_int,
+        ) -> FPDF_BOOL,
+    >,
+    pub FPDFPage_RemoveObject:
+        Option<unsafe extern "C" fn(FPDF_PAGE, FPDF_PAGEOBJECT) -> FPDF_BOOL>,
+    pub FPDFPageObj_Destroy: Option<unsafe extern "C" fn(FPDF_PAGEOBJECT)>,
+    pub FPDFPage_GenerateContent: Option<unsafe extern "C" fn(FPDF_PAGE) -> FPDF_BOOL>,
     pub FPDF_PageToDevice: unsafe extern "C" fn(
         FPDF_PAGE,
         std::os::raw::c_int,
@@ -251,6 +269,8 @@ pub struct PdfiumBindings {
     ) -> FPDF_BOOL,
     pub FPDFText_GetLooseCharBox:
         unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int, *mut FS_RECTF) -> FPDF_BOOL,
+    pub FPDFText_GetCharOrigin:
+        unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int, *mut f64, *mut f64) -> FPDF_BOOL,
     pub FPDFText_GetMatrix:
         unsafe extern "C" fn(FPDF_TEXTPAGE, std::os::raw::c_int, *mut FS_MATRIX) -> FPDF_BOOL,
     pub FPDFText_IsGenerated:
@@ -606,6 +626,11 @@ impl PdfiumBindings {
             FPDFPage_SetCropBox: load_fn!(lib, "FPDFPage_SetCropBox"),
             FPDFPage_GetUserUnit: load_fn_opt!(lib, "FPDFPage_GetUserUnit"),
             FPDFPage_Flatten: load_fn_opt!(lib, "FPDFPage_Flatten"),
+            FPDF_CreateNewDocument: load_fn_opt!(lib, "FPDF_CreateNewDocument"),
+            FPDF_ImportPagesByIndex: load_fn_opt!(lib, "FPDF_ImportPagesByIndex"),
+            FPDFPage_RemoveObject: load_fn_opt!(lib, "FPDFPage_RemoveObject"),
+            FPDFPageObj_Destroy: load_fn_opt!(lib, "FPDFPageObj_Destroy"),
+            FPDFPage_GenerateContent: load_fn_opt!(lib, "FPDFPage_GenerateContent"),
             FPDF_PageToDevice: load_fn!(lib, "FPDF_PageToDevice"),
             FPDFPage_CountObjects: load_fn!(lib, "FPDFPage_CountObjects"),
             FPDFPage_GetObject: load_fn!(lib, "FPDFPage_GetObject"),
@@ -644,6 +669,7 @@ impl PdfiumBindings {
             FPDFText_GetCharAngle: load_fn!(lib, "FPDFText_GetCharAngle"),
             FPDFText_GetCharBox: load_fn!(lib, "FPDFText_GetCharBox"),
             FPDFText_GetLooseCharBox: load_fn!(lib, "FPDFText_GetLooseCharBox"),
+            FPDFText_GetCharOrigin: load_fn!(lib, "FPDFText_GetCharOrigin"),
             FPDFText_GetMatrix: load_fn!(lib, "FPDFText_GetMatrix"),
             FPDFText_IsGenerated: load_fn!(lib, "FPDFText_IsGenerated"),
             FPDFText_HasUnicodeMapError: load_fn!(lib, "FPDFText_HasUnicodeMapError"),

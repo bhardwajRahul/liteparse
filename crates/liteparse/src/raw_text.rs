@@ -21,6 +21,26 @@
 //! - Bounds are the union of the glyphs' loose boxes. Angle, colours, marked-content
 //!   id, font and font metrics come from the first glyph. `text_width` sums per-glyph
 //!   advance widths.
+//! - The angle is the baseline direction of the glyph's text matrix (`atan2(b, a)`
+//!   of its first column), not pdfium's `FPDFText_GetCharAngle`: a sheared (italic)
+//!   font puts the shear in the second column, and it must not change the reading
+//!   direction. Folded with the page `/Rotate` into `[0, 2π)`.
+//! - [`RawTextItem::grounding_bounds`] is the tight box of the item's real glyphs:
+//!   the strict glyph boxes of every non-generated, non-space glyph (judged after
+//!   buggy-font recovery), projected along and across the baseline and re-centred as
+//!   a rectangle to rotate about its centre by the angle. `None` when no glyph
+//!   qualifies. A sheared font's loose boxes overlap the next word; this box does
+//!   not.
+//! - [`RawTextItem::baseline_gap`] is measured only for an item that is a lone
+//!   pdfium-generated space between two real glyphs of a horizontal font (Type1,
+//!   TrueType, or a CID font with `Identity-H`) that share a baseline direction: the
+//!   advance from the previous glyph's origin to the next one, minus the previous
+//!   glyph's width, in page points. It reports the true separation where the
+//!   envelope boxes cannot. `None` when the neighbours are ineligible or the origins
+//!   run backwards, which happens when pdfium reverses object order on a rotated
+//!   page.
+//! - [`append_raw_widget_text_items`] adds the text painted by visible form-widget
+//!   appearances, which pdfium's text API leaves out until they are flattened.
 //! - A font is "buggy" when it is embedded and its name/type match the subset-font
 //!   heuristic, or when any non-generated glyph decodes to a control or private-use
 //!   codepoint. A glyph pdfium cannot map to Unicode decodes to 0 and therefore counts,
@@ -38,7 +58,7 @@
 //! [`Page::viewport_transform`] approximation, so boxes are reproducible to the last
 //! digit. The viewport is scaled by the page's `/UserUnit`, as everywhere in liteparse.
 
-use pdfium::{Font, FontType, Page, RectF, TextPage};
+use pdfium::{Document, Font, FontType, Matrix, Page, RectF, TextPage};
 
 use crate::GlyphResolver;
 use crate::extract::{CharInfoChunks, CharView, is_buggy_codepoint, is_buggy_font};
@@ -70,6 +90,12 @@ pub struct RawTextItem {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+    /// Tight box of the item's real glyphs, as a rectangle to rotate about its
+    /// centre by `angle_radians`; see the module docs. Viewport space.
+    pub grounding_bounds: Option<RectF>,
+    /// Advance gap across a lone generated space, in page points; see the module
+    /// docs. Zero or negative when the neighbours overlap.
+    pub baseline_gap: Option<f64>,
     /// Marked-content id of the first glyph's text object, when it has one.
     pub mcid: Option<i32>,
     /// Base font name with pdfium's subset-tag stripping; `""` when the first
@@ -106,6 +132,9 @@ struct Glyph {
     unicode: u32,
     /// Loose glyph box in viewport space.
     loose: RectF,
+    /// Strict glyph box in viewport space; only meaningful for a non-generated
+    /// glyph.
+    strict: RectF,
     /// Normalised angle in radians, `[0, 2π)`.
     angle: f32,
 }
@@ -183,6 +212,12 @@ fn load_glyph(
     };
     let strict = cv.strict_char_box().unwrap_or_default();
     let loose = cv.loose_char_box().unwrap_or(strict);
+    // The baseline direction comes from the text matrix; pdfium's own char angle
+    // is the fallback for a glyph whose matrix cannot be read.
+    let angle = match cv.ch.matrix() {
+        Some(matrix) => baseline_angle_radians(&matrix),
+        None => f64::from(cv.ch.angle()),
+    };
     Glyph {
         index,
         text_object: cv.text_object(),
@@ -190,8 +225,19 @@ fn load_glyph(
         char_code,
         unicode,
         loose: page.bounds_to_viewport(view_box, &loose),
-        angle: normalize_angle(cv.ch.angle(), page_rotation),
+        strict: page.bounds_to_viewport(view_box, &strict),
+        angle: normalize_angle(angle, page_rotation),
     }
+}
+
+/// Counter-clockwise baseline rotation of a text matrix, in radians, from the
+/// direction of its first column. Formed the way the C extractor forms it — the
+/// degrees wrapped into `[0, 360)` first, then negated and converted — so an
+/// angle a hair below zero lands a hair below 2π and rounds the same way.
+fn baseline_angle_radians(m: &Matrix) -> f64 {
+    use std::f64::consts::PI;
+    let degrees = (f64::from(m.b).atan2(f64::from(m.a)) * 180.0 / PI + 360.0) % 360.0;
+    -degrees * PI / 180.0
 }
 
 fn decompose_scale_single_precision_products(m: &pdfium::Matrix) -> (f32, f32) {
@@ -208,11 +254,12 @@ fn decompose_scale_single_precision_products(m: &pdfium::Matrix) -> (f32, f32) {
     (sx.sqrt() as f32, sy.sqrt() as f32)
 }
 
-/// Fold the page's `/Rotate` into pdfium's counter-clockwise glyph angle and
-/// wrap it into `[0, 2π)`. Computed in f64 so the wrap does not lose precision.
-fn normalize_angle(angle_radians: f32, page_rotation: i32) -> f32 {
+/// Fold the page's `/Rotate` into a counter-clockwise glyph angle and wrap it
+/// into `[0, 2π)`. Computed in f64 so the wrap does not lose precision; the
+/// final narrowing to f32 can round a value just under 2π up to it.
+fn normalize_angle(angle_radians: f64, page_rotation: i32) -> f32 {
     use std::f64::consts::PI;
-    let mut angle = f64::from(angle_radians);
+    let mut angle = angle_radians;
     match page_rotation {
         1 => angle -= 3.0 * PI / 2.0,
         2 => angle -= PI,
@@ -316,6 +363,14 @@ fn build_item(
         }
     }
     let text = c_string_from_utf32(&codepoints)?;
+    // Judged after recovery: a glyph's original codepoint can be missing or end up
+    // replaced by a space.
+    let grounding_bounds = grounding_bounds(glyphs, &codepoints, first.angle);
+    let baseline_gap = if glyphs.len() == 1 && first.generated && first.unicode == u32::from(' ') {
+        measure_baseline_gap(text_page, first.index)
+    } else {
+        None
+    };
 
     let glyph_names = font
         .as_ref()
@@ -337,6 +392,8 @@ fn build_item(
         y: bounds.top,
         width: bounds.right - bounds.left,
         height: bounds.bottom - bounds.top,
+        grounding_bounds,
+        baseline_gap,
         mcid: first_char.marked_content_id(),
         font_name,
         font_size,
@@ -349,6 +406,204 @@ fn build_item(
         fill_color: first_char.fill_color().map(pack_argb),
         stroke_color: first_char.stroke_color().map(pack_argb),
     })
+}
+
+/// Tight rotated box of the item's real glyphs (see the module docs). Each strict
+/// box's four corners are projected onto the baseline direction (`along`) and its
+/// normal (`across`); the extrema over all qualifying glyphs give the box, which is
+/// then rotated back to viewport axes at its centre. Everything in f64; the
+/// coordinates narrow to f32 at the end.
+fn grounding_bounds(glyphs: &[Glyph], codepoints: &[u32], angle_radians: f32) -> Option<RectF> {
+    let (c, s) = (
+        f64::from(angle_radians).cos(),
+        f64::from(angle_radians).sin(),
+    );
+    let (mut min_along, mut max_along) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut min_across, mut max_across) = (f64::INFINITY, f64::NEG_INFINITY);
+    for (glyph, &codepoint) in glyphs.iter().zip(codepoints) {
+        let b = glyph.strict;
+        if glyph.generated
+            || codepoint == 0
+            || is_c_locale_space(codepoint)
+            || !(b.left.is_finite()
+                && b.right.is_finite()
+                && b.top.is_finite()
+                && b.bottom.is_finite())
+            || b.right <= b.left
+            || b.bottom <= b.top
+        {
+            continue;
+        }
+        for corner in 0..4 {
+            let x = f64::from(if corner & 1 != 0 { b.right } else { b.left });
+            let y = f64::from(if corner & 2 != 0 { b.bottom } else { b.top });
+            let along = x * c + y * s;
+            let across = y * c - x * s;
+            min_along = min_along.min(along);
+            max_along = max_along.max(along);
+            min_across = min_across.min(across);
+            max_across = max_across.max(across);
+        }
+    }
+    if min_along > max_along {
+        return None;
+    }
+    let along = (min_along + max_along) / 2.0;
+    let across = (min_across + max_across) / 2.0;
+    let cx = along * c - across * s;
+    let cy = along * s + across * c;
+    let w = max_along - min_along;
+    let h = max_across - min_across;
+    Some(RectF {
+        left: (cx - w / 2.0) as f32,
+        right: (cx + w / 2.0) as f32,
+        top: (cy - h / 2.0) as f32,
+        bottom: (cy + h / 2.0) as f32,
+    })
+}
+
+/// What one neighbour of a generated space contributes to the gap measurement.
+struct GapNeighbour {
+    font: Font,
+    char_code: u32,
+    matrix: Matrix,
+    /// `hypot(a, b)` of the matrix: the baseline scale.
+    scale: f64,
+    x: f64,
+    y: f64,
+}
+
+impl GapNeighbour {
+    /// `None` when the glyph is generated, unmapped, whitespace, or in a font
+    /// whose advances do not describe a horizontal baseline (only Type1, TrueType
+    /// and CID fonts with `Identity-H` qualify), or when its geometry is unreadable
+    /// or degenerate.
+    fn read(text_page: &TextPage, index: i32) -> Option<Self> {
+        let ch = text_page.char_at_unchecked(index);
+        let codepoint = ch.unicode();
+        if ch.is_generated() || codepoint == 0 || is_c_locale_space(codepoint) {
+            return None;
+        }
+        let font = unsafe { Font::from_text_object(ch.text_object()?) }?;
+        match font.font_type() {
+            FontType::Type1 | FontType::TrueType => {}
+            FontType::CidType0 | FontType::CidType2 => {
+                if font.encoding().as_deref() != Some("Identity-H") {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+        let matrix = ch.matrix()?;
+        let (x, y) = ch.origin()?;
+        let scale = f64::from(matrix.a).hypot(f64::from(matrix.b));
+        if !scale.is_finite() || scale <= 0.0 || !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        Some(Self {
+            font,
+            char_code: ch.char_code(),
+            matrix,
+            scale,
+            x,
+            y,
+        })
+    }
+}
+
+/// The advance gap across the generated space at `index` (see the module docs):
+/// the displacement from the previous glyph's origin to the next one, projected
+/// onto the previous glyph's baseline, minus the previous glyph's advance. Page
+/// points, f64 as the C extractor computes it.
+fn measure_baseline_gap(text_page: &TextPage, index: i32) -> Option<f64> {
+    let (previous, next) = (index - 1, index + 1);
+    if previous < 0 || next >= text_page.char_count() {
+        return None;
+    }
+    let p = GapNeighbour::read(text_page, previous)?;
+    let n = GapNeighbour::read(text_page, next)?;
+    let same_direction = (f64::from(p.matrix.a) / p.scale - f64::from(n.matrix.a) / n.scale).abs()
+        < 1e-6
+        && (f64::from(p.matrix.b) / p.scale - f64::from(n.matrix.b) / n.scale).abs() < 1e-6;
+    if !same_direction {
+        return None;
+    }
+    let size = text_page.char_at_unchecked(previous).font_size() as f32;
+    let width = p.font.glyph_width_from_char_code(p.char_code, size)?;
+    let displacement =
+        ((n.x - p.x) * f64::from(p.matrix.a) + (n.y - p.y) * f64::from(p.matrix.b)) / p.scale;
+    let gap = displacement - f64::from(width) * p.scale;
+    // Backwards origins do not measure a forward separator; overlapping forward
+    // advances still supply their authoritative zero or negative gap.
+    (displacement >= 0.0 && size.is_finite() && width.is_finite() && gap.is_finite()).then_some(gap)
+}
+
+/// Append the text that page `page_index`'s visible form-widget appearances paint,
+/// which [`extract_raw_text_items`] cannot see: pdfium's text API only reports
+/// appearance glyphs once they are flattened into page content. The appearances
+/// are flattened on a private copy of the page ([`Document::widget_appearance_copy`])
+/// and extracted with the same rules, then appended to `items` — except a widget
+/// item that repeats an existing item's text at the same geometry, which some
+/// producers emit in both places. Appended items carry no marked-content id: an
+/// appearance's MCIDs do not belong to the page's structure tree.
+///
+/// Returns `false` when the copy could not be built or read; `items` is then
+/// unchanged and the caller keeps the page text it has. A page without such a
+/// widget is a no-op `true`.
+pub fn append_raw_widget_text_items(
+    doc: &Document<'_>,
+    page: &Page<'_, '_>,
+    page_index: i32,
+    glyph_resolver: Option<&dyn GlyphResolver>,
+    items: &mut Vec<RawTextItem>,
+) -> bool {
+    if !page.has_form_widget_text() {
+        return true;
+    }
+    let Some(copy) = doc.widget_appearance_copy(page_index) else {
+        return false;
+    };
+    let Ok(copy_page) = copy.page(0) else {
+        return false;
+    };
+    let Some(view_box) = copy_page.view_box() else {
+        return false;
+    };
+    let Ok(text_page) = copy_page.text() else {
+        return false;
+    };
+    let widgets = extract_raw_text_items(&copy_page, &text_page, &view_box, glyph_resolver);
+    let original_count = items.len();
+    for mut item in widgets {
+        if items[..original_count]
+            .iter()
+            .any(|existing| same_text_item(&item, existing))
+        {
+            continue;
+        }
+        item.mcid = None;
+        items.push(item);
+    }
+    true
+}
+
+/// Two items are the same when their text agrees up to trailing ASCII whitespace
+/// and is non-empty, and their loose boxes and angles coincide. Equal text
+/// elsewhere on the page is a distinct item.
+fn same_text_item(a: &RawTextItem, b: &RawTextItem) -> bool {
+    let a_text = a.text.trim_end_matches(is_c_locale_space_char);
+    let b_text = b.text.trim_end_matches(is_c_locale_space_char);
+    !a_text.is_empty()
+        && a_text == b_text
+        && (a.x - b.x).abs() < 0.01
+        && (a.y - b.y).abs() < 0.01
+        && ((a.x + a.width) - (b.x + b.width)).abs() < 0.01
+        && ((a.y + a.height) - (b.y + b.height)).abs() < 0.01
+        && (a.angle_radians - b.angle_radians).abs() < 0.001
+}
+
+fn is_c_locale_space_char(c: char) -> bool {
+    is_c_locale_space(u32::from(c))
 }
 
 /// The codepoint a Type3 font's own `/Encoding` `/Differences` name resolves to.
@@ -419,16 +674,163 @@ mod tests {
 
     #[test]
     fn angle_folds_page_rotation_and_wraps() {
-        use std::f32::consts::PI;
-        let close = |a: f32, b: f32| (a - b).abs() < 1e-5;
+        use std::f64::consts::PI;
+        let close = |a: f32, b: f64| (f64::from(a) - b).abs() < 1e-5;
         assert!(close(normalize_angle(0.0, 0), 0.0));
         assert!(close(normalize_angle(PI / 2.0, 0), PI / 2.0));
-        // /Rotate 90: pdfium's angle minus 3π/2, wrapped up into [0, 2π).
+        // /Rotate 90: the angle minus 3π/2, wrapped up into [0, 2π).
         assert!(close(normalize_angle(0.0, 1), PI / 2.0));
         assert!(close(normalize_angle(0.0, 2), PI));
         assert!(close(normalize_angle(0.0, 3), 3.0 * PI / 2.0));
         assert!(close(normalize_angle(-0.5, 0), 2.0 * PI - 0.5));
         assert!(close(normalize_angle(2.0 * PI + 0.25, 0), 0.25));
+    }
+
+    fn matrix(a: f32, b: f32, c: f32, d: f32) -> Matrix {
+        Matrix {
+            a,
+            b,
+            c,
+            d,
+            e: 0.0,
+            f: 0.0,
+        }
+    }
+
+    #[test]
+    fn baseline_angle_ignores_shear_and_keeps_the_c_wrap() {
+        use std::f64::consts::PI;
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // Upright and italic (sheared second column) share a baseline.
+        assert!(close(
+            baseline_angle_radians(&matrix(12.0, 0.0, 0.0, 12.0)),
+            0.0
+        ));
+        assert!(close(
+            baseline_angle_radians(&matrix(12.0, 0.0, 3.0, 12.0)),
+            0.0
+        ));
+        // A counter-clockwise quarter turn.
+        assert!(close(
+            baseline_angle_radians(&matrix(0.0, 12.0, -12.0, 0.0)),
+            -PI / 2.0
+        ));
+        // A baseline a hair below horizontal wraps to just under 360°, which the
+        // fold brings back to a hair above zero.
+        let radians = baseline_angle_radians(&matrix(12.0, -1e-6, 0.0, 12.0));
+        assert!(radians < -2.0 * PI + 1e-6 && radians > -2.0 * PI);
+        assert!(normalize_angle(radians, 0) > 0.0 && normalize_angle(radians, 0) < 1e-6);
+        // On a /Rotate 90 page a baseline a hair past the quarter turn folds to a
+        // hair under 2π, and the narrowing to f32 leaves it there — a consumer
+        // converting to degrees at three decimals reads 360, as with the C extractor.
+        let past_quarter = baseline_angle_radians(&matrix(-1e-6, 12.0, -12.0, 0.0));
+        let folded = normalize_angle(past_quarter, 1);
+        assert!(f64::from(folded) > 2.0 * PI - 1e-6 && f64::from(folded) <= 2.0 * PI + 1e-6);
+    }
+
+    fn glyph(strict: RectF, generated: bool) -> Glyph {
+        Glyph {
+            index: 0,
+            text_object: None,
+            generated,
+            char_code: 0,
+            unicode: 0,
+            loose: strict,
+            strict,
+            angle: 0.0,
+        }
+    }
+
+    fn rect(left: f32, top: f32, right: f32, bottom: f32) -> RectF {
+        RectF {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn grounding_bounds_skip_spaces_and_generated_glyphs() {
+        let glyphs = [
+            glyph(rect(10.0, 20.0, 15.0, 30.0), false),
+            glyph(rect(15.0, 20.0, 20.0, 30.0), false),
+            glyph(rect(20.0, 20.0, 25.0, 30.0), true),
+            glyph(rect(25.0, 20.0, 30.0, 30.0), false),
+            glyph(rect(30.0, 20.0, 35.0, 30.0), false),
+            glyph(rect(35.0, 0.0, 40.0, 40.0), false),
+        ];
+        // Space glyph, a generated glyph and an unmapped (0) glyph all drop out.
+        let codepoints = [b'H', b'i', b' ', b' ', b'!', 0].map(u32::from);
+        let bounds = grounding_bounds(&glyphs, &codepoints, 0.0).unwrap();
+        assert_eq!(bounds, rect(10.0, 20.0, 35.0, 30.0));
+        assert!(grounding_bounds(&glyphs[2..3], &codepoints[2..3], 0.0).is_none());
+        // A degenerate strict box contributes nothing.
+        let flat = [glyph(rect(1.0, 1.0, 1.0, 5.0), false)];
+        assert!(grounding_bounds(&flat, &[u32::from(b'x')], 0.0).is_none());
+    }
+
+    #[test]
+    fn grounding_bounds_rotate_about_the_centre() {
+        use std::f32::consts::FRAC_PI_2;
+        // One 10×4 box at a quarter turn: along the baseline it measures the box's
+        // height, across it the width, centred where the box is centred.
+        let glyphs = [glyph(rect(0.0, 0.0, 10.0, 4.0), false)];
+        let bounds = grounding_bounds(&glyphs, &[u32::from(b'x')], FRAC_PI_2).unwrap();
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-5;
+        assert!(close(bounds.left, 3.0) && close(bounds.right, 7.0));
+        assert!(close(bounds.top, -3.0) && close(bounds.bottom, 7.0));
+    }
+
+    fn item(text: &str, x: f32, y: f32, width: f32, height: f32, angle: f32) -> RawTextItem {
+        RawTextItem {
+            text: text.into(),
+            char_codes: Vec::new(),
+            glyph_names: None,
+            angle_radians: angle,
+            text_width: 0.0,
+            x,
+            y,
+            width,
+            height,
+            grounding_bounds: None,
+            baseline_gap: None,
+            mcid: Some(3),
+            font_name: String::new(),
+            font_size: 0.0,
+            font_weight: 0,
+            font_height: 0.0,
+            font_ascent: 0.0,
+            font_descent: 0.0,
+            font_is_buggy: false,
+            trailing_space_generated: false,
+            fill_color: None,
+            stroke_color: None,
+        }
+    }
+
+    #[test]
+    fn same_text_item_needs_equal_text_and_geometry() {
+        let a = item("Total ", 10.0, 20.0, 30.0, 8.0, 0.0);
+        assert!(same_text_item(
+            &a,
+            &item("Total", 10.005, 20.0, 29.995, 8.0, 0.0005)
+        ));
+        assert!(!same_text_item(
+            &a,
+            &item("Total", 10.02, 20.0, 29.98, 8.0, 0.0)
+        ));
+        assert!(!same_text_item(
+            &a,
+            &item("Total", 10.0, 20.0, 30.0, 8.0, 0.002)
+        ));
+        assert!(!same_text_item(
+            &a,
+            &item("Totals", 10.0, 20.0, 30.0, 8.0, 0.0)
+        ));
+        // Whitespace-only text never matches, so blank widgets are always kept.
+        let blank = item("  ", 10.0, 20.0, 30.0, 8.0, 0.0);
+        assert!(!same_text_item(&blank, &blank));
     }
 
     #[test]
