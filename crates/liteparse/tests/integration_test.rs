@@ -1024,3 +1024,52 @@ async fn parse_reports_no_page_label_when_pdf_has_none() {
         "sample.pdf has no /PageLabels tree"
     );
 }
+
+/// `diagonal_text.pdf` draws each word on its own diagonal baseline. pdfium's
+/// char boxes enclose a rotated glyph in page axes, so a grounding box built
+/// from their corners is far taller across the baseline than the ink is; the
+/// outline-derived box is not. The C extractor's value for the first word is the
+/// pinned figure; the rest are held to a fraction of their enclosing box.
+#[test]
+#[serial]
+fn raw_text_diagonal_grounding_bounds_follow_the_glyph_outlines() {
+    use liteparse::extract_raw_text_items;
+
+    let lib = pdfium::Library::init();
+    let document = lib
+        .load_document("../../integration_tests_data/diagonal_text.pdf", None)
+        .expect("diagonal_text.pdf loads");
+    let page = document.page(0).expect("page 0 loads");
+    let text_page = page.text().expect("text page loads");
+    let view_box = page.view_box().expect("page has a bounding box");
+
+    let items = extract_raw_text_items(&page, &text_page, &view_box, None);
+    let rotated: Vec<_> = items
+        .iter()
+        .filter(|item| {
+            let quarter = std::f32::consts::FRAC_PI_2;
+            (item.angle_radians % quarter).abs() > 0.05
+        })
+        .collect();
+    assert!(!rotated.is_empty(), "the fixture has diagonal text");
+    let first = rotated[0]
+        .grounding_bounds
+        .expect("the first diagonal word has grounding bounds");
+    assert!(
+        ((first.bottom - first.top) - 34.049).abs() < 0.01,
+        "first word across-baseline extent {} differs from the C extractor's 34.049",
+        first.bottom - first.top
+    );
+    for item in rotated {
+        let bounds = item
+            .grounding_bounds
+            .expect("a diagonal word with real glyphs has grounding bounds");
+        let across = bounds.bottom - bounds.top;
+        assert!(
+            across > 0.0 && across < item.height,
+            "{:?}: outline box ({across}) should sit inside the loose box ({})",
+            item.text,
+            item.height
+        );
+    }
+}
