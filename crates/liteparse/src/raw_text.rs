@@ -26,11 +26,17 @@
 //!   font puts the shear in the second column, and it must not change the reading
 //!   direction. Folded with the page `/Rotate` into `[0, 2π)`.
 //! - [`RawTextItem::grounding_bounds`] is the tight box of the item's real glyphs:
-//!   the strict glyph boxes of every non-generated, non-space glyph (judged after
-//!   buggy-font recovery), projected along and across the baseline and re-centred as
-//!   a rectangle to rotate about its centre by the angle. `None` when no glyph
+//!   every non-generated, non-space glyph (judged after buggy-font recovery) is
+//!   projected along and across the baseline and the extrema re-centred as a
+//!   rectangle to rotate about its centre by the angle. `None` when no glyph
 //!   qualifies. A sheared font's loose boxes overlap the next word; this box does
-//!   not.
+//!   not. Cardinal, unsheared text projects the corners of its strict glyph boxes.
+//!   Rotated or sheared text projects the points of the glyph's outline instead
+//!   (see [`glyph_outline_support`]): pdfium's char box already encloses a rotated
+//!   glyph in page axes, and its empty corners cannot be rotated back into ink.
+//!   Glyphs whose outline cannot stand in for the paint — stroked render modes,
+//!   Type3 and non-`Identity-H` CID fonts, unreadable geometry — keep their strict
+//!   boxes.
 //! - [`RawTextItem::baseline_gap`] is measured only for an item that is a lone
 //!   pdfium-generated space between two real glyphs of a horizontal font (Type1,
 //!   TrueType, or a CID font with `Identity-H`) that share a baseline direction: the
@@ -153,12 +159,22 @@ pub fn extract_raw_text_items(
     let mut chunks = CharInfoChunks::new(text_page);
     let mut items = Vec::new();
     let mut run: Vec<Glyph> = Vec::new();
+    // Outline shapes repeat across a page (the same glyph at the same size and
+    // matrix), so they are computed once per page, not once per item.
+    let mut outline_cache = OutlineSupportCache::default();
 
-    let flush = |run: &mut Vec<Glyph>, items: &mut Vec<RawTextItem>| {
+    let mut flush = |run: &mut Vec<Glyph>, items: &mut Vec<RawTextItem>| {
         if run.is_empty() {
             return;
         }
-        if let Some(item) = build_item(text_page, run, glyph_resolver) {
+        if let Some(item) = build_item(
+            page,
+            text_page,
+            view_box,
+            run,
+            glyph_resolver,
+            &mut outline_cache,
+        ) {
             items.push(item);
         }
         run.clear();
@@ -286,9 +302,12 @@ fn pack_argb(color: pdfium::Color) -> u32 {
 /// Turn a run of glyphs into an item. `None` when a codepoint is not a Unicode
 /// scalar value (see [`c_string_from_utf32`]).
 fn build_item(
+    page: &Page,
     text_page: &TextPage,
+    view_box: &RectF,
     glyphs: &[Glyph],
     glyph_resolver: Option<&dyn GlyphResolver>,
+    outline_cache: &mut OutlineSupportCache,
 ) -> Option<RawTextItem> {
     let first = glyphs.first()?;
     let first_char = text_page.char_at_unchecked(first.index);
@@ -365,7 +384,9 @@ fn build_item(
     let text = c_string_from_utf32(&codepoints)?;
     // Judged after recovery: a glyph's original codepoint can be missing or end up
     // replaced by a space.
-    let grounding_bounds = grounding_bounds(glyphs, &codepoints, first.angle);
+    let grounding_bounds = grounding_bounds(glyphs, &codepoints, first.angle, |glyph, c, s| {
+        glyph_outline_support(page, text_page, view_box, glyph, c, s, outline_cache)
+    });
     let baseline_gap = if glyphs.len() == 1 && first.generated && first.unicode == u32::from(' ') {
         measure_baseline_gap(text_page, first.index)
     } else {
@@ -408,12 +429,199 @@ fn build_item(
     })
 }
 
-/// Tight rotated box of the item's real glyphs (see the module docs). Each strict
-/// box's four corners are projected onto the baseline direction (`along`) and its
-/// normal (`across`); the extrema over all qualifying glyphs give the box, which is
-/// then rotated back to viewport axes at its centre. Everything in f64; the
-/// coordinates narrow to f32 at the end.
-fn grounding_bounds(glyphs: &[Glyph], codepoints: &[u32], angle_radians: f32) -> Option<RectF> {
+/// Extrema of a glyph's ink in an item's baseline frame, viewport units: `along`
+/// is the projection onto the baseline direction, `across` onto its normal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BaselineSupport {
+    min_along: f64,
+    max_along: f64,
+    min_across: f64,
+    max_across: f64,
+}
+
+impl BaselineSupport {
+    const EMPTY: Self = Self {
+        min_along: f64::INFINITY,
+        max_along: f64::NEG_INFINITY,
+        min_across: f64::INFINITY,
+        max_across: f64::NEG_INFINITY,
+    };
+
+    fn include(&mut self, along: f64, across: f64) {
+        self.min_along = self.min_along.min(along);
+        self.max_along = self.max_along.max(along);
+        self.min_across = self.min_across.min(across);
+        self.max_across = self.max_across.max(across);
+    }
+
+    fn translate(self, along: f64, across: f64) -> Self {
+        Self {
+            min_along: self.min_along + along,
+            max_along: self.max_along + along,
+            min_across: self.min_across + across,
+            max_across: self.max_across + across,
+        }
+    }
+}
+
+/// One glyph outline's shape in the baseline frame, before the glyph's own origin
+/// is added, with everything the shape depends on as its key.
+struct OutlineShape {
+    /// Address of the `FPDF_FONT` handle; pdfium hands the same handle back for
+    /// the same font object while the page is loaded.
+    font: usize,
+    char_code: u32,
+    size_bits: u32,
+    matrix_bits: [u32; 4],
+    cos_bits: u64,
+    sin_bits: u64,
+    support: BaselineSupport,
+}
+
+/// Per-page cache of outline shapes: 256 direct-mapped slots keyed by
+/// `char_code % 256`, a collision recomputing the shape rather than evicting
+/// anything, as in the C extractor. Bounds the memory held per page without
+/// retaining font handles beyond it.
+pub(crate) struct OutlineSupportCache {
+    slots: Vec<Option<OutlineShape>>,
+}
+
+impl Default for OutlineSupportCache {
+    fn default() -> Self {
+        Self {
+            slots: (0..256).map(|_| None).collect(),
+        }
+    }
+}
+
+/// The extrema of `glyph`'s outline in the item's baseline frame (`c`, `s` are
+/// the cosine and sine of the item angle), or `None` when the glyph keeps its
+/// strict box. `None` for cardinal, unsheared text, whose char box is already
+/// axis-aligned (shear alone needs outlines even at a cardinal angle: judging the
+/// baseline only made bounds jump when a sheared baseline crossed the threshold);
+/// for stroked render modes, whose paint the fill outline does not describe; for
+/// fonts other than Type1, TrueType and `Identity-H` CID (a Type3 outline may be
+/// a substitute face rather than the drawn CharProc, and vertical CID placement is
+/// not exposed by the glyph-path API); and for any geometry that cannot be read
+/// or is degenerate.
+///
+/// Glyph paths are in em units scaled by the font size, so the shape is built
+/// with the linear part of the text matrix at a fixed origin — projecting each
+/// glyph's own origin made the 0.001 pt viewport rounding change an otherwise
+/// identical shape — and each occurrence adds its own origin afterwards. Bézier
+/// control points are included as a conservative hull of the curve. Point
+/// products are formed in f32 before the projection, as the C extractor forms
+/// them, so the two agree to the last digit.
+fn glyph_outline_support(
+    page: &Page,
+    text_page: &TextPage,
+    view_box: &RectF,
+    glyph: &Glyph,
+    c: f64,
+    s: f64,
+    cache: &mut OutlineSupportCache,
+) -> Option<BaselineSupport> {
+    let font = unsafe { Font::from_text_object(glyph.text_object?) }?;
+    let ch = text_page.char_at_unchecked(glyph.index);
+    let matrix = ch.matrix()?;
+    let linear = [matrix.a, matrix.b, matrix.c, matrix.d];
+    if !linear.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let axes = f64::from(matrix.a).hypot(f64::from(matrix.b))
+        * f64::from(matrix.c).hypot(f64::from(matrix.d));
+    let shear = f64::from(matrix.a * matrix.c + matrix.b * matrix.d);
+    if (c * s).abs() <= 1e-6 && shear.abs() <= 1e-6 * axes {
+        return None;
+    }
+    // Fill, invisible, fill-clip and clip modes paint (or clip to) the outline
+    // itself; unknown and every stroking mode fall back to the char box.
+    match ch.text_render_mode() {
+        Some(0 | 3 | 4 | 7) => {}
+        _ => return None,
+    }
+    match font.font_type() {
+        FontType::Type1 | FontType::TrueType => {}
+        FontType::CidType0 | FontType::CidType2 => {
+            if font.encoding().as_deref() != Some("Identity-H") {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    let size = ch.font_size() as f32;
+    if !size.is_finite() || size <= 0.0 {
+        return None;
+    }
+
+    let font_address = font.handle() as usize;
+    let matrix_bits = linear.map(f32::to_bits);
+    let slot = &mut cache.slots[(glyph.char_code % 256) as usize];
+    let cached = slot.as_ref().filter(|shape| {
+        shape.font == font_address
+            && shape.char_code == glyph.char_code
+            && shape.size_bits == size.to_bits()
+            && shape.matrix_bits == matrix_bits
+            && shape.cos_bits == c.to_bits()
+            && shape.sin_bits == s.to_bits()
+    });
+    let support = match cached {
+        Some(shape) => shape.support,
+        None => {
+            let segments = font.glyph_path_segments(glyph.char_code, size)?;
+            if segments.is_empty() {
+                return None;
+            }
+            let (vx, vy) = page.page_to_viewport(view_box, 0.0, 0.0);
+            let (ux, uy) = page.page_to_viewport(view_box, size * matrix.a, size * matrix.b);
+            let (wx, wy) = page.page_to_viewport(view_box, size * matrix.c, size * matrix.d);
+            let mut support = BaselineSupport::EMPTY;
+            for &(_, x, y) in &segments {
+                if !x.is_finite() || !y.is_finite() {
+                    return None;
+                }
+                let px = f64::from(x * (ux - vx) + y * (wx - vx));
+                let py = f64::from(x * (uy - vy) + y * (wy - vy));
+                support.include(px * c + py * s, py * c - px * s);
+            }
+            if !(support.min_along < support.max_along && support.min_across < support.max_across) {
+                return None;
+            }
+            *slot = Some(OutlineShape {
+                font: font_address,
+                char_code: glyph.char_code,
+                size_bits: size.to_bits(),
+                matrix_bits,
+                cos_bits: c.to_bits(),
+                sin_bits: s.to_bits(),
+                support,
+            });
+            support
+        }
+    };
+
+    // Only the shape is shared; each occurrence keeps its own advance and rise.
+    let (ox, oy) = ch.origin()?;
+    if !ox.is_finite() || !oy.is_finite() {
+        return None;
+    }
+    let (x, y) = page.page_to_viewport(view_box, ox as f32, oy as f32);
+    let (x, y) = (f64::from(x), f64::from(y));
+    Some(support.translate(x * c + y * s, y * c - x * s))
+}
+
+/// Tight rotated box of the item's real glyphs (see the module docs). Each
+/// qualifying glyph's support — its outline extrema from `outline` when that
+/// returns one, otherwise the four corners of its strict box — is projected onto
+/// the baseline direction (`along`) and its normal (`across`); the extrema over all
+/// glyphs give the box, which is then rotated back to viewport axes at its centre.
+/// Everything in f64; the coordinates narrow to f32 at the end.
+fn grounding_bounds(
+    glyphs: &[Glyph],
+    codepoints: &[u32],
+    angle_radians: f32,
+    mut outline: impl FnMut(&Glyph, f64, f64) -> Option<BaselineSupport>,
+) -> Option<RectF> {
     let (c, s) = (
         f64::from(angle_radians).cos(),
         f64::from(angle_radians).sin(),
@@ -432,6 +640,13 @@ fn grounding_bounds(glyphs: &[Glyph], codepoints: &[u32], angle_radians: f32) ->
             || b.right <= b.left
             || b.bottom <= b.top
         {
+            continue;
+        }
+        if let Some(support) = outline(glyph, c, s) {
+            min_along = min_along.min(support.min_along);
+            max_along = max_along.max(support.max_along);
+            min_across = min_across.min(support.min_across);
+            max_across = max_across.max(support.max_across);
             continue;
         }
         for corner in 0..4 {
@@ -762,12 +977,12 @@ mod tests {
         ];
         // Space glyph, a generated glyph and an unmapped (0) glyph all drop out.
         let codepoints = [b'H', b'i', b' ', b' ', b'!', 0].map(u32::from);
-        let bounds = grounding_bounds(&glyphs, &codepoints, 0.0).unwrap();
+        let bounds = grounding_bounds(&glyphs, &codepoints, 0.0, |_, _, _| None).unwrap();
         assert_eq!(bounds, rect(10.0, 20.0, 35.0, 30.0));
-        assert!(grounding_bounds(&glyphs[2..3], &codepoints[2..3], 0.0).is_none());
+        assert!(grounding_bounds(&glyphs[2..3], &codepoints[2..3], 0.0, |_, _, _| None).is_none());
         // A degenerate strict box contributes nothing.
         let flat = [glyph(rect(1.0, 1.0, 1.0, 5.0), false)];
-        assert!(grounding_bounds(&flat, &[u32::from(b'x')], 0.0).is_none());
+        assert!(grounding_bounds(&flat, &[u32::from(b'x')], 0.0, |_, _, _| None).is_none());
     }
 
     #[test]
@@ -776,7 +991,8 @@ mod tests {
         // One 10×4 box at a quarter turn: along the baseline it measures the box's
         // height, across it the width, centred where the box is centred.
         let glyphs = [glyph(rect(0.0, 0.0, 10.0, 4.0), false)];
-        let bounds = grounding_bounds(&glyphs, &[u32::from(b'x')], FRAC_PI_2).unwrap();
+        let bounds =
+            grounding_bounds(&glyphs, &[u32::from(b'x')], FRAC_PI_2, |_, _, _| None).unwrap();
         let close = |a: f32, b: f32| (a - b).abs() < 1e-5;
         assert!(close(bounds.left, 3.0) && close(bounds.right, 7.0));
         assert!(close(bounds.top, -3.0) && close(bounds.bottom, 7.0));
