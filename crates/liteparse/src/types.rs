@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 #[doc(hidden)]
@@ -13,7 +13,7 @@ pub enum PdfInput {
 /// Document-level provenance metadata extracted from PDFium plus a bounded
 /// streaming scan of the source PDF. Fields stay optional so malformed
 /// metadata never prevents the document itself from being parsed.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DocumentMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub creation_date: Option<String>,
@@ -58,7 +58,8 @@ pub struct DocumentMetadata {
 
 /// Represents a single text item extracted from a PDF page,
 /// including its content, position, size, rotation, and font metadata.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TextItem {
     pub text: String,
     /// Viewport-space coordinates (top-left origin, 72 DPI).
@@ -127,9 +128,10 @@ pub struct TextItem {
     /// breaks at line/column boundaries), so this exposes the finer word-level
     /// geometry needed for bbox attribution. Empty for items that produced no
     /// word split (e.g. OCR-sourced or single-token items). Internal/attribution
-    /// use only — `#[serde(skip)]` keeps it out of the JSON output but it is
-    /// marshalled across the napi boundary.
-    #[serde(skip)]
+    /// use only — the public JSON output (`output/json.rs`) builds its own
+    /// item view without it, but it is marshalled across the napi boundary
+    /// and must survive a stage boundary (see `stages`), so it serializes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub words: Vec<WordBox>,
 }
 
@@ -195,7 +197,7 @@ impl TextItem {
 /// One word's bounding box within a `TextItem`, in the same viewport space
 /// (top-left origin, 72 DPI) as the parent item. `text` is the word's content
 /// with inter-word spaces excluded.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WordBox {
     pub text: String,
     pub x: f32,
@@ -204,8 +206,13 @@ pub struct WordBox {
     pub height: f32,
 }
 
+/// Serialization is lossless: every field the later stages read (graphics,
+/// structure nodes, image refs, per-item word boxes) round-trips through
+/// `Serialize`/`Deserialize`, so a caller sequencing the `stages` module can
+/// put a process or activity boundary between any two stages. The public JSON
+/// output does not use this shape (see `output/json.rs`).
 #[doc(hidden)]
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Page {
     pub page_number: usize,
     /// The document's `/PageLabels` entry for this page ("iv", "A-1"), when
@@ -222,8 +229,9 @@ pub struct Page {
     pub content_bounds: Option<Rect>,
     pub text_items: Vec<TextItem>,
     /// Vector graphics on the page, distilled from PDFium path objects.
-    /// Not emitted in JSON/text outputs — consumed by the markdown layout pass.
-    #[serde(skip)]
+    /// Not part of the public JSON/text outputs — consumed by the markdown
+    /// layout pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub graphics: Vec<GraphicPrimitive>,
     /// Lossless-enough, PDFium-compatible path output requested by the caller.
     /// Kept separate from the lossy internal `graphics` layout primitives.
@@ -232,26 +240,26 @@ pub struct Page {
     /// Structure-tree nodes for this page when the PDF is tagged. Each node
     /// carries its role, marked-content ids, and the union bbox of its tagged
     /// content. Empty for untagged PDFs.
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub struct_nodes: Vec<StructNode>,
     /// Raster image objects detected on the page. Empty when the page has no
     /// images. Threaded through to `ParsedPage.image_refs`.
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub image_refs: Vec<ImageRef>,
     /// Public annotation data when explicitly requested. `None` distinguishes
     /// disabled extraction from an enabled page with no annotations.
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<Vec<DocumentAnnotation>>,
     /// AcroForm widgets when explicitly requested.
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub form_fields: Option<Vec<FormField>>,
     /// Tagged-PDF logical structure when explicitly requested.
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structure_tree: Option<StructureTree>,
 }
 
 /// A page that could not be extracted while tolerant page errors were enabled.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PageError {
     /// Source page number (1-indexed). Serialized as `page` to match the
     /// sibling per-page fields in the JSON output (`pages[]`, `images[]`).
@@ -263,7 +271,7 @@ pub struct PageError {
 
 /// One PDF page annotation. Coordinates use the same top-left, 72-DPI
 /// viewport space as [`TextItem`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentAnnotation {
     pub subtype: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -276,14 +284,14 @@ pub struct DocumentAnnotation {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rect: Option<Rect>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quadpoint_rects: Vec<Rect>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
 }
 
 /// Scalar value from a tagged-PDF structure element's `/A` dictionary.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum StructureAttributeValue {
     Boolean(bool),
@@ -292,14 +300,14 @@ pub enum StructureAttributeValue {
 }
 
 /// A complete page-scoped tagged-PDF logical structure tree.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StructureTree {
     pub roots: Vec<StructureTreeElement>,
 }
 
 /// One tagged-PDF structure element. Field names follow the
 /// repository's snake_case JSON convention rather than PDFium's C spellings.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StructureTreeElement {
     #[serde(rename = "type")]
     pub element_type: String,
@@ -311,7 +319,7 @@ pub struct StructureTreeElement {
     pub alt_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub attributes: BTreeMap<String, StructureAttributeValue>,
     pub marked_content_ids: Vec<i32>,
     pub children: Vec<StructureTreeElement>,
@@ -319,7 +327,7 @@ pub struct StructureTreeElement {
 }
 
 /// One AcroForm widget and its resolved field metadata.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FormField {
     pub id: String,
     #[serde(rename = "type")]
@@ -346,15 +354,15 @@ pub struct FormField {
     pub checked: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rect: Option<Rect>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_options: Vec<String>,
 }
 
 /// One raw packet from an XFA form document's `/XFA` array. Surfaced on
 /// `ParseResult.xfa_packets` when `extract_xfa_packets` is enabled.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XfaPacket {
     /// Zero-based index in the XFA array.
     pub index: u32,
@@ -373,7 +381,7 @@ pub struct XfaPacket {
 /// Coordinates are in the same top-left, 72-DPI viewport space as text
 /// items. Detection runs on the raster, so it also covers scanned/flattened
 /// pages that carry no vector paths.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenshotRect {
     pub x: f32,
     pub y: f32,
@@ -390,7 +398,7 @@ pub struct ScreenshotRect {
 /// user space (origin bottom-left) — convert to viewport with
 /// `page_height - y` once you know the page.
 #[doc(hidden)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutlineTarget {
     /// Hierarchy depth, 1-based.
     pub level: u8,
@@ -405,7 +413,7 @@ pub struct OutlineTarget {
 /// One node from the structure tree of a page. Pre-flattened in pre-order
 /// (parent before children).
 #[doc(hidden)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StructNode {
     pub role: String,
     pub mcids: Vec<i32>,
@@ -416,7 +424,11 @@ pub struct StructNode {
 }
 
 /// Represents a fully parsed page with projected text layout.
-#[derive(Debug, Serialize)]
+///
+/// Like [`Page`], serialization is lossless so the markdown stages can run on
+/// the other side of a process boundary from projection. The public JSON
+/// output builds its own view of this type (`output/json.rs`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedPage {
     pub page_number: usize,
     /// The document's `/PageLabels` entry for this page ("iv", "A-1"), when
@@ -432,21 +444,21 @@ pub struct ParsedPage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_bounds: Option<Rect>,
     pub text: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub markdown: String,
     pub text_items: Vec<TextItem>,
     /// Per-line structural metadata used by the markdown emitter. Not part of
-    /// the JSON/text outputs (consumed internally) so it is `#[serde(skip)]`.
-    #[serde(skip)]
+    /// the public JSON/text outputs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub projected_lines: Vec<ProjectedLine>,
     /// Root of the XY-cut region tree for this page. Leaves correspond to the
     /// `region_path` on each `ProjectedLine`. Internal-only.
-    #[serde(skip)]
+    #[serde(default)]
     pub regions: Region,
     /// Vector graphics on the page (decomposed paths) used by the markdown
     /// emitter for ruled-table / HR / figure-cluster detection. Not part of
-    /// the JSON/text output.
-    #[serde(skip)]
+    /// the public JSON/text output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub graphics: Vec<GraphicPrimitive>,
     /// Public vector path extraction. Absent unless explicitly enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -454,7 +466,7 @@ pub struct ParsedPage {
     /// Figure-region bounding rectangles derived from `graphics`. Pre-computed
     /// in `to_parsed_pages` so the XY-cut layout pass can treat them as
     /// obstacles, and reused downstream for figure classification.
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub figures: Vec<Rect>,
     /// `(projected, original)` geometry of every text item, populated only
     /// when the two differ for at least one item on the page. Rotation
@@ -465,18 +477,18 @@ pub struct ParsedPage {
     /// through this table before they are reported, so they land in the
     /// same viewport space as `text_items`. Empty for pages without rotated
     /// text, which is the overwhelming majority.
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub projected_item_frames: Vec<(Rect, Rect)>,
     /// Structure-tree nodes for this page (tagged PDFs only). Pre-flattened in
     /// pre-order. Consumed by the markdown classifier for highest-priority
     /// heading / figure / table detection.
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub struct_nodes: Vec<StructNode>,
     /// Raster image objects on the page. Bbox in viewport coords. Populated
     /// during extraction; consumed by the markdown emitter to interleave
     /// `Block::Figure` references at the right y position. Empty when the
-    /// page has no embedded images. Not part of JSON/text output.
-    #[serde(skip)]
+    /// page has no embedded images. Not part of the public JSON/text output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub image_refs: Vec<ImageRef>,
     /// Per-page complexity signals (the same the `is_complex` API returns).
     /// Populated only when `LiteParseConfig::include_complexity` is set;
@@ -507,7 +519,7 @@ pub struct ParsedPage {
 /// the image's position among image page-objects, so a later embed pass can
 /// re-open the document and pull pixel bytes with `render_image_object`.
 #[doc(hidden)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageRef {
     pub id: String,
     pub bbox: Rect,
@@ -516,7 +528,13 @@ pub struct ImageRef {
     pub pixel_width: u32,
     pub pixel_height: u32,
     pub rotation: f32,
+    /// Pixel payloads are consumed during extraction (they become
+    /// `ExtractedImage.bytes`) and nothing after extraction reads them, so
+    /// they stay out of the serialized page: a stage boundary after extract
+    /// carries the image bytes on `ExtractedImage`, not here.
+    #[serde(skip)]
     pub jpeg_bytes: Option<Vec<u8>>,
+    #[serde(skip)]
     pub raw_bytes: Option<Vec<u8>>,
     pub bits_per_pixel: u32,
     pub colorspace: i32,
@@ -528,7 +546,7 @@ pub struct ImageRef {
 /// produced. JPEG streams are preserved without re-encoding when PDFium
 /// exposes a valid directly decoded DCT stream; other images are encoded as
 /// PNG from PDFium's rendered bitmap.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedImage {
     pub id: String,
     pub name: String,
@@ -543,13 +561,15 @@ pub struct ExtractedImage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duplicate_of: Option<String>,
     /// Encoded image bytes. Shared (`Arc`) so duplicate entries reference the
-    /// canonical image's buffer instead of copying it per occurrence.
+    /// canonical image's buffer instead of copying it per occurrence. Not
+    /// serialized: an image payload crossing a boundary goes as a file or a
+    /// separate blob, keyed by `id`.
     #[serde(skip)]
     pub bytes: std::sync::Arc<Vec<u8>>,
 }
 
 #[doc(hidden)]
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Rect {
     pub x: f32,
     pub y: f32,
@@ -588,14 +608,14 @@ impl Rect {
 
 /// Page-scoped vector path output. Coordinates use the same top-left,
 /// 72-DPI viewport space as text items.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VectorGraphics {
     pub shapes: Vec<VectorShape>,
     pub lines: Vec<VectorLine>,
 }
 
 /// One PDF path object's paint state and viewport bounding box.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorShape {
     pub bbox: Rect,
     pub stroke: bool,
@@ -609,7 +629,7 @@ pub struct VectorShape {
 
 /// A strict horizontal or vertical path segment after adjacent compatible
 /// segments have been merged, matching LlamaParse PDFium path semantics.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorLine {
     pub x1: f32,
     pub y1: f32,
@@ -630,7 +650,7 @@ pub struct VectorLine {
 /// clusters) are kept — bezier curves and complex paths are decomposed into
 /// straight strokes, or dropped.
 #[doc(hidden)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GraphicPrimitive {
     /// A single straight line segment in viewport coords. Used for HR/table
     /// border detection.
@@ -673,7 +693,7 @@ impl GraphicPrimitive {
 /// Per-line structural metadata derived during grid projection. Used by the
 /// markdown emitter; not surfaced in JSON/text output.
 #[doc(hidden)]
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectedLine {
     pub text: String,
     pub bbox: Rect,
@@ -721,14 +741,14 @@ pub struct ProjectedLine {
 /// XY-cut region tree node. A page's root region recursively splits along H or
 /// V axes until each leaf holds a coherent block of items.
 #[doc(hidden)]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Region {
     pub bbox: Rect,
     pub kind: RegionKind,
 }
 
 #[doc(hidden)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RegionKind {
     Leaf {
         item_indices: Vec<usize>,
@@ -748,7 +768,7 @@ impl Default for RegionKind {
 }
 
 #[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CutAxis {
     Horizontal,
     Vertical,
@@ -763,7 +783,7 @@ pub enum Snap {
 }
 
 #[doc(hidden)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Anchor {
     Left,
     Right,

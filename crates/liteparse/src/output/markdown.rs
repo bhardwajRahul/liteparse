@@ -1,8 +1,6 @@
 use crate::config::ImageMode;
-use crate::markdown_layout::{
-    PositionedBlock, build_heading_map, classify_page_with_filters, compute_body_size,
-    compute_header_footer_set, detect_single_page_chrome, render_blocks, splice_soft_hyphens,
-};
+use crate::markdown_layout::PositionedBlock;
+use crate::stages;
 use crate::types::{OutlineTarget, ParsedPage};
 
 /// Format parsed pages as markdown.
@@ -67,59 +65,15 @@ pub fn classify_document(
         return Vec::new();
     }
 
-    let body_size = compute_body_size(pages);
-    let heading_map = build_heading_map(pages, body_size);
-    let header_footer = if keep_headers_footers {
-        Default::default()
-    } else {
-        compute_header_footer_set(pages)
+    let signals = stages::document_signals(pages, keep_headers_footers);
+    let options = stages::BlockOptions {
+        outline,
+        image_mode,
+        keep_headers_footers,
     };
-
     pages
         .iter()
-        .map(|page| {
-            if page.projected_lines.is_empty() {
-                return None;
-            }
-
-            // Filter outline entries to this page so the classifier's y/title
-            // match is a O(entries_on_page) scan per line, not O(whole doc).
-            let target_index = (page.page_number as i32).saturating_sub(1);
-            let page_outline: Vec<OutlineTarget> = outline
-                .iter()
-                .filter(|e| e.page_index == target_index)
-                .cloned()
-                .collect();
-            let chrome_indices = if keep_headers_footers {
-                Default::default()
-            } else {
-                detect_single_page_chrome(page, body_size)
-            };
-            let mut blocks = classify_page_with_filters(
-                page,
-                &heading_map,
-                &header_footer,
-                &page_outline,
-                image_mode,
-                &chrome_indices,
-            );
-            // A page whose only surviving blocks are horizontal rules (all its
-            // text was stripped as chrome) should render empty, not as a stack
-            // of bare `---` separators.
-            let has_content = blocks.iter().any(|b| {
-                !matches!(
-                    b.block,
-                    crate::markdown_layout::Block::HorizontalRule
-                        | crate::markdown_layout::Block::Figure { .. }
-                )
-            });
-            if !has_content {
-                blocks
-                    .retain(|b| !matches!(b.block, crate::markdown_layout::Block::HorizontalRule));
-            }
-            dedupe_rules(&mut blocks);
-            Some(splice_soft_hyphens(blocks))
-        })
+        .map(|page| stages::extract_blocks(page, &signals, &options))
         .collect()
 }
 
@@ -133,18 +87,7 @@ pub fn render_classified(
     pages
         .iter()
         .zip(classified)
-        .map(|(page, blocks)| match blocks {
-            Some(blocks) => render_blocks(blocks),
-            None => {
-                let mut out = String::from("```text\n");
-                out.push_str(&page.text);
-                if !page.text.ends_with('\n') {
-                    out.push('\n');
-                }
-                out.push_str("```");
-                out
-            }
-        })
+        .map(|(page, blocks)| stages::render_page_markdown(page, blocks.as_deref()))
         .collect()
 }
 
@@ -154,7 +97,7 @@ pub fn render_classified(
 /// two sources — vector-graphics detection and decorative divider text — and
 /// doubling up reads as sloppy output to a human, while carrying no extra
 /// structure for an LLM.
-fn dedupe_rules(blocks: &mut Vec<crate::markdown_layout::PositionedBlock>) {
+pub(crate) fn dedupe_rules(blocks: &mut Vec<crate::markdown_layout::PositionedBlock>) {
     use crate::markdown_layout::Block::HorizontalRule;
     while matches!(blocks.first().map(|b| &b.block), Some(HorizontalRule)) {
         blocks.remove(0);
