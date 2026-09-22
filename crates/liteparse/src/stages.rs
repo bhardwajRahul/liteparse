@@ -8,18 +8,6 @@
 //! itself and insert its own inputs between stages — its own OCR engine, a
 //! page selection, extra blocks — or put a process boundary between any two.
 //!
-//! Two invariants hold this together:
-//!
-//! * `parse()` is implemented *only* through these functions (see
-//!   `parser.rs`), and an integration test composes them by hand and asserts
-//!   the result equals `parse()`. A step cannot be added to `parse()` without
-//!   becoming a public stage.
-//! * Every type crossing a stage boundary is `Clone + Serialize +
-//!   Deserialize`, and the serialization is lossless for everything a later
-//!   stage reads. The two exceptions are payloads that are better carried
-//!   out of band: `ExtractedImage::bytes` is skipped (key it by image id),
-//!   and `OcrRaster::pixels` is base64 so JSON stays ~1.3× the raw size.
-//!
 //! Stages split into two kinds. **pdfium-bound** stages take an open
 //! [`Document`] and must run while the [`Library`] that opened it is alive
 //! (PDFium is single-threaded behind a process-global lock, so keep these
@@ -40,8 +28,6 @@
 //!
 //! [`Document`] and [`Library`] are the `pdfium` crate's types re-exported
 //! verbatim, so that crate's handle API is part of this module's contract.
-//!
-//! Everything else in the crate that is not re-exported here is unstable.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
