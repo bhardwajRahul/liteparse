@@ -16,7 +16,9 @@
 //!   becoming a public stage.
 //! * Every type crossing a stage boundary is `Clone + Serialize +
 //!   Deserialize`, and the serialization is lossless for everything a later
-//!   stage reads.
+//!   stage reads. The two exceptions are payloads that are better carried
+//!   out of band: `ExtractedImage::bytes` is skipped (key it by image id),
+//!   and `OcrRaster::pixels` is base64 so JSON stays ~1.3× the raw size.
 //!
 //! Stages split into two kinds. **pdfium-bound** stages take an open
 //! [`Document`] and must run while the [`Library`] that opened it is alive
@@ -36,9 +38,12 @@
 //! | markdown | [`document_signals`] → [`extract_blocks`] → [`render_page_markdown`] | pure |
 //! | screenshots | [`screenshots`] | pdfium |
 //!
+//! [`Document`] and [`Library`] are the `pdfium` crate's types re-exported
+//! verbatim, so that crate's handle API is part of this module's contract.
+//!
 //! Everything else in the crate that is not re-exported here is unstable.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -176,8 +181,17 @@ impl Default for ExtractRequest<'_> {
 }
 
 /// Extract text items, graphics, structure nodes and (optionally) images
-/// from an open document. This is the only stage that reads page content
+/// from an open document. This is the only stage that reads *text* content
 /// through PDFium; everything downstream works on the returned [`Page`]s.
+///
+/// With `extract_form_fields`, extraction may flatten some pages' widget
+/// annotations into page content to recover their text. That mutates the
+/// open document: a later [`screenshots`] call with `render_form_fields` on
+/// this same document would paint those widgets twice, and an OCR raster
+/// from a reopened document must re-flatten the same pages to match. The
+/// returned `flattened_form_widgets` / `flattened_page_numbers` say what
+/// happened; [`screenshots_need_pristine_document`] and
+/// `LiteParse::ocr_render_options` turn them into the right follow-up.
 pub fn extract(
     document: &Document,
     request: &ExtractRequest<'_>,
@@ -380,7 +394,7 @@ pub fn extract_blocks(
     if !has_content {
         blocks.retain(|b| !matches!(b.block, Block::HorizontalRule));
     }
-    crate::output::markdown::dedupe_rules(&mut blocks);
+    dedupe_rules(&mut blocks);
     Some(markdown_layout::splice_soft_hyphens(blocks))
 }
 
@@ -417,7 +431,52 @@ pub fn canonicalize_image_refs(
     full_text: &mut String,
     images: &[ExtractedImage],
 ) {
-    crate::parser::rewrite_duplicate_image_refs(pages, full_text, images)
+    let by_id: HashMap<&str, &ExtractedImage> = images
+        .iter()
+        .map(|image| (image.id.as_str(), image))
+        .collect();
+    let renames: Vec<(String, String)> = images
+        .iter()
+        .filter_map(|image| {
+            let canonical = by_id.get(image.duplicate_of.as_ref()?.as_str())?;
+            Some((
+                format!("![](img_{}.{})", image.id, image.format),
+                format!("![]({})", canonical.name),
+            ))
+        })
+        .collect();
+    if renames.is_empty() {
+        return;
+    }
+
+    for markdown in pages
+        .iter_mut()
+        .map(|page| &mut page.markdown)
+        .chain(std::iter::once(full_text))
+    {
+        for (from, to) in &renames {
+            if markdown.contains(from.as_str()) {
+                *markdown = markdown.replace(from.as_str(), to);
+            }
+        }
+    }
+}
+
+/// Collapse cosmetic horizontal-rule noise on a single page's block stream:
+/// drop leading/trailing rules (which would otherwise abut the `-----` page
+/// separator) and collapse runs of consecutive rules to one. Rules come from
+/// two sources — vector-graphics detection and decorative divider text — and
+/// doubling up reads as sloppy output to a human, while carrying no extra
+/// structure for an LLM.
+fn dedupe_rules(blocks: &mut Vec<PositionedBlock>) {
+    use Block::HorizontalRule;
+    while matches!(blocks.first().map(|b| &b.block), Some(HorizontalRule)) {
+        blocks.remove(0);
+    }
+    while matches!(blocks.last().map(|b| &b.block), Some(HorizontalRule)) {
+        blocks.pop();
+    }
+    blocks.dedup_by(|a, b| matches!((&a.block, &b.block), (HorizontalRule, HorizontalRule)));
 }
 
 // ── Screenshots ────────────────────────────────────────────────────────
@@ -432,6 +491,19 @@ pub struct ScreenshotOptions {
     pub render_form_fields: bool,
     /// Skip pages that fail to render instead of failing the call.
     pub continue_on_page_error: bool,
+}
+
+/// Whether [`screenshots`] must run on a freshly opened document rather
+/// than the one [`extract`] ran on. True when extraction flattened widget
+/// annotations into page content *and* the screenshots will paint form
+/// fields through the form environment: on the mutated document the widgets
+/// would be drawn twice. Plain screenshots are unaffected, since flattening
+/// promotes the same appearance streams the renderer would paint.
+pub fn screenshots_need_pristine_document(
+    extracted: &ExtractedPages,
+    options: &ScreenshotOptions,
+) -> bool {
+    extracted.flattened_form_widgets && options.render_form_fields
 }
 
 /// Render pages to PNG. `page_numbers` is 1-based; `None` renders every
@@ -459,4 +531,197 @@ pub fn screenshots(
         rects: page.rects,
     })
     .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Anchor, ProjectedLine, Rect, TextItem};
+
+    fn line(text: &str, x: f32, y: f32, h: f32, size: f32) -> ProjectedLine {
+        ProjectedLine {
+            text: text.into(),
+            rtl: crate::bidi::is_rtl_text(text),
+            bbox: Rect {
+                x,
+                y,
+                width: text.chars().count() as f32 * (size * 0.5),
+                height: h,
+            },
+            anchor: Anchor::Left,
+            indent_x: x,
+            dominant_font_size: size,
+            font_size_is_estimated: false,
+            heading_font_size: None,
+            dominant_font_name: Some("Arial".into()),
+            all_bold: false,
+            all_italic: false,
+            all_mono: false,
+            all_strike: false,
+            spans: vec![TextItem::default()],
+            region_path: Vec::new(),
+            mcid: None,
+            in_figure: false,
+        }
+    }
+
+    fn page_with(n: usize, lines: Vec<ProjectedLine>) -> ParsedPage {
+        ParsedPage {
+            page_number: n,
+            page_label: None,
+            page_width: 612.0,
+            page_height: 792.0,
+            content_bounds: None,
+            text: "fallback".into(),
+            markdown: String::new(),
+            text_items: vec![],
+            projected_lines: lines,
+            regions: crate::types::Region::default(),
+            graphics: vec![],
+            vector_graphics: None,
+            figures: vec![],
+            projected_item_frames: vec![],
+            struct_nodes: vec![],
+            image_refs: vec![],
+            complexity: None,
+            annotations: None,
+            form_fields: None,
+            structure_tree: None,
+            blocks: None,
+        }
+    }
+
+    /// The markdown stages composed as `parse()` composes them, one string
+    /// per page.
+    fn render_pages(pages: &[ParsedPage]) -> Vec<String> {
+        let signals = document_signals(pages, false);
+        let options = BlockOptions {
+            outline: &[],
+            image_mode: ImageMode::Placeholder,
+            keep_headers_footers: false,
+        };
+        pages
+            .iter()
+            .map(|page| {
+                let blocks = extract_blocks(page, &signals, &options);
+                render_page_markdown(page, blocks.as_deref())
+            })
+            .collect()
+    }
+
+    fn render_document(pages: &[ParsedPage]) -> String {
+        render_pages(pages).join("\n\n-----\n\n")
+    }
+
+    #[test]
+    fn empty_document_renders_empty() {
+        assert_eq!(render_document(&[]), "");
+    }
+
+    #[test]
+    fn dedupe_rules_drops_edges_and_collapses_runs() {
+        use Block::{HorizontalRule, Paragraph};
+        let p = |t: &str| Paragraph {
+            text: t.into(),
+            bold: false,
+            italic: false,
+        };
+        let mut blocks: Vec<PositionedBlock> = [
+            HorizontalRule,
+            p("a"),
+            HorizontalRule,
+            HorizontalRule,
+            p("b"),
+            HorizontalRule,
+        ]
+        .into_iter()
+        .map(PositionedBlock::unlocated)
+        .collect();
+        dedupe_rules(&mut blocks);
+        let kinds: Vec<bool> = blocks
+            .iter()
+            .map(|b| matches!(b.block, Block::HorizontalRule))
+            .collect();
+        // Leading + trailing rules gone; the doubled interior run collapsed to one.
+        assert_eq!(kinds, vec![false, true, false]);
+    }
+
+    #[test]
+    fn page_without_projected_lines_falls_back_to_fenced_text() {
+        let mut p = page_with(1, vec![]);
+        p.text = "hello".into();
+        let out = render_document(&[p]);
+        assert!(out.contains("```text"));
+        assert!(out.contains("hello"));
+    }
+
+    #[test]
+    fn heading_and_paragraph() {
+        let p = page_with(
+            1,
+            vec![
+                line("My Title For This Test Document", 50.0, 50.0, 18.0, 18.0),
+                // Enough body text to dominate the char-weighted body-size
+                // mode so the title at 18pt registers as larger-than-body.
+                line("First sentence of body prose here.", 50.0, 80.0, 10.0, 10.0),
+                line(
+                    "Second sentence of body prose here.",
+                    50.0,
+                    92.0,
+                    10.0,
+                    10.0,
+                ),
+                line(
+                    "Third sentence of body prose here.",
+                    50.0,
+                    104.0,
+                    10.0,
+                    10.0,
+                ),
+            ],
+        );
+        let out = render_document(&[p]);
+        assert!(out.contains("# My Title For This Test Document"));
+        assert!(out.contains("First sentence of body prose here."));
+    }
+
+    #[test]
+    fn per_page_markdown_joins_with_separator() {
+        let a = page_with(1, vec![line("A page.", 50.0, 80.0, 10.0, 10.0)]);
+        let b = page_with(2, vec![line("B page.", 50.0, 80.0, 10.0, 10.0)]);
+        let pages = [a, b];
+        let per_page = render_pages(&pages);
+        assert_eq!(per_page.len(), 2);
+        assert!(per_page[0].contains("A page."));
+        assert!(per_page[1].contains("B page."));
+        // The per-page strings carry no separator on their own.
+        assert!(!per_page[0].contains("-----"));
+        let out = render_document(&pages);
+        assert!(out.contains("-----"));
+        assert!(out.find("A page.").unwrap() < out.find("B page.").unwrap());
+    }
+
+    #[test]
+    fn canonicalize_image_refs_points_duplicates_at_canonical_file() {
+        let image = |id: &str, dup: Option<&str>| ExtractedImage {
+            id: id.into(),
+            name: format!("img_{id}.jpg"),
+            page: 1,
+            bbox: Rect::default(),
+            width: 1,
+            height: 1,
+            rotation: 0.0,
+            format: "jpg".into(),
+            path: None,
+            duplicate_of: dup.map(Into::into),
+            bytes: Arc::new(Vec::new()),
+        };
+        let mut pages = vec![page_with(1, vec![])];
+        pages[0].markdown = "intro\n\n![](img_p2_1.jpg)\n\noutro".into();
+        let mut full_text = pages[0].markdown.clone();
+        let images = vec![image("p1_1", None), image("p2_1", Some("p1_1"))];
+        canonicalize_image_refs(&mut pages, &mut full_text, &images);
+        assert_eq!(pages[0].markdown, "intro\n\n![](img_p1_1.jpg)\n\noutro");
+        assert_eq!(full_text, pages[0].markdown);
+    }
 }

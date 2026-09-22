@@ -59,7 +59,6 @@ pub struct DocumentMetadata {
 /// Represents a single text item extracted from a PDF page,
 /// including its content, position, size, rotation, and font metadata.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
 pub struct TextItem {
     pub text: String,
     /// Viewport-space coordinates (top-left origin, 72 DPI).
@@ -72,56 +71,56 @@ pub struct TextItem {
     pub font_name: Option<String>,
     pub font_size: Option<f32>,
     /// Font size * scale_y from the text matrix — accounts for CTM scaling.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_height: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_ascent: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_descent: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_weight: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_flags: Option<i32>,
     /// Sum of glyph widths (using charcode-based lookup when possible).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_width: Option<f32>,
     /// Whether the font has buggy encoding (private-use codepoints, TT subset, etc.)
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub font_is_buggy: bool,
     /// Whether most characters in this item could not be mapped to Unicode
     /// (e.g. a Type3 font with no ToUnicode map). The text content is
     /// PDFium's char-code fallback and does not reflect the rendered glyphs.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub has_unicode_map_error: bool,
     /// Marked content ID from the PDF structure tree.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcid: Option<i32>,
     /// Fill color as ARGB hex string (e.g. "ff000000").
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill_color: Option<String>,
     /// Stroke color as ARGB hex string.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stroke_color: Option<String>,
     /// Raw character codes from the PDF content stream. These correspond to
     /// source glyphs rather than Unicode scalar values, so ligature expansion
     /// can produce more text characters than entries in this array.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub char_codes: Vec<u32>,
     /// Whether the trailing source space was synthesized by PDFium rather than
     /// represented by a real space glyph in the PDF content stream.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trailing_space_generated: bool,
     /// OCR confidence score (0.0–1.0). None for native PDF text.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f32>,
     /// Target URI when this item falls inside a hyperlink annotation's
     /// rectangle. Populated in `extract.rs`; consumed by the markdown emitter.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
     /// Whether a thin horizontal stroke/rect crosses this item's vertical middle
     /// band (a strikethrough line). Populated in `extract.rs`; consumed by the
     /// markdown emitter to wrap the text in `~~…~~`.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub strike: bool,
     /// Per-word sub-boxes within this item, split on the inter-word spaces seen
     /// during segment building. A segment groups several words together (it only
@@ -131,7 +130,7 @@ pub struct TextItem {
     /// use only — the public JSON output (`output/json.rs`) builds its own
     /// item view without it, but it is marshalled across the napi boundary
     /// and must survive a stage boundary (see `stages`), so it serializes.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub words: Vec<WordBox>,
 }
 

@@ -215,7 +215,8 @@ async fn compose(parser: &LiteParse, input: PdfInput) -> ParseResult {
     let producer = document.meta_text("Producer").filter(|v| !v.is_empty());
     let doc_meta = want_doc_meta.then(|| {
         if repaired.is_some() {
-            let source = stages::open(&lib, &input, password, &[]).unwrap();
+            let source =
+                stages::open(&lib, &input, password, &config.page_orientation_corrections).unwrap();
             return stages::document_metadata(&input, &source);
         }
         stages::document_metadata(&input, &document)
@@ -229,49 +230,65 @@ async fn compose(parser: &LiteParse, input: PdfInput) -> ParseResult {
         &parser.extract_request(target_pages.as_deref(), config.max_pages),
     )
     .unwrap();
-    let stages::ExtractedPages {
-        pages,
-        page_errors,
-        mut images,
-        image_error_count,
-        flattened_form_widgets,
-        flattened_page_numbers,
-    } = extracted;
+    let ocr_render_options = parser.ocr_render_options(grayscale, &extracted);
+    let screenshot_options = parser.screenshot_options(config.continue_on_page_error);
+    // Extraction may have flattened form widgets into the open document;
+    // screenshots that paint form fields need a document it did not touch.
+    let pristine = (config.extract_screenshots
+        && stages::screenshots_need_pristine_document(&extracted, &screenshot_options))
+    .then(|| {
+        stages::open(
+            &lib,
+            document_input,
+            password,
+            &config.page_orientation_corrections,
+        )
+        .unwrap()
+    });
+    let analysis_document = pristine.as_ref().unwrap_or(&document);
     let complexity: Vec<stages::PageComplexityStats> = if config.include_complexity {
-        pages
+        extracted
+            .pages
             .iter()
-            .map(|page| stages::page_complexity(&document, page).unwrap())
+            .map(|page| stages::page_complexity(analysis_document, page).unwrap())
             .collect()
     } else {
         Vec::new()
     };
     let screenshots = if config.extract_screenshots {
-        let page_numbers: Vec<u32> = pages.iter().map(|p| p.page_number as u32).collect();
-        stages::screenshots(
-            &document,
-            Some(&page_numbers),
-            &stages::ScreenshotOptions {
-                dpi: config.dpi,
-                detect_rects: config.detect_screenshot_rects,
-                render_form_fields: config.render_form_fields,
-                continue_on_page_error: config.continue_on_page_error,
-            },
-        )
-        .unwrap()
+        let page_numbers: Vec<u32> = extracted
+            .pages
+            .iter()
+            .map(|p| p.page_number as u32)
+            .collect();
+        stages::screenshots(analysis_document, Some(&page_numbers), &screenshot_options).unwrap()
     } else {
         Vec::new()
     };
+    drop(pristine);
     drop(document);
     drop(lib);
 
-    // Boundary 1: the extracted page set crosses a (simulated) process
-    // boundary before OCR.
-    let mut pages: Vec<Page> = round_trip(pages, "Vec<Page> after extract");
+    // Boundary 1: the whole extraction result crosses a (simulated) process
+    // boundary before OCR. Image payloads are the documented exception (they
+    // travel out of band, keyed by id), so they are carried across by hand.
+    let image_bytes: Vec<_> = extracted.images.iter().map(|i| i.bytes.clone()).collect();
+    let extracted = round_trip(extracted, "ExtractedPages after extract");
+    let stages::ExtractedPages {
+        pages,
+        page_errors,
+        mut images,
+        image_error_count,
+        ..
+    } = extracted;
+    for (image, bytes) in images.iter_mut().zip(image_bytes) {
+        image.bytes = bytes;
+    }
+    let mut pages: Vec<Page> = pages;
 
     // ── OCR: render rounds (pdfium) → recognize (async) → merge (pure)
     if let Some(engine) = engine {
-        let options =
-            parser.ocr_render_options(grayscale, flattened_form_widgets, &flattened_page_numbers);
+        let options = ocr_render_options;
         let ocr_input = repaired.as_ref().unwrap_or(&input);
         let mut start = 0;
         while start < pages.len() {
@@ -329,11 +346,7 @@ async fn compose(parser: &LiteParse, input: PdfInput) -> ParseResult {
         assert_eq!(back.heading_map, signals.heading_map);
         assert_eq!(back.header_footer, signals.header_footer);
         let signals = back;
-        let options = stages::BlockOptions {
-            outline: &outline,
-            image_mode: config.image_mode,
-            keep_headers_footers: config.keep_headers_footers,
-        };
+        let options = parser.block_options(&outline);
         for page in parsed.iter_mut() {
             let blocks = stages::extract_blocks(page, &signals, &options);
             let blocks = blocks.map(|b| round_trip(b, "Vec<PositionedBlock>"));
@@ -573,6 +586,87 @@ async fn parse_equals_composed_stages_with_form_fields() {
         ..LiteParseConfig::default()
     };
     assert_parse_equals_composition(config, &fixture("filled_acroform.pdf"), true).await;
+}
+
+/// Form fields plus screenshots that paint form fields: the one combination
+/// where `parse()` reopens a pristine document after extraction flattened
+/// widgets, so the composed pipeline must do the same.
+#[tokio::test]
+#[serial]
+async fn parse_equals_composed_stages_with_form_fields_and_rendered_screenshots() {
+    let config = LiteParseConfig {
+        ocr_enabled: false,
+        quiet: true,
+        output_format: OutputFormat::Markdown,
+        extract_form_fields: true,
+        extract_screenshots: true,
+        render_form_fields: true,
+        include_complexity: true,
+        ..LiteParseConfig::default()
+    };
+    let result =
+        assert_parse_equals_composition(config, &fixture("filled_acroform.pdf"), false).await;
+    assert!(
+        !result.screenshots.is_empty(),
+        "fixture should produce screenshots"
+    );
+}
+
+/// An explicit OCR page selection bypasses the complexity gate: a text-dense
+/// page that scoring would never send to OCR is rastered anyway, and pages
+/// outside the selection are skipped.
+#[tokio::test]
+#[serial]
+async fn render_for_ocr_selection_overrides_complexity_gate() {
+    let parser = LiteParse::new(everything_config());
+    let lib = Library::init();
+    let document = stages::open(&lib, &PdfInput::Path(fixture("sample.pdf")), None, &[]).unwrap();
+    let pages = stages::extract(&document, &parser.extract_request(None, usize::MAX))
+        .unwrap()
+        .pages;
+    let first = pages[0].page_number as u32;
+    let gated = stages::render_for_ocr(&document, &pages, 0, &stages::OcrRenderOptions::default())
+        .unwrap()
+        .0;
+    assert!(
+        gated.iter().all(|r| r.page_number as u32 != first),
+        "sample.pdf page 1 has native text and should not be rastered by the scoring gate"
+    );
+    let options = stages::OcrRenderOptions {
+        selection: Some([first].into_iter().collect()),
+        ..stages::OcrRenderOptions::default()
+    };
+    let (rasters, next) = stages::render_for_ocr(&document, &pages, 0, &options).unwrap();
+    assert_eq!(next, pages.len());
+    assert_eq!(rasters.len(), 1);
+    assert_eq!(rasters[0].page_number as u32, first);
+    assert!(rasters[0].has_native_text);
+    assert!(rasters[0].width > 0 && rasters[0].height > 0);
+    // The raster's pixels survive the boundary as base64, not a number array.
+    let json = serde_json::to_value(&rasters[0]).unwrap();
+    assert!(json["pixels"].is_string());
+}
+
+/// A hand-built outcome for a page that is not being merged is an error,
+/// not a panic.
+#[test]
+fn merge_ocr_rejects_outcome_for_unknown_page() {
+    let mut pages: Vec<Page> = Vec::new();
+    let outcome = stages::PageOcrOutcome {
+        page_number: 7,
+        dpi: 150.0,
+        has_native_text: false,
+        image_rects: Vec::new(),
+        results: vec![OcrResult {
+            text: "x".into(),
+            bbox: [0.0, 0.0, 10.0, 10.0],
+            confidence: 1.0,
+            polygon: None,
+        }],
+        error: None,
+    };
+    let err = stages::merge_ocr(&mut pages, vec![outcome], false).unwrap_err();
+    assert!(err.to_string().contains("page 7"), "{err}");
 }
 
 /// Sanity check on the round-trip helper itself: a page with every optional

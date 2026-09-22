@@ -68,7 +68,7 @@ pub struct ParseResult {
 }
 
 /// Result of rendering a single page screenshot.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScreenshotResult {
     pub page_num: u32,
     pub width: u32,
@@ -101,7 +101,7 @@ fn write_extracted_images(
     // pipeline is built around): only the canonical file is written; every
     // duplicate placement keeps its own `name` but points `path` at the
     // canonical file. Markdown figure references are rewritten to the
-    // canonical name (`rewrite_duplicate_image_refs`) so they only ever
+    // canonical name (`stages::canonicalize_image_refs`) so they only ever
     // reference files that exist.
     let mut written: HashMap<String, String> = HashMap::new();
     for image in images {
@@ -119,51 +119,6 @@ fn write_extracted_images(
         written.insert(image.id.clone(), path);
     }
     Ok(())
-}
-
-/// Rewrite markdown figure references for deduplicated images to the
-/// canonical entry's file name. The markdown emitter references each figure
-/// by its own placement id (`![](img_p2_1.jpg)`), but only the canonical
-/// file is written to disk (see `write_extracted_images`), so duplicate
-/// placements must reference the canonical name, matching the resolution the
-/// LlamaParse worker applies via `resolveOutputImageName`. Public as
-/// [`stages::canonicalize_image_refs`].
-pub(crate) fn rewrite_duplicate_image_refs(
-    pages: &mut [ParsedPage],
-    full_text: &mut String,
-    images: &[ExtractedImage],
-) {
-    use std::collections::HashMap;
-
-    let by_id: HashMap<&str, &ExtractedImage> = images
-        .iter()
-        .map(|image| (image.id.as_str(), image))
-        .collect();
-    let renames: Vec<(String, String)> = images
-        .iter()
-        .filter_map(|image| {
-            let canonical = by_id.get(image.duplicate_of.as_ref()?.as_str())?;
-            Some((
-                format!("![](img_{}.{})", image.id, image.format),
-                format!("![]({})", canonical.name),
-            ))
-        })
-        .collect();
-    if renames.is_empty() {
-        return;
-    }
-
-    for markdown in pages
-        .iter_mut()
-        .map(|page| &mut page.markdown)
-        .chain(std::iter::once(full_text))
-    {
-        for (from, to) in &renames {
-            if markdown.contains(from.as_str()) {
-                *markdown = markdown.replace(from.as_str(), to);
-            }
-        }
-    }
 }
 
 /// Build the default glyph resolver from the environment, if configured.
@@ -246,20 +201,17 @@ pub struct LiteParse {
 /// consumers share a single pass rather than each triggering their own. Returns
 /// the joined document markdown when that is the output format.
 fn apply_layout(
-    config: &crate::config::LiteParseConfig,
+    parser: &LiteParse,
     parsed_pages: &mut [ParsedPage],
     outline: &[OutlineTarget],
 ) -> Option<String> {
+    let config = &parser.config;
     let wants_markdown = config.output_format == crate::config::OutputFormat::Markdown;
     if !wants_markdown && !config.extract_blocks {
         return None;
     }
     let signals = stages::document_signals(parsed_pages, config.keep_headers_footers);
-    let block_options = stages::BlockOptions {
-        outline,
-        image_mode: config.image_mode,
-        keep_headers_footers: config.keep_headers_footers,
-    };
+    let block_options = parser.block_options(outline);
     let mut page_md = Vec::with_capacity(parsed_pages.len());
     for page in parsed_pages.iter_mut() {
         let blocks = stages::extract_blocks(page, &signals, &block_options);
@@ -384,7 +336,8 @@ impl LiteParse {
         }
     }
 
-    /// The OCR render stage's options for a full parse, derived from config.
+    /// The OCR render stage's options for a full parse, derived from config
+    /// and from what extraction did to the document.
     ///
     /// Extraction may have flattened SOME pages' form widgets into page
     /// content in its (since dropped) document instance; those pages are
@@ -394,11 +347,11 @@ impl LiteParse {
     pub fn ocr_render_options(
         &self,
         grayscale: bool,
-        flattened_form_widgets: bool,
-        flattened_page_numbers: &[u32],
+        extracted: &stages::ExtractedPages,
     ) -> stages::OcrRenderOptions {
-        let reflatten_pages = if flattened_form_widgets && !self.config.render_form_fields {
-            flattened_page_numbers.iter().copied().collect()
+        let reflatten_pages = if extracted.flattened_form_widgets && !self.config.render_form_fields
+        {
+            extracted.flattened_page_numbers.iter().copied().collect()
         } else {
             std::collections::HashSet::new()
         };
@@ -411,6 +364,26 @@ impl LiteParse {
             continue_on_page_error: self.config.continue_on_page_error,
             reflatten_pages,
             selection: None,
+        }
+    }
+
+    /// The screenshot stage's options, derived from config. `parse()` passes
+    /// `config.continue_on_page_error`; `screenshot()` is always fail-fast.
+    pub fn screenshot_options(&self, continue_on_page_error: bool) -> stages::ScreenshotOptions {
+        stages::ScreenshotOptions {
+            dpi: self.config.dpi,
+            detect_rects: self.config.detect_screenshot_rects,
+            render_form_fields: self.config.render_form_fields,
+            continue_on_page_error,
+        }
+    }
+
+    /// The block-classification stage's options, derived from config.
+    pub fn block_options<'a>(&self, outline: &'a [OutlineTarget]) -> stages::BlockOptions<'a> {
+        stages::BlockOptions {
+            outline,
+            image_mode: self.config.image_mode,
+            keep_headers_footers: self.config.keep_headers_footers,
         }
     }
 
@@ -686,8 +659,7 @@ impl LiteParse {
             producer,
             doc_meta,
             xfa_packets,
-            flattened_form_widgets,
-            flattened_page_numbers,
+            ocr_render_options,
             repaired_input,
         ) = {
             let lib = Library::init();
@@ -733,14 +705,10 @@ impl LiteParse {
             let outline = outline.unwrap_or_else(|| stages::outline(&document));
             let extracted =
                 stages::extract(&document, &self.extract_request(target_pages, max_pages))?;
-            let stages::ExtractedPages {
-                pages,
-                page_errors,
-                images,
-                image_error_count,
-                flattened_form_widgets,
-                flattened_page_numbers,
-            } = extracted;
+            // Derived here, before the document is dropped, so the OCR rounds
+            // below reproduce exactly what extraction did to it.
+            let ocr_render_options = self.ocr_render_options(ocr_grayscale, &extracted);
+            let screenshot_options = self.screenshot_options(self.config.continue_on_page_error);
             // Reopening the input costs a full parse, so it is confined to the
             // one consumer that genuinely needs live widget annotations: the
             // opt-in form renderer, which initializes the form environment to
@@ -753,13 +721,19 @@ impl LiteParse {
             // flattened document by design (see `is_complex`). OCR rasters
             // render in bounded rounds after this section, each against a
             // freshly reopened (hence pristine) document.
-            let needs_pristine_document = flattened_form_widgets
-                && self.config.extract_screenshots
-                && self.config.render_form_fields;
+            let needs_pristine_document = self.config.extract_screenshots
+                && stages::screenshots_need_pristine_document(&extracted, &screenshot_options);
             let pristine_document = needs_pristine_document
                 .then(|| self.open_document(&lib, document_input, password))
                 .transpose()?;
             let analysis_document = pristine_document.as_ref().unwrap_or(&document);
+            let stages::ExtractedPages {
+                pages,
+                page_errors,
+                images,
+                image_error_count,
+                ..
+            } = extracted;
             let t_extract = web_time::Instant::now();
             log(&format!(
                 "[liteparse] extract: {:.1}ms ({} pages)",
@@ -790,16 +764,7 @@ impl LiteParse {
                     .iter()
                     .map(|page| page.page_number as u32)
                     .collect::<Vec<_>>();
-                stages::screenshots(
-                    analysis_document,
-                    Some(&page_numbers),
-                    &stages::ScreenshotOptions {
-                        dpi: self.config.dpi,
-                        detect_rects: self.config.detect_screenshot_rects,
-                        render_form_fields: self.config.render_form_fields,
-                        continue_on_page_error: self.config.continue_on_page_error,
-                    },
-                )?
+                stages::screenshots(analysis_document, Some(&page_numbers), &screenshot_options)?
             } else {
                 Vec::new()
             };
@@ -820,8 +785,7 @@ impl LiteParse {
                 producer,
                 doc_meta,
                 xfa_packets,
-                flattened_form_widgets,
-                flattened_page_numbers,
+                ocr_render_options,
                 repaired_input,
             )
         };
@@ -829,11 +793,7 @@ impl LiteParse {
         let t1 = web_time::Instant::now();
 
         if let Some(engine) = ocr_engine {
-            let render_options = self.ocr_render_options(
-                ocr_grayscale,
-                flattened_form_widgets,
-                &flattened_page_numbers,
-            );
+            let render_options = ocr_render_options;
             let ocr_input = repaired_input.as_ref().unwrap_or(validated_input);
             let mut round_start = 0usize;
             while round_start < pages.len() {
@@ -895,7 +855,7 @@ impl LiteParse {
             t2.duration_since(t_ocr).as_secs_f64() * 1000.0
         ));
 
-        let laid_out = apply_layout(&self.config, &mut parsed_pages, &outline);
+        let laid_out = apply_layout(self, &mut parsed_pages, &outline);
         let mut full_text = if let Some(md) = laid_out {
             let t3 = web_time::Instant::now();
             log(&format!(
@@ -953,7 +913,7 @@ impl LiteParse {
         let total_pages = pages.len().min(u32::MAX as usize) as u32;
         let mut parsed_pages = stages::project(pages);
 
-        let full_text = if let Some(md) = apply_layout(&self.config, &mut parsed_pages, &outline) {
+        let full_text = if let Some(md) = apply_layout(self, &mut parsed_pages, &outline) {
             md
         } else {
             parsed_pages
@@ -1137,12 +1097,7 @@ impl LiteParse {
         stages::screenshots(
             &document,
             page_numbers.as_deref(),
-            &stages::ScreenshotOptions {
-                dpi: self.config.dpi,
-                detect_rects: self.config.detect_screenshot_rects,
-                render_form_fields: self.config.render_form_fields,
-                continue_on_page_error: false,
-            },
+            &self.screenshot_options(false),
         )
     }
 
@@ -1524,7 +1479,7 @@ mod tests {
             image("p2_1", "jpg", Some("p1_1")),
         ];
 
-        rewrite_duplicate_image_refs(&mut pages, &mut full_text, &images);
+        stages::canonicalize_image_refs(&mut pages, &mut full_text, &images);
 
         // The duplicate's ref now points at the canonical file; canonical
         // refs and surrounding text are untouched.
