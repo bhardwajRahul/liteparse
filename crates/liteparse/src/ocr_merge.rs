@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use crate::error::LiteParseError;
 use crate::ocr::{OcrEngine, OcrOptions, OcrResult};
-use crate::types::{CutAxis, Page, ParsedPage, Region, RegionKind, TextItem};
+use crate::types::{CutAxis, Page, ParsedPage, Rect, Region, RegionKind, TextItem};
 use pdfium::{Document, ImageBounds};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Minimum dark filled-path area (pt², ~72 DPI page space) not covered by
 /// native text before a page is sent to OCR. 400 pt² is roughly one word at
@@ -37,14 +37,25 @@ const MIN_COLUMN_ITEM_FRACTION: f32 = 0.15;
 /// `DenseGraphics`.
 const DENSE_GRAPHICS_MIN_COVERAGE: f32 = 0.2;
 
-/// Owned page bitmap prepared for OCR. Indices refer to positions in the `pages` slice.
-pub(crate) struct RenderedPage {
-    pub idx: usize,
-    /// Tightly-packed pixels: 1 byte/px (grayscale) or 3 (RGB).
+/// Owned page bitmap prepared for OCR, plus the page facts the merge needs
+/// to judge the engine's output. Produced by [`render_pages_for_ocr`],
+/// consumed by [`recognize_rasters`]; the non-pixel facts are carried into
+/// the [`PageOcrOutcome`] so [`merge_ocr_results`] never needs the raster or
+/// the document again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrRaster {
+    /// 1-based source page number. Outcomes are matched back to pages by
+    /// this number, so a raster can be merged into any page slice that
+    /// contains its page.
+    pub page_number: usize,
+    /// Tightly-packed pixels: 1 byte/px (grayscale) or 3 (RGB). Serialized
+    /// as a base64 string, since a JSON array of numbers is ~3.5× the size.
+    #[serde(with = "base64_bytes")]
     pub pixels: Vec<u8>,
     pub width: u32,
     pub height: u32,
-    /// DPI this page was actually rendered at.
+    /// DPI this page was actually rendered at (the long-edge cap can lower it
+    /// below the requested DPI). Pixel → point scale is `72 / dpi`.
     pub dpi: f32,
     /// The page has real native text (it was not sent to OCR as scanned,
     /// blank, or garbled). OCR is then an enrichment pass over native text,
@@ -53,13 +64,72 @@ pub(crate) struct RenderedPage {
     /// Embedded raster figure rects (viewport pt, excluding full-page
     /// backgrounds), so the merge can judge each figure's OCR output as a
     /// group — a chart's axis/legend labels are dropped together.
-    pub image_rects: Vec<ImageBounds>,
+    pub image_rects: Vec<Rect>,
+}
+
+/// How [`render_pages_for_ocr`] picks and rasterizes pages.
+///
+/// `Default` renders every page that needs OCR at
+/// [`DEFAULT_DPI`](crate::config::DEFAULT_DPI) in RGB, in one round, with
+/// no form rendering or re-flattening.
+#[derive(Debug, Clone)]
+pub struct OcrRenderOptions {
+    /// Stop after this many rasters (`0` = no limit), so a long document can
+    /// be processed in bounded rounds; the function returns where to resume.
+    pub max_rasters: usize,
+    /// Requested render resolution; clamped per page by the long-edge cap.
+    pub dpi: f32,
+    /// Emit 1 byte/px luma instead of RGB (see `OcrEngine::prefers_grayscale`).
+    pub grayscale: bool,
+    /// Paint form-field appearances into the raster (runs document actions).
+    pub render_form_fields: bool,
+    /// Keep going when one page fails to render (it keeps its native text).
+    pub continue_on_page_error: bool,
+    /// Pages extraction flattened widget annotations on, which must be
+    /// flattened again on this (reopened) document so the raster shows what
+    /// extraction saw. See `ExtractedPages::flattened_page_numbers`.
+    pub reflatten_pages: HashSet<u32>,
+    /// Explicit 1-based page selection. `None` lets the page-complexity
+    /// scoring decide which pages need OCR (the default parse behaviour);
+    /// `Some` renders exactly these pages, whatever the scoring says, so a
+    /// caller with its own routing can override it.
+    pub selection: Option<HashSet<u32>>,
+}
+
+impl Default for OcrRenderOptions {
+    fn default() -> Self {
+        Self {
+            max_rasters: 0,
+            dpi: crate::config::DEFAULT_DPI,
+            grayscale: false,
+            render_form_fields: false,
+            continue_on_page_error: false,
+            reflatten_pages: HashSet::new(),
+            selection: None,
+        }
+    }
+}
+
+/// Base64 (de)serialization for raster pixel buffers.
+mod base64_bytes {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        STANDARD.decode(encoded).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Why a page was flagged as needing more than the cheap text-only path.
 /// Multiple reasons can apply to one page (e.g. a sparse page whose little
 /// text is also garbled). Empty exactly when `needs_ocr` is false.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ComplexityReason {
     /// A single raster covers essentially the whole page and there is little or
@@ -104,7 +174,7 @@ impl ComplexityReason {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PageComplexityStats {
     pub page_number: usize,
     pub text_length: usize,
@@ -216,7 +286,7 @@ pub(crate) fn calculate_page_complexity(
     let is_garbled = page_is_garbled(page);
 
     let mut reasons = Vec::new();
-    if text_length < 20 {
+    if text_length < MIN_NATIVE_TEXT_LEN {
         // Too little text to be the page's content. A full-page raster behind
         // it means a scan; otherwise it's effectively blank.
         reasons.push(if full_page_image {
@@ -364,7 +434,7 @@ pub fn calculate_native_page_complexity(
     let is_garbled = page_is_garbled(page);
 
     let mut reasons = Vec::new();
-    if text_length < 20 {
+    if text_length < MIN_NATIVE_TEXT_LEN {
         reasons.push(if full_page_image {
             ComplexityReason::Scanned
         } else {
@@ -438,7 +508,7 @@ pub fn calculate_native_page_complexity(
 /// that the text-only path may mangle reading order or structure, so a caller
 /// can route the page to a higher-accuracy pipeline. Same leniency contract
 /// as `ComplexityReason`: new variants will be added, treat unknowns kindly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LayoutComplexityReason {
     /// The XY-cut layout tree splits the page into two or more side-by-side
@@ -464,7 +534,7 @@ impl LayoutComplexityReason {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutComplexityStats {
     /// Side-by-side text columns found by the XY-cut layout pass (1 = single
     /// column). Only subtrees holding a substantial share of the page's text
@@ -587,31 +657,39 @@ fn count_columns(region: &Region, total_items: usize) -> usize {
     }
 }
 
-/// Render pages that need OCR from an already-open document.
-///
-/// The pdfium `Document` holds raw pointers that are not `Send`, so callers must
-/// drop it before awaiting the OCR engine.
-///
 /// Cap on the rendered long edge (in pixels) for OCR page rasters
 /// to avoid excessive memory usage.
 pub(crate) const MAX_OCR_RENDER_LONG_EDGE_PX: f32 = 4096.0;
 
-/// Render the pages in `pages[start..]` that need OCR, stopping once
-/// `max_rasters` of them have been rendered (`0` means no limit). Returns the
-/// rasters plus the index to resume scanning from, so a caller can process a
-/// long document in bounded rounds.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn render_pages_for_ocr(
+/// Render the pages in `pages[start..]` that need OCR from an already-open
+/// document, stopping once `options.max_rasters` of them have been rendered.
+/// Returns the rasters plus the index to resume scanning from, so a caller
+/// can process a long document in bounded rounds.
+///
+/// The pdfium `Document` holds raw pointers that are not `Send`, so callers
+/// must drop it before awaiting the OCR engine.
+pub fn render_pages_for_ocr(
     document: &Document,
     pages: &[Page],
     start: usize,
-    max_rasters: usize,
-    dpi: f32,
-    grayscale: bool,
-    render_form_fields: bool,
-    continue_on_page_error: bool,
-    flatten_page_numbers: &std::collections::HashSet<u32>,
-) -> Result<(Vec<RenderedPage>, usize), LiteParseError> {
+    options: &OcrRenderOptions,
+) -> Result<(Vec<OcrRaster>, usize), LiteParseError> {
+    let OcrRenderOptions {
+        max_rasters,
+        dpi,
+        grayscale,
+        render_form_fields,
+        continue_on_page_error,
+        reflatten_pages: flatten_page_numbers,
+        selection,
+    } = options;
+    let (max_rasters, dpi, grayscale, render_form_fields, continue_on_page_error) = (
+        *max_rasters,
+        *dpi,
+        *grayscale,
+        *render_form_fields,
+        *continue_on_page_error,
+    );
     let mut rendered = Vec::new();
     // With `render_form_fields`, draw form-field appearances into the OCR
     // raster so filled-in form values are visible to the OCR engine (matches
@@ -625,7 +703,12 @@ pub(crate) fn render_pages_for_ocr(
     }
     let mut next_start = pages.len();
     for (idx, page) in pages.iter().enumerate().skip(start) {
-        let page_render = (|| -> Result<Option<RenderedPage>, LiteParseError> {
+        if let Some(selection) = selection
+            && !selection.contains(&(page.page_number as u32))
+        {
+            continue;
+        }
+        let page_render = (|| -> Result<Option<OcrRaster>, LiteParseError> {
             let page_index = (page.page_number - 1) as i32;
             // Text extraction may have flattened THIS page's widget
             // annotations into page content. When the caller hands us a
@@ -642,11 +725,32 @@ pub(crate) fn render_pages_for_ocr(
             } else {
                 document.page(page_index)?
             };
-            let page_complexity = calculate_page_complexity(page, &page_obj)?;
-
-            if !page_complexity.needs_ocr {
-                return Ok(None);
-            }
+            // `has_native_text` drives the merge's artifact filters: true
+            // when the page was not sent to OCR as scanned, blank, garbled or
+            // annotation-only. With an explicit selection the OCR gate is the
+            // caller's decision, so the page-object walk in
+            // `calculate_page_complexity` is skipped and the signal is derived
+            // from the text items alone (which is all those reasons read).
+            let has_native_text = match selection {
+                Some(_) => {
+                    native_text_length(page) >= MIN_NATIVE_TEXT_LEN && !page_is_garbled(page)
+                }
+                None => {
+                    let page_complexity = calculate_page_complexity(page, &page_obj)?;
+                    if !page_complexity.needs_ocr {
+                        return Ok(None);
+                    }
+                    !page_complexity.reasons.iter().any(|r| {
+                        matches!(
+                            r,
+                            ComplexityReason::Scanned
+                                | ComplexityReason::NoText
+                                | ComplexityReason::Garbled
+                                | ComplexityReason::AnnotationText
+                        )
+                    })
+                }
+            };
 
             // Clamp the render DPI so the long edge stays within the raster budget.
             let long_edge_pt = page.page_width.max(page.page_height);
@@ -668,15 +772,6 @@ pub(crate) fn render_pages_for_ocr(
                 bitmap.to_rgb()
             };
 
-            let has_native_text = !page_complexity.reasons.iter().any(|r| {
-                matches!(
-                    r,
-                    ComplexityReason::Scanned
-                        | ComplexityReason::NoText
-                        | ComplexityReason::Garbled
-                        | ComplexityReason::AnnotationText
-                )
-            });
             let image_rects = if has_native_text {
                 let pw = page.page_width;
                 let ph = page.page_height;
@@ -687,13 +782,19 @@ pub(crate) fn render_pages_for_ocr(
                         !(b.width > pw * MAX_IMAGE_PAGE_COVERAGE
                             && b.height > ph * MAX_IMAGE_PAGE_COVERAGE)
                     })
+                    .map(|b| Rect {
+                        x: b.x,
+                        y: b.y,
+                        width: b.width,
+                        height: b.height,
+                    })
                     .collect()
             } else {
                 Vec::new()
             };
 
-            Ok(Some(RenderedPage {
-                idx,
+            Ok(Some(OcrRaster {
+                page_number: page.page_number,
                 pixels,
                 width,
                 height,
@@ -723,27 +824,52 @@ pub(crate) fn render_pages_for_ocr(
     Ok((rendered, next_start))
 }
 
-/// Run OCR on pre-rendered page bitmaps and merge results into `pages`.
-pub(crate) async fn ocr_and_merge_rendered(
-    pages: &mut [Page],
-    rendered: Vec<RenderedPage>,
+/// One page's recognition outcome: what the engine returned for one
+/// [`OcrRaster`], plus the raster's page facts so the merge is a pure
+/// function of `(pages, outcomes)`. The pixels are gone — this is the small
+/// payload that crosses a stage boundary, not the bitmap.
+///
+/// `error` is set when the engine failed on this page (`results` is then
+/// empty); the merge counts failures to tell a systemic engine problem from
+/// a flaky page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageOcrOutcome {
+    /// 1-based source page number the raster came from.
+    pub page_number: usize,
+    /// DPI the raster was rendered at; pixel → point scale is `72 / dpi`.
+    pub dpi: f32,
+    pub has_native_text: bool,
+    pub image_rects: Vec<Rect>,
+    /// Engine output in raster pixel coordinates. Empty when the engine
+    /// failed (see `error`) or found nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub results: Vec<OcrResult>,
+    /// The engine's error message when recognition failed on this page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Run `ocr_engine` over pre-rendered page bitmaps, at most `num_workers`
+/// pages at a time, returning one outcome per raster in the order given.
+/// Pure recognition: nothing is merged, and a failed page is reported as an
+/// `Err` outcome rather than aborting the batch.
+pub async fn recognize_rasters(
+    rendered: Vec<OcrRaster>,
     ocr_engine: Arc<dyn OcrEngine>,
     ocr_language: &str,
     num_workers: usize,
-    ocr_failure_fatal: bool,
-) -> Result<(), LiteParseError> {
+) -> Vec<PageOcrOutcome> {
     type OcrTaskResult = Result<Vec<OcrResult>, Box<dyn std::error::Error + Send + Sync>>;
 
     // Browser WASM uses the JavaScript event loop. It has no Tokio runtime or
     // blocking thread pool. Run each JavaScript OCR callback directly so the
     // returned Promise can make progress on the browser event loop.
     #[cfg(target_arch = "wasm32")]
-    let task_results: Vec<(usize, usize, f32, (bool, Vec<ImageBounds>), OcrTaskResult)> = {
+    let task_results: Vec<(usize, f32, (bool, Vec<Rect>), OcrTaskResult)> = {
         let _ = num_workers;
         let mut results = Vec::with_capacity(rendered.len());
         for r in rendered {
-            let idx = r.idx;
-            let page_number = pages[idx].page_number;
+            let page_number = r.page_number;
             let page_dpi = r.dpi;
             let native = (r.has_native_text, r.image_rects.clone());
             let options = OcrOptions {
@@ -753,7 +879,7 @@ pub(crate) async fn ocr_and_merge_rendered(
             let result = ocr_engine
                 .recognize(&r.pixels, r.width, r.height, &options)
                 .await;
-            results.push((idx, page_number, page_dpi, native, result));
+            results.push((page_number, page_dpi, native, result));
         }
         results
     };
@@ -772,7 +898,7 @@ pub(crate) async fn ocr_and_merge_rendered(
     // pass deadlocks. Acquiring the permit asynchronously parks the lightweight
     // task instead, so only `num_workers` blocking threads are ever consumed.
     #[cfg(not(target_arch = "wasm32"))]
-    let task_results: Vec<(usize, usize, f32, (bool, Vec<ImageBounds>), OcrTaskResult)> = {
+    let task_results: Vec<(usize, f32, (bool, Vec<Rect>), OcrTaskResult)> = {
         let num_workers = num_workers.max(1);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(num_workers));
         let mut handles = Vec::with_capacity(rendered.len());
@@ -783,11 +909,10 @@ pub(crate) async fn ocr_and_merge_rendered(
             let engine = ocr_engine.clone();
             let sem = semaphore.clone();
             let language = ocr_language.to_string();
-            let page_number = pages[r.idx].page_number;
+            let page_number = r.page_number;
             let rt_handle = handle.clone();
 
             handles.push((
-                r.idx,
                 page_number,
                 r.dpi,
                 (r.has_native_text, r.image_rects.clone()),
@@ -818,20 +943,56 @@ pub(crate) async fn ocr_and_merge_rendered(
         }
 
         let mut results = Vec::with_capacity(handles.len());
-        for (idx, page_number, page_dpi, native, handle) in handles {
+        for (page_number, page_dpi, native, handle) in handles {
             let result = match handle.await {
                 Ok(result) => result,
                 Err(join_err) => {
                     Err(Box::new(join_err) as Box<dyn std::error::Error + Send + Sync>)
                 }
             };
-            results.push((idx, page_number, page_dpi, native, result));
+            results.push((page_number, page_dpi, native, result));
         }
         results
     };
 
-    // Phase 3: collect results and merge into pages.
+    task_results
+        .into_iter()
+        .map(
+            |(page_number, dpi, (has_native_text, image_rects), result)| {
+                let (results, error) = match result {
+                    Ok(results) => (results, None),
+                    Err(e) => (Vec::new(), Some(e.to_string())),
+                };
+                PageOcrOutcome {
+                    page_number,
+                    dpi,
+                    has_native_text,
+                    image_rects,
+                    results,
+                    error,
+                }
+            },
+        )
+        .collect()
+}
 
+/// Merge recognition outcomes into `pages`, in place. Pure: needs neither the
+/// document nor the rasters, only the outcomes [`recognize_rasters`] produced
+/// (or an equivalent a caller built from its own OCR engine's output).
+///
+/// Per page, unusable native text (garbled fonts, unmappable Type3) is dropped
+/// first so OCR can replace it; then each result is filtered against rule
+/// artifacts, chart figures and overlap with surviving native text before
+/// being appended as an `OCR`-font [`TextItem`] in viewport points.
+///
+/// Outcomes are matched to pages by `page_number`; an outcome for a page not
+/// in `pages` is an error rather than a panic, so a caller can merge a
+/// subset of pages or hand-built outcomes safely.
+pub fn merge_ocr_results(
+    pages: &mut [Page],
+    outcomes: Vec<PageOcrOutcome>,
+    ocr_failure_fatal: bool,
+) -> Result<(), LiteParseError> {
     // Track OCR task outcomes so we can distinguish a systemic failure (e.g.
     // missing Tesseract language data, which fails identically on every page)
     // from incidental per-page failures. Without this, every page logs the same
@@ -844,25 +1005,41 @@ pub(crate) async fn ocr_and_merge_rendered(
     // enrichment but already has all its text. We must only fail loud when OCR
     // failure destroyed a sparse page's likely primary text source — otherwise
     // a broken OCR setup would abort perfectly good native-text documents.
-    let total_tasks = task_results.len();
+    let total_tasks = outcomes.len();
     let mut failed_tasks = 0usize;
     let mut failed_sparse_text_page = false;
     let mut first_error: Option<String> = None;
 
-    for (idx, page_number, page_dpi, (has_native_text, image_rects), result) in task_results {
-        let ocr_results: Vec<OcrResult> = match result {
-            Ok(results) => results,
-            Err(e) => {
-                failed_tasks += 1;
-                failed_sparse_text_page |= page_has_sparse_native_text(&pages[idx]);
-                if first_error.is_none() {
-                    let msg = e.to_string();
-                    eprintln!("[ocr] failed for page {}: {}", page_number, msg);
-                    first_error = Some(msg);
-                }
-                continue;
-            }
+    let index_by_page_number: HashMap<usize, usize> = pages
+        .iter()
+        .enumerate()
+        .map(|(idx, page)| (page.page_number, idx))
+        .collect();
+
+    for outcome in outcomes {
+        let PageOcrOutcome {
+            page_number,
+            dpi: page_dpi,
+            has_native_text,
+            image_rects,
+            results: ocr_results,
+            error,
+        } = outcome;
+        let Some(&idx) = index_by_page_number.get(&page_number) else {
+            return Err(LiteParseError::Other(format!(
+                "OCR outcome for page {page_number} has no matching page among the {} page(s) being merged",
+                pages.len()
+            )));
         };
+        if let Some(msg) = error {
+            failed_tasks += 1;
+            failed_sparse_text_page |= page_has_sparse_native_text(&pages[idx]);
+            if first_error.is_none() {
+                eprintln!("[ocr] failed for page {}: {}", page_number, msg);
+                first_error = Some(msg);
+            }
+            continue;
+        }
 
         if ocr_results.is_empty() {
             continue;
@@ -1076,12 +1253,7 @@ pub(crate) async fn ocr_and_merge_rendered(
 /// systemic-failure guard matches the same pages that were rendered because
 /// their native text was insufficient.
 fn page_has_sparse_native_text(page: &Page) -> bool {
-    let text_length: usize = page
-        .text_items
-        .iter()
-        .filter(|item| !is_unusable_native(item))
-        .map(|item| item.text.len())
-        .sum();
+    let text_length = native_text_length(page);
     let page_area = page.page_width * page.page_height;
     let text_bbox_area: f32 = page
         .text_items
@@ -1095,7 +1267,21 @@ fn page_has_sparse_native_text(page: &Page) -> bool {
         0.0
     };
 
-    text_length < 20 || text_coverage < 0.15
+    text_length < MIN_NATIVE_TEXT_LEN || text_coverage < 0.15
+}
+
+/// Below this many bytes of usable native text a page counts as having no
+/// text of its own (`NoText` / `Scanned`), so OCR is its primary source.
+const MIN_NATIVE_TEXT_LEN: usize = 20;
+
+/// Bytes of native text on the page, excluding items OCR would replace
+/// anyway (see `is_unusable_native`).
+fn native_text_length(page: &Page) -> usize {
+    page.text_items
+        .iter()
+        .filter(|item| !is_unusable_native(item))
+        .map(|item| item.text.len())
+        .sum()
 }
 
 /// A native text item that cannot be trusted as a text source: either its
@@ -1334,7 +1520,7 @@ const CHART_MIN_RESULTS: usize = 4;
 /// tokens for the figure to count as a chart.
 const CHART_LABEL_FRACTION: f32 = 0.5;
 
-fn box_center_in(rect: &ImageBounds, x: f32, y: f32, w: f32, h: f32) -> bool {
+fn box_center_in(rect: &Rect, x: f32, y: f32, w: f32, h: f32) -> bool {
     let cx = x + w / 2.0;
     let cy = y + h / 2.0;
     cx >= rect.x && cx <= rect.x + rect.width && cy >= rect.y && cy <= rect.y + rect.height
@@ -1358,7 +1544,7 @@ fn is_chart_label(text: &str) -> bool {
 
 /// For each figure rect, whether its OCR results look like a chart's
 /// axes/ticks/legend rather than text worth keeping.
-fn chart_like_images(rects: &[ImageBounds], results: &[OcrResult], scale_factor: f32) -> Vec<bool> {
+fn chart_like_images(rects: &[Rect], results: &[OcrResult], scale_factor: f32) -> Vec<bool> {
     rects
         .iter()
         .map(|rect| {
@@ -1469,7 +1655,7 @@ mod tests {
         assert!(!is_chart_label("Year"));
         assert!(!is_chart_label("Fruit Production in British Columbia"));
 
-        let rect = ImageBounds {
+        let rect = Rect {
             x: 50.0,
             y: 100.0,
             width: 200.0,
@@ -1996,17 +2182,31 @@ mod tests {
         assert!(matches!(garbled_scope(&page), GarbledScope::WholePage));
     }
 
-    fn make_rendered(idx: usize) -> RenderedPage {
-        RenderedPage {
+    fn make_rendered(idx: usize) -> OcrRaster {
+        OcrRaster {
             has_native_text: false,
             image_rects: Vec::new(),
-            idx,
+            page_number: idx + 1,
             // 1x1 grayscale pixel; the engine never inspects it.
             pixels: vec![0u8],
             width: 1,
             height: 1,
             dpi: 72.0,
         }
+    }
+
+    /// The pre-split entry point, kept for these tests: recognition followed
+    /// by the merge, exactly as `parse()` composes the two stages.
+    async fn ocr_and_merge_rendered(
+        pages: &mut [Page],
+        rendered: Vec<OcrRaster>,
+        engine: Arc<dyn OcrEngine>,
+        language: &str,
+        num_workers: usize,
+        ocr_failure_fatal: bool,
+    ) -> Result<(), LiteParseError> {
+        let outcomes = recognize_rasters(rendered, engine, language, num_workers).await;
+        merge_ocr_results(pages, outcomes, ocr_failure_fatal)
     }
 
     // A page that already has substantial native text coverage, as would be the
